@@ -281,6 +281,7 @@ Market movement is AI-driven through world behaviors (`world_market_ai_cycle`, `
 ## Design References
 
 - High-level design notes: `docs/game-design.md`
+- MMO migration plan: `docs/mmo-migration-plan.md`
 - Behavior data index: `docs/game-data/behaviors.yaml`
 - Player behavior definitions: `docs/game-data/player-behaviors.yaml`
 - World behavior definitions: `docs/game-data/world-behaviors.yaml`
@@ -298,6 +299,7 @@ Market movement is AI-driven through world behaviors (`world_market_ai_cycle`, `
 	- `.github/20-gameplay.instructions.md`
 	- `.github/30-api.instructions.md`
 	- `.github/40-persistence.instructions.md`
+	- `.github/50-mmo-refactor.instructions.md`
 
 ## Docs Freshness Checklist
 

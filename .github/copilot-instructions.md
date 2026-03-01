@@ -35,6 +35,7 @@
 	- `20-gameplay.instructions.md`
 	- `30-api.instructions.md`
 	- `40-persistence.instructions.md`
+	- `50-mmo-refactor.instructions.md`
 - New sessions should treat this root file + ordered domain files as the baseline project memory.
 
 ## Architecture Principles
