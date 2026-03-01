@@ -503,6 +503,49 @@ func makeChatWordlistListHandler(database *gorm.DB) echo.HandlerFunc {
 	}
 }
 
+func makeChatChannelListHandler(database *gorm.DB) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		realmID, err := parseOptionalUintQuery(c.QueryParam("realmId"), "realmId")
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		query := database.WithContext(c.Request().Context()).
+			Where("is_active = ?", true)
+		if realmID != 0 {
+			query = query.Where("realm_id = ?", realmID)
+		}
+
+		rows := make([]dal.ChatChannel, 0)
+		if err := query.Order("realm_id ASC, channel_key ASC").Find(&rows).Error; err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load chat channels")
+		}
+
+		channels := make([]map[string]any, 0, len(rows))
+		for _, row := range rows {
+			channels = append(channels, map[string]any{
+				"scope":       chatBindingScopeRealm,
+				"scopeKey":    chatBindingScopeKey(chatBindingScopeRealm, row.RealmID),
+				"realmId":     row.RealmID,
+				"key":         row.ChannelKey,
+				"name":        row.DisplayName,
+				"subject":     row.Subject,
+				"description": row.Description,
+			})
+		}
+
+		response := map[string]any{
+			"scope":    chatBindingScopeRealm,
+			"channels": channels,
+		}
+		if realmID != 0 {
+			response["realmId"] = realmID
+		}
+
+		return respondSuccess(c, http.StatusOK, "Chat channels loaded.", response)
+	}
+}
+
 func makeChatWordlistAddHandler(database *gorm.DB) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		actor, ok := serverAuth.ActorFromContext(c.Request().Context())

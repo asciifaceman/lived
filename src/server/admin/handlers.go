@@ -44,6 +44,9 @@ const (
 	actionRoleGrant           = "account_role_grant"
 	actionRoleRevoke          = "account_role_revoke"
 	actionCharacterModify     = "character_modify"
+	actionRealmConfigSet      = "realm_config_set"
+	actionRealmAccessGrant    = "realm_access_grant"
+	actionRealmAccessRevoke   = "realm_access_revoke"
 )
 
 var (
@@ -102,6 +105,17 @@ type moderationCharacterRequest struct {
 	Note       string  `json:"note,omitempty"`
 }
 
+type realmConfigRequest struct {
+	Name          string `json:"name"`
+	WhitelistOnly *bool  `json:"whitelistOnly,omitempty"`
+}
+
+type realmAccessRequest struct {
+	AccountID  uint   `json:"accountId"`
+	ReasonCode string `json:"reasonCode"`
+	Note       string `json:"note,omitempty"`
+}
+
 type validatedRoleModeration struct {
 	RoleKey    string
 	Action     string
@@ -155,12 +169,17 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 	group.GET("/audit/export", makeAuditExportHandler(database), authMW, requireAdminRole())
 	group.GET("/audit/:id", makeAuditDetailHandler(database), authMW, requireAdminRole())
 	group.POST("/realms/:id/actions", makeRealmActionHandler(database), authMW, requireAdminRole())
+	group.POST("/realms/:id/config", makeRealmConfigHandler(database), authMW, requireAdminRole())
+	group.GET("/realms/:id/access", makeRealmAccessListHandler(database), authMW, requireAdminRole())
+	group.POST("/realms/:id/access/grant", makeRealmAccessGrantHandler(database), authMW, requireAdminRole())
+	group.POST("/realms/:id/access/revoke", makeRealmAccessRevokeHandler(database), authMW, requireAdminRole())
 	group.POST("/moderation/accounts/:id/lock", makeAccountLockHandler(database), authMW, requireAdminRole())
 	group.POST("/moderation/accounts/:id/unlock", makeAccountUnlockHandler(database), authMW, requireAdminRole())
 	group.POST("/moderation/accounts/:id/status", makeAccountStatusHandler(database), authMW, requireAdminRole())
 	group.POST("/moderation/accounts/:id/roles", makeAccountRoleModerationHandler(database), authMW, requireAdminRole())
 	group.GET("/moderation/characters", makeCharacterModerationListHandler(database), authMW, requireAdminRole())
 	group.POST("/moderation/characters/:id", makeCharacterModerationHandler(database), authMW, requireAdminRole())
+	group.GET("/chat/channels", makeChatChannelListHandler(database), authMW, requireAdminRole())
 	group.POST("/chat/channels", makeChatChannelCreateHandler(database), authMW, requireAdminRole())
 	group.DELETE("/chat/channels/:key", makeChatChannelRemoveHandler(database), authMW, requireAdminRole())
 	group.POST("/chat/channels/:key/flush", makeChatChannelFlushHandler(database), authMW, requireAdminRole())
@@ -372,6 +391,23 @@ func makeRealmsHandler(database *gorm.DB) echo.HandlerFunc {
 		for realmID := range realmSet {
 			realmIDs = append(realmIDs, realmID)
 		}
+
+		configRows := make([]dal.RealmConfig, 0)
+		if err := database.WithContext(c.Request().Context()).
+			Where("realm_id > 0").
+			Find(&configRows).Error; err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load realm metadata")
+		}
+
+		configsByRealmID := make(map[uint]dal.RealmConfig, len(configRows))
+		for _, row := range configRows {
+			configsByRealmID[row.RealmID] = row
+			if _, ok := realmSet[row.RealmID]; !ok {
+				realmSet[row.RealmID] = struct{}{}
+				realmIDs = append(realmIDs, row.RealmID)
+			}
+		}
+
 		sort.Slice(realmIDs, func(i, j int) bool { return realmIDs[i] < realmIDs[j] })
 
 		realms := make([]map[string]any, 0, len(realmIDs))
@@ -384,8 +420,17 @@ func makeRealmsHandler(database *gorm.DB) echo.HandlerFunc {
 				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load realm character counts")
 			}
 
+			config := configsByRealmID[realmID]
+			displayName := strings.TrimSpace(config.DisplayName)
+			if displayName == "" {
+				displayName = defaultRealmDisplayName(realmID)
+			}
+
 			realms = append(realms, map[string]any{
 				"realmId":          realmID,
+				"name":             displayName,
+				"whitelistOnly":    config.WhitelistOnly,
+				"decommissioned":   config.Decommissioned,
 				"activeCharacters": activeCharacters,
 			})
 		}
@@ -642,6 +687,324 @@ func makeRealmActionHandler(database *gorm.DB) echo.HandlerFunc {
 		resultData["occurredTick"] = tick
 
 		return respondSuccess(c, http.StatusOK, "Admin realm action applied.", resultData)
+	}
+}
+
+func makeRealmConfigHandler(database *gorm.DB) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		realmID, err := parseRealmIDPathParam(c.Param("id"))
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+		if !ok {
+			return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+		}
+
+		var req realmConfigRequest
+		if err := c.Bind(&req); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "invalid realm config payload")
+		}
+
+		name := strings.TrimSpace(req.Name)
+		if name != "" && (len(name) < 2 || len(name) > 64) {
+			return echo.NewHTTPError(http.StatusBadRequest, "name must be between 2 and 64 characters")
+		}
+
+		tick, err := adminAuditTick(c.Request().Context(), database, realmID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+		}
+
+		result := map[string]any{}
+		err = database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
+			config := dal.RealmConfig{}
+			query := tx.WithContext(c.Request().Context()).Where("realm_id = ?", realmID).Limit(1).Find(&config)
+			if query.Error != nil {
+				return query.Error
+			}
+
+			beforeName := strings.TrimSpace(config.DisplayName)
+			if beforeName == "" {
+				beforeName = defaultRealmDisplayName(realmID)
+			}
+			beforeWhitelist := config.WhitelistOnly
+
+			nextName := name
+			if nextName == "" {
+				if strings.TrimSpace(config.DisplayName) != "" {
+					nextName = strings.TrimSpace(config.DisplayName)
+				} else {
+					nextName = defaultRealmDisplayName(realmID)
+				}
+			}
+
+			nextWhitelist := beforeWhitelist
+			if req.WhitelistOnly != nil {
+				nextWhitelist = *req.WhitelistOnly
+			}
+
+			if query.RowsAffected == 0 {
+				config = dal.RealmConfig{
+					RealmID:       realmID,
+					DisplayName:   nextName,
+					WhitelistOnly: nextWhitelist,
+				}
+				if err := tx.WithContext(c.Request().Context()).Create(&config).Error; err != nil {
+					return err
+				}
+			} else {
+				if err := tx.WithContext(c.Request().Context()).Model(&dal.RealmConfig{}).Where("id = ?", config.ID).Updates(map[string]any{
+					"display_name":   nextName,
+					"whitelist_only": nextWhitelist,
+				}).Error; err != nil {
+					return err
+				}
+			}
+
+			before := map[string]any{"name": beforeName, "whitelistOnly": beforeWhitelist}
+			after := map[string]any{"name": nextName, "whitelistOnly": nextWhitelist}
+			if err := appendAdminAudit(tx, actor.AccountID, actionRealmConfigSet, "realm_config", "", before, after, tick, realmID); err != nil {
+				return err
+			}
+
+			result["realmId"] = realmID
+			result["name"] = nextName
+			result["whitelistOnly"] = nextWhitelist
+			result["occurredTick"] = tick
+			return nil
+		})
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to update realm config")
+		}
+
+		return respondSuccess(c, http.StatusOK, "Realm config updated.", result)
+	}
+}
+
+func makeRealmAccessListHandler(database *gorm.DB) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		realmID, err := parseRealmIDPathParam(c.Param("id"))
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		accountID, err := parseOptionalUintQuery(c.QueryParam("accountId"), "accountId")
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		type row struct {
+			ID              uint      `gorm:"column:id"`
+			RealmID         uint      `gorm:"column:realm_id"`
+			AccountID       uint      `gorm:"column:account_id"`
+			AccountUsername string    `gorm:"column:account_username"`
+			GrantedByID     uint      `gorm:"column:granted_by_id"`
+			ReasonCode      string    `gorm:"column:reason_code"`
+			Note            string    `gorm:"column:note"`
+			UpdatedAt       time.Time `gorm:"column:updated_at"`
+		}
+
+		rows := make([]row, 0)
+		query := database.WithContext(c.Request().Context()).
+			Table("realm_access_grants rag").
+			Select("rag.id, rag.realm_id, rag.account_id, acc.username AS account_username, rag.granted_by_id, rag.reason_code, rag.note, rag.updated_at").
+			Joins("JOIN accounts acc ON acc.id = rag.account_id").
+			Where("rag.realm_id = ? AND rag.is_active = ?", realmID, true)
+		if accountID != 0 {
+			query = query.Where("rag.account_id = ?", accountID)
+		}
+		if err := query.Order("rag.updated_at DESC, rag.id DESC").Find(&rows).Error; err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load realm access grants")
+		}
+
+		entries := make([]map[string]any, 0, len(rows))
+		for _, row := range rows {
+			entries = append(entries, map[string]any{
+				"id":              row.ID,
+				"realmId":         row.RealmID,
+				"accountId":       row.AccountID,
+				"accountUsername": row.AccountUsername,
+				"grantedById":     row.GrantedByID,
+				"reasonCode":      row.ReasonCode,
+				"note":            row.Note,
+				"updatedAt":       row.UpdatedAt,
+			})
+		}
+
+		return respondSuccess(c, http.StatusOK, "Realm access grants loaded.", map[string]any{"realmId": realmID, "entries": entries})
+	}
+}
+
+func makeRealmAccessGrantHandler(database *gorm.DB) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		realmID, err := parseRealmIDPathParam(c.Param("id"))
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+		if !ok {
+			return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+		}
+
+		var req realmAccessRequest
+		if err := c.Bind(&req); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "invalid realm access payload")
+		}
+		if req.AccountID == 0 {
+			return echo.NewHTTPError(http.StatusBadRequest, "accountId is required")
+		}
+
+		reasonCode, note, err := validateReasonAndNote(req.ReasonCode, req.Note)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		tick, err := adminAuditTick(c.Request().Context(), database, realmID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+		}
+
+		result := map[string]any{}
+		err = database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
+			account := dal.Account{}
+			accountResult := tx.WithContext(c.Request().Context()).Where("id = ?", req.AccountID).Limit(1).Find(&account)
+			if accountResult.Error != nil {
+				return accountResult.Error
+			}
+			if accountResult.RowsAffected == 0 {
+				return gorm.ErrRecordNotFound
+			}
+
+			grant := dal.RealmAccessGrant{}
+			grantResult := tx.WithContext(c.Request().Context()).Where("realm_id = ? AND account_id = ?", realmID, req.AccountID).Limit(1).Find(&grant)
+			if grantResult.Error != nil {
+				return grantResult.Error
+			}
+
+			before := map[string]any{"active": grant.IsActive, "reasonCode": grant.ReasonCode, "note": grant.Note}
+			after := map[string]any{"active": true, "reasonCode": reasonCode, "note": note}
+
+			if grantResult.RowsAffected == 0 {
+				grant = dal.RealmAccessGrant{
+					RealmID:      realmID,
+					AccountID:    req.AccountID,
+					GrantedByID:  actor.AccountID,
+					LastActionBy: actor.AccountID,
+					IsActive:     true,
+					ReasonCode:   reasonCode,
+					Note:         note,
+				}
+				if err := tx.WithContext(c.Request().Context()).Create(&grant).Error; err != nil {
+					return err
+				}
+			} else {
+				if err := tx.WithContext(c.Request().Context()).Model(&dal.RealmAccessGrant{}).Where("id = ?", grant.ID).Updates(map[string]any{
+					"is_active":      true,
+					"reason_code":    reasonCode,
+					"note":           note,
+					"granted_by_id":  actor.AccountID,
+					"last_action_by": actor.AccountID,
+				}).Error; err != nil {
+					return err
+				}
+			}
+
+			if err := appendAdminAudit(tx, actor.AccountID, actionRealmAccessGrant, reasonCode, note, before, after, tick, realmID); err != nil {
+				return err
+			}
+
+			result["realmId"] = realmID
+			result["accountId"] = req.AccountID
+			result["accountUsername"] = account.Username
+			result["active"] = true
+			result["occurredTick"] = tick
+			return nil
+		})
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return echo.NewHTTPError(http.StatusNotFound, "account not found")
+			}
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to grant realm access")
+		}
+
+		return respondSuccess(c, http.StatusOK, "Realm access granted.", result)
+	}
+}
+
+func makeRealmAccessRevokeHandler(database *gorm.DB) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		realmID, err := parseRealmIDPathParam(c.Param("id"))
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+		if !ok {
+			return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+		}
+
+		var req realmAccessRequest
+		if err := c.Bind(&req); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "invalid realm access payload")
+		}
+		if req.AccountID == 0 {
+			return echo.NewHTTPError(http.StatusBadRequest, "accountId is required")
+		}
+
+		reasonCode, note, err := validateReasonAndNote(req.ReasonCode, req.Note)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		tick, err := adminAuditTick(c.Request().Context(), database, realmID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+		}
+
+		result := map[string]any{}
+		err = database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
+			grant := dal.RealmAccessGrant{}
+			grantResult := tx.WithContext(c.Request().Context()).Where("realm_id = ? AND account_id = ?", realmID, req.AccountID).Limit(1).Find(&grant)
+			if grantResult.Error != nil {
+				return grantResult.Error
+			}
+			if grantResult.RowsAffected == 0 {
+				return gorm.ErrRecordNotFound
+			}
+
+			before := map[string]any{"active": grant.IsActive, "reasonCode": grant.ReasonCode, "note": grant.Note}
+			after := map[string]any{"active": false, "reasonCode": reasonCode, "note": note}
+
+			if err := tx.WithContext(c.Request().Context()).Model(&dal.RealmAccessGrant{}).Where("id = ?", grant.ID).Updates(map[string]any{
+				"is_active":      false,
+				"reason_code":    reasonCode,
+				"note":           note,
+				"last_action_by": actor.AccountID,
+			}).Error; err != nil {
+				return err
+			}
+
+			if err := appendAdminAudit(tx, actor.AccountID, actionRealmAccessRevoke, reasonCode, note, before, after, tick, realmID); err != nil {
+				return err
+			}
+
+			result["realmId"] = realmID
+			result["accountId"] = req.AccountID
+			result["active"] = false
+			result["occurredTick"] = tick
+			return nil
+		})
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return echo.NewHTTPError(http.StatusNotFound, "realm access grant not found")
+			}
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to revoke realm access")
+		}
+
+		return respondSuccess(c, http.StatusOK, "Realm access revoked.", result)
 	}
 }
 
@@ -1725,7 +2088,7 @@ func applyRealmResume(ctx context.Context, tx *gorm.DB, realmID uint, reasonCode
 
 func applyRealmCreate(ctx context.Context, tx *gorm.DB, realmID uint) (map[string]any, map[string]any, error) {
 	before := map[string]any{"existed": false}
-	created := map[string]any{"worldState": false, "worldRuntime": false, "realmControl": false}
+	created := map[string]any{"worldState": false, "worldRuntime": false, "realmControl": false, "realmConfig": false}
 
 	state := dal.WorldState{}
 	stateResult := tx.WithContext(ctx).Where("realm_id = ?", realmID).Limit(1).Find(&state)
@@ -1763,6 +2126,18 @@ func applyRealmCreate(ctx context.Context, tx *gorm.DB, realmID uint) (map[strin
 		return nil, nil, err
 	}
 	created["realmControl"] = true
+
+	config := dal.RealmConfig{}
+	configResult := tx.WithContext(ctx).Where("realm_id = ?", realmID).Limit(1).Find(&config)
+	if configResult.Error != nil {
+		return nil, nil, configResult.Error
+	}
+	if configResult.RowsAffected == 0 {
+		if err := tx.WithContext(ctx).Create(&dal.RealmConfig{RealmID: realmID, DisplayName: defaultRealmDisplayName(realmID), WhitelistOnly: false}).Error; err != nil {
+			return nil, nil, err
+		}
+		created["realmConfig"] = true
+	}
 
 	after := map[string]any{"realmId": realmID, "created": created}
 	return before, after, nil
@@ -1950,6 +2325,13 @@ func decodeMaybeJSON(raw string) any {
 		return map[string]any{}
 	}
 	return decoded
+}
+
+func defaultRealmDisplayName(realmID uint) string {
+	if realmID == 0 {
+		realmID = 1
+	}
+	return fmt.Sprintf("Realm %d", realmID)
 }
 
 func buildAuditCSV(rows []dal.AdminAuditEvent) ([]byte, error) {

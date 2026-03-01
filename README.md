@@ -2,7 +2,10 @@
 
 <img src="docs/static/text_logo.png" alt="Lived" width="280" />
 
-Lived is a server-authoritative idle/incremental game backend inspired by Lives Lived.
+Lived is a server-authoritative idle/incremental game backend.
+It is 100% unapologetically vibe coded for fun to explore the technology and make something ridiculous I'd never execute on otherwise.
+
+Beware, skeletons lay beyond here. This repo is comprised of a series of mistakes, inconsistencies, and ignored festering problems. While I am almost obsessively in control of the direction, and steering, I ain't reviewing all of that.
 
 This repo includes:
 
@@ -114,6 +117,12 @@ When server is running:
 - Health: `http://localhost:8080/health`
 - Metrics: `http://localhost:8080/metrics`
 
+Current notable contracts:
+
+- Onboarding status returns realm metadata (`name`, `whitelistOnly`, `canCreateCharacter`, `decommissioned`) for realm selector UX.
+- Onboarding start enforces whitelist-only realm access (non-admin accounts require an active admin grant).
+- Admin realm endpoints support realm metadata updates and realm access grant/revoke workflows.
+
 ## Development principles
 
 - Server is authoritative for simulation time and state
@@ -121,3 +130,4 @@ When server is running:
 - API usability and learnability matter as much as raw functionality
 - Tracker state is canonical in [docs/feature-tracker.md](docs/feature-tracker.md)
 - Pre-alpha policy allows breaking changes when they simplify architecture
+- Documentation is updated in the same change pass as behavior/API updates (at minimum `README.md` + Swagger/OpenAPI contract updates)

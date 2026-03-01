@@ -31,6 +31,7 @@ import {
   refreshSession,
   register,
   setSession,
+  subscribeSessionChanges,
   startBehavior,
   startOnboarding
 } from "./api";
@@ -315,6 +316,21 @@ function clampPercent(value: number): number {
   return value;
 }
 
+function formatRealmLabel(realmId: number | undefined): string {
+  if (!realmId || realmId <= 0) {
+    return "Realm -";
+  }
+  return `Realm ${realmId}`;
+}
+
+type RealmMeta = {
+  realmId: number;
+  name: string;
+  whitelistOnly: boolean;
+  canCreateCharacter: boolean;
+  decommissioned: boolean;
+};
+
 export function App() {
   const lastStreamTickRef = useRef<number | null>(null);
   const selectedCharacterIDRef = useRef<number | undefined>(undefined);
@@ -351,6 +367,7 @@ export function App() {
   const [adminOpen, setAdminOpen] = useState(false);
 
   const [loading, setLoading] = useState(false);
+  const [bootstrapping, setBootstrapping] = useState<boolean>(() => !!getSession());
   const [actionBusy, setActionBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [realmPausedMessage, setRealmPausedMessage] = useState<string | null>(null);
@@ -359,6 +376,7 @@ export function App() {
   const isLoggedIn = !!account;
   const isAdmin = (account?.roles ?? []).includes("admin");
   const characters = meData?.characters ?? onboarding?.characters ?? [];
+  const onboardingRealms = (onboarding?.realms ?? []) as RealmMeta[];
 
   const resetClientState = useCallback((options?: { clearAccountContext?: boolean }) => {
     const clearAccountContext = options?.clearAccountContext ?? false;
@@ -392,6 +410,53 @@ export function App() {
     }
     return characters.find((entry) => entry.id === selectedCharacterId);
   }, [characters, selectedCharacterId]);
+  const hasCharacterContext = !!selectedCharacter?.id;
+  const realmByID = useMemo(() => {
+    const map = new Map<number, RealmMeta>();
+    for (const realm of onboardingRealms) {
+      map.set(realm.realmId, realm);
+    }
+    return map;
+  }, [onboardingRealms]);
+  const formatRealmName = useCallback((realmId: number | undefined) => {
+    if (!realmId || realmId <= 0) {
+      return "Realm -";
+    }
+    return realmByID.get(realmId)?.name || formatRealmLabel(realmId);
+  }, [realmByID]);
+
+  const onboardingRealmOptions = useMemo(() => {
+    if (onboardingRealms.length > 0) {
+      const active = onboardingRealms
+        .filter((realm) => !realm.decommissioned)
+        .map((realm) => realm.realmId)
+        .filter((realmId) => Number.isInteger(realmId) && realmId > 0);
+      if (active.length > 0) {
+        return Array.from(new Set(active)).sort((left, right) => left - right);
+      }
+    }
+
+    const realmIds = new Set<number>();
+    for (const character of characters) {
+      if (character.realmId > 0) {
+        realmIds.add(character.realmId);
+      }
+    }
+    if (onboarding?.defaultRealm && onboarding.defaultRealm > 0) {
+      realmIds.add(onboarding.defaultRealm);
+    }
+    if (selectedRealmId > 0) {
+      realmIds.add(selectedRealmId);
+    }
+    if (realmIds.size === 0) {
+      realmIds.add(1);
+    }
+    return Array.from(realmIds.values()).sort((left, right) => left - right);
+  }, [characters, onboarding?.defaultRealm, onboardingRealms, selectedRealmId]);
+  const selectedOnboardingRealm = useMemo(() => {
+    return onboardingRealms.find((realm) => realm.realmId === selectedRealmId);
+  }, [onboardingRealms, selectedRealmId]);
+  const onboardingBlockedByWhitelist = !!selectedOnboardingRealm?.whitelistOnly && !selectedOnboardingRealm?.canCreateCharacter;
 
   useEffect(() => {
 	selectedCharacterIDRef.current = selectedCharacterId;
@@ -488,11 +553,15 @@ export function App() {
 
   const handleError = useCallback((err: unknown) => {
     const message = (err as Error).message;
+    const isBootAuthBoundary = bootstrapping && message.toLowerCase().includes("not authenticated");
+    if (isBootAuthBoundary) {
+      return;
+    }
     pushToast("error", message);
     if (message.toLowerCase().includes("maintenance") || message.toLowerCase().includes("realm is under maintenance")) {
       setRealmPausedMessage(message);
     }
-  }, [pushToast]);
+  }, [bootstrapping, pushToast]);
 
   useEffect(() => {
     if (!notice) {
@@ -682,17 +751,39 @@ export function App() {
     void getSystemVersion();
     const session = getSession();
     if (!session) {
+      setBootstrapping(false);
       return;
     }
 
     void (async () => {
-      const refreshed = await refreshSession();
-      if (!refreshed) {
-        clearSession();
+      try {
+        const refreshed = await refreshSession();
+        if (!refreshed) {
+          clearSession();
+        }
+        await loadAccountContext();
+      } finally {
+        setBootstrapping(false);
       }
-      await loadAccountContext();
     })();
   }, [loadAccountContext]);
+
+  useEffect(() => {
+    return subscribeSessionChanges(() => {
+      const session = getSession();
+      if (!session) {
+        resetClientState({ clearAccountContext: true });
+        setView("profile");
+        setBootstrapping(false);
+      }
+    });
+  }, [resetClientState]);
+
+  useEffect(() => {
+    if (view !== "profile" && !hasCharacterContext) {
+      setView("profile");
+    }
+  }, [hasCharacterContext, view]);
 
   useEffect(() => {
     if (!isLoggedIn || !selectedCharacter?.id) {
@@ -844,6 +935,17 @@ export function App() {
     await Promise.all([loadChat(), loadGameplay(), loadAccountContext()]);
   }, [loadAccountContext, loadChat, loadGameplay]);
 
+  if (bootstrapping) {
+    return (
+      <div className="new-shell">
+        <div className="auth-card">
+          <h1>Lived</h1>
+          <p>Loading account context...</p>
+        </div>
+      </div>
+    );
+  }
+
   if (!isLoggedIn) {
     return (
       <div className="new-shell">
@@ -889,7 +991,7 @@ export function App() {
             >
               {characters.map((character) => (
                 <option key={character.id} value={character.id}>
-                  {character.name} · realm {character.realmId} {character.isPrimary ? "(primary)" : ""}
+                  {character.name} · {formatRealmName(character.realmId)} {character.isPrimary ? "(primary)" : ""}
                 </option>
               ))}
             </select>
@@ -897,8 +999,8 @@ export function App() {
 
           <div className="nav-tabs">
             <button className={view === "profile" ? "active" : ""} onClick={() => setView("profile")} type="button">Profile</button>
-            <button className={view === "gameplay" ? "active" : ""} onClick={() => setView("gameplay")} type="button">Gameplay</button>
-            <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")} type="button">Chat</button>
+            <button className={view === "gameplay" ? "active" : ""} onClick={() => setView("gameplay")} type="button" disabled={!hasCharacterContext}>Gameplay</button>
+            <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")} type="button" disabled={!hasCharacterContext}>Chat</button>
           </div>
 
           {isAdmin ? <button type="button" onClick={() => setAdminOpen(true)}>Admin Panel</button> : null}
@@ -906,7 +1008,7 @@ export function App() {
         </div>
       </header>
 
-      {loading ? <div className="notice">Loading account context...</div> : null}
+      {loading || bootstrapping ? <div className="notice">Loading account context...</div> : null}
 
       <PlayerSnapshot
         name={selectedCharacter?.name ?? account?.username ?? "Player"}
@@ -952,7 +1054,7 @@ export function App() {
                     {characters.map((character) => (
                       <tr key={character.id}>
                         <td>{character.name}{character.isPrimary ? " ⭐" : ""}</td>
-                        <td>{character.realmId}</td>
+                        <td>{formatRealmName(character.realmId)}</td>
                         <td>{character.status}</td>
                       </tr>
                     ))}
@@ -969,9 +1071,18 @@ export function App() {
                   </label>
                   <label>
                     Realm
-                    <input value={selectedRealmId} onChange={(event) => setSelectedRealmId(Number(event.target.value) || 1)} />
+                    <select value={selectedRealmId} onChange={(event) => setSelectedRealmId(Number(event.target.value) || 1)}>
+                      {onboardingRealmOptions.map((realmId) => (
+                        <option key={realmId} value={realmId}>{formatRealmName(realmId)}</option>
+                      ))}
+                    </select>
                   </label>
-                  <button type="button" onClick={onStartOnboarding} disabled={actionBusy}>Create character</button>
+                  {selectedOnboardingRealm?.whitelistOnly ? (
+                    <p className="muted">
+                      {selectedOnboardingRealm.canCreateCharacter ? "This realm is whitelisted; your account is approved." : "This realm is whitelisted; request admin approval before creating a character."}
+                    </p>
+                  ) : null}
+                  <button type="button" onClick={onStartOnboarding} disabled={actionBusy || onboardingBlockedByWhitelist}>Create character</button>
                 </div>
               </div>
             </div>
@@ -995,7 +1106,7 @@ export function App() {
                 <div className="info-card">
                   <h3>Character Snapshot</h3>
                   <p><strong>Name:</strong> {selectedCharacter?.name ?? "-"}</p>
-                  <p><strong>Realm:</strong> {selectedCharacter?.realmId ?? "-"}</p>
+                  <p><strong>Realm:</strong> {formatRealmName(selectedCharacter?.realmId)}</p>
                   <p><strong>Tick:</strong> {playerStatus?.simulationTick ?? 0}</p>
                   <p><strong>Ascensions:</strong> {playerStatus?.ascensionCount ?? 0}</p>
                   <p><strong>Wealth bonus:</strong> {playerStatus?.wealthBonusPct ?? 0}%</p>

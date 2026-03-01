@@ -57,6 +57,25 @@ type WorldState struct {
 	SimulationTick int64 `gorm:"not null;default:0"`
 }
 
+type RealmConfig struct {
+	BaseModel
+	RealmID        uint   `gorm:"not null;default:1;uniqueIndex:idx_realm_config_realm"`
+	DisplayName    string `gorm:"size:64;not null;default:''"`
+	WhitelistOnly  bool   `gorm:"not null;default:false"`
+	Decommissioned bool   `gorm:"not null;default:false"`
+}
+
+type RealmAccessGrant struct {
+	BaseModel
+	RealmID      uint   `gorm:"not null;default:1;uniqueIndex:idx_realm_access_grant,priority:1;index"`
+	AccountID    uint   `gorm:"not null;uniqueIndex:idx_realm_access_grant,priority:2;index"`
+	GrantedByID  uint   `gorm:"not null;default:0;index"`
+	IsActive     bool   `gorm:"not null;default:true;index"`
+	ReasonCode   string `gorm:"size:64;not null;default:''"`
+	Note         string `gorm:"size:500;not null;default:''"`
+	LastActionBy uint   `gorm:"not null;default:0;index"`
+}
+
 type WorldRuntimeState struct {
 	BaseModel
 	RealmID              uint      `gorm:"not null;default:1;uniqueIndex:idx_world_runtime_realm_key,priority:1"`
@@ -213,6 +232,8 @@ func Models() []any {
 		&AccountSession{},
 		&Player{},
 		&Character{},
+		&RealmConfig{},
+		&RealmAccessGrant{},
 		&WorldState{},
 		&WorldRuntimeState{},
 		&InventoryEntry{},

@@ -444,7 +444,7 @@ const openAPISpecJSON = `{
       "post": {
         "tags": ["Onboarding"],
         "summary": "Start onboarding",
-        "description": "Creates initial character for authenticated account in selected realm. Idempotent per account+realm.",
+        "description": "Creates an initial character for the authenticated account in the selected realm. Idempotent per account+realm. When the target realm is configured as whitelist-only, the account must have an active realm access grant (admins are always allowed).",
         "security": [
           { "BearerAuth": [] }
         ],
@@ -481,6 +481,8 @@ const openAPISpecJSON = `{
           },
           "400": { "$ref": "#/components/responses/ErrorResponse" },
           "401": { "$ref": "#/components/responses/ErrorResponse" },
+          "403": { "$ref": "#/components/responses/ErrorResponse" },
+          "423": { "$ref": "#/components/responses/ErrorResponse" },
           "409": { "$ref": "#/components/responses/ErrorResponse" },
           "500": { "$ref": "#/components/responses/ErrorResponse" }
         }
@@ -490,7 +492,7 @@ const openAPISpecJSON = `{
       "get": {
         "tags": ["Onboarding"],
         "summary": "Get onboarding status",
-        "description": "Returns onboarding status and characters for authenticated account.",
+        "description": "Returns onboarding status and characters for authenticated account, plus realm metadata (realmId, name, whitelistOnly, canCreateCharacter, decommissioned) used by clients to drive realm selector UX and creation eligibility messaging.",
         "security": [
           { "BearerAuth": [] }
         ],
@@ -1759,7 +1761,7 @@ const openAPISpecJSON = `{
       "get": {
         "tags": ["Admin"],
         "summary": "List known realms",
-        "description": "Returns discovered realm IDs and active character counts. Requires admin role.",
+        "description": "Returns discovered realms with metadata (name, whitelistOnly, decommissioned) and active character counts. Requires admin role.",
         "security": [
           { "BearerAuth": [] }
         ],
@@ -1778,6 +1780,260 @@ const openAPISpecJSON = `{
             "$ref": "#/components/responses/ErrorResponse"
           },
           "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/realms/{id}/config": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Update realm metadata",
+        "description": "Updates realm metadata used by clients/operators (display name and whitelist-only character creation policy). Records immutable admin audit context. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Realm ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 2,
+                    "maxLength": 64,
+                    "description": "Realm display name shown in selectors and admin views."
+                  },
+                  "whitelistOnly": {
+                    "type": "boolean",
+                    "description": "When true, character creation requires an active realm access grant (except admins)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Realm metadata updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/realms/{id}/access": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List active realm access grants",
+        "description": "Lists active account access grants for a realm (used for whitelist-only character creation policy). Supports optional account filter. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Realm ID"
+          },
+          {
+            "name": "accountId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Optional account filter."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Realm access grants",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/realms/{id}/access/grant": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Grant realm access",
+        "description": "Creates or reactivates an account grant for realm whitelist access and records immutable admin audit context. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Realm ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["accountId", "reasonCode"],
+                "properties": {
+                  "accountId": { "type": "integer", "minimum": 1 },
+                  "reasonCode": { "type": "string", "maxLength": 64 },
+                  "note": { "type": "string", "maxLength": 500 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Realm access granted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/realms/{id}/access/revoke": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Revoke realm access",
+        "description": "Deactivates an existing account realm access grant and records immutable admin audit context. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Realm ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["accountId", "reasonCode"],
+                "properties": {
+                  "accountId": { "type": "integer", "minimum": 1 },
+                  "reasonCode": { "type": "string", "maxLength": 64 },
+                  "note": { "type": "string", "maxLength": 500 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Realm access revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
             "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {

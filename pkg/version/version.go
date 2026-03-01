@@ -2,6 +2,6 @@ package version
 
 var (
 	APIVersion      = "v1"
-	BackendVersion  = "0.2.46-dev"
-	FrontendVersion = "0.1.16"
+	BackendVersion  = "0.2.49-dev"
+	FrontendVersion = "0.1.20"
 )
