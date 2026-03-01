@@ -1,0 +1,45 @@
+version: 1
+stats:
+  - key: strength
+    label: Strength
+    description: Improves physical task efficiency.
+    effects:
+      - Reduces wood chopping duration.
+      - Increases wood output from chopping behaviors.
+    starterProgression:
+      - player_pushups
+      - player_weight_training
+
+  - key: social
+    label: Social
+    description: Improves negotiation and trade outcomes.
+    effects:
+      - Increases effective sale price on scrap sales.
+    starterProgression:
+      - player_socialize_market
+
+  - key: stamina
+    label: Stamina
+    description: Energy pool consumed by physically demanding behaviors.
+    effects:
+      - Consumed by gathering and training actions.
+      - Recharges over time based on stamina recovery rate.
+    starterProgression:
+      - player_scavenge_scrap
+      - player_chop_wood
+      - player_run_training
+
+  - key: max_stamina
+    label: Max Stamina
+    description: Maximum stamina capacity.
+    effects:
+      - Increases available stamina buffer for sustained action chaining.
+    starterProgression:
+      - player_run_training
+
+  - key: stamina_recovery_rate
+    label: Stamina Recovery Rate
+    description: Per-hour stamina regeneration rate.
+    effects:
+      - Improves naturally from sustained stamina-consuming play.
+      - Governs passive stamina recovery cadence over world ticks.

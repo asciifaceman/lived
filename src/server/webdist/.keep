@@ -1,0 +1,2 @@
+This directory stores built frontend assets for optional embed_frontend builds.
+Run `cd web && npm run build:embed` to populate it.

@@ -1,0 +1,22 @@
+version: 1
+ascension:
+  constants:
+    baseRequirementCoins: 250
+    requirementGrowthFactor: 1.75
+    baseWealthBonusPctPerAscension: 10
+    startCoinsPerAscension: 50
+
+  formulas:
+    requirementCoins: "round(baseRequirementCoins * requirementGrowthFactor^ascensionCount)"
+    startingCoinsAfterAscend: "startCoinsPerAscension * ascensionCount"
+
+  baseWealthBonusPctPerAscension: 10
+  resets:
+    worldTick: true
+    inventory: true
+    queuedBehaviors: true
+    worldEvents: true
+    unlocks: true
+  persists:
+    ascensionCount: true
+    wealthBonusPct: true

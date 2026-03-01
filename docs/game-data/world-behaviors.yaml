@@ -1,0 +1,32 @@
+version: 1
+behaviors:
+  - key: world_market_ai_cycle
+    actorType: world
+    durationMinutes: 60
+    repeatIntervalMin: 60
+    requirements:
+      unlocks: []
+      items: {}
+    costs: {}
+    outputs: {}
+    outputExpressions: {}
+    startMessage: "Market analysts gather ledgers and regional rumors."
+    completeMessage: "The market council concludes a new pricing posture."
+    notes:
+      - This behavior runs AI market evaluation and applies directional price changes based on observed world state.
+
+  - key: world_merchant_convoy
+    actorType: world
+    durationMinutes: 90
+    repeatIntervalMin: 180
+    requirements:
+      unlocks: []
+      items: {}
+    costs: {}
+    outputs: {}
+    outputExpressions: {}
+    marketEffects:
+      scrap: 1
+      wood: 1
+    startMessage: "A merchant convoy prepares to enter nearby routes."
+    completeMessage: "The convoy arrives and demand rises across local stalls."

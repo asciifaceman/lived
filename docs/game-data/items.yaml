@@ -1,0 +1,13 @@
+version: 1
+items:
+  - key: coins
+    kind: currency
+    description: Core wealth metric used for progression and ascension readiness.
+
+  - key: scrap
+    kind: material
+    description: Low-value salvage gathered from starter behaviors.
+
+  - key: wood
+    kind: material
+    description: Basic crafting and trade resource unlocked through progression.

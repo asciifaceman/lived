@@ -1,0 +1,88 @@
+version: 1
+behaviors:
+  - key: player_scavenge_scrap
+    actorType: player
+    durationMinutes: 30
+    requirements:
+      unlocks: []
+      items: {}
+    costs: {}
+    outputs:
+      scrap: 1
+    outputExpressions:
+      coins: "1+d2"
+    outputChances:
+      coins: 0.35
+    startMessage: "You search alleys and abandoned lots for anything useful."
+    completeMessage: "You return with salvage and a few coins from quick trades."
+
+  - key: player_sell_scrap
+    actorType: player
+    durationMinutes: 10
+    requirements:
+      unlocks: []
+      items:
+        scrap: 1
+    costs:
+      scrap: 1
+    outputs: {}
+    outputExpressions: {}
+    startMessage: "You head toward the nearest buyer with scrap in hand."
+    completeMessage: "The scrap changes hands and your coin pouch feels heavier."
+    notes:
+      - Coins are resolved from current market price for scrap (AI-driven market).
+
+  - key: player_sell_wood
+    actorType: player
+    durationMinutes: 12
+    requirements:
+      unlocks: []
+      items:
+        wood: 1
+    costs:
+      wood: 1
+    outputs: {}
+    outputExpressions: {}
+    startMessage: "You carry your cut wood to market stalls and lumber buyers."
+    completeMessage: "The wood lot sells and your coin pouch grows."
+    notes:
+      - Coins are resolved from current market price for wood (AI-driven market).
+
+  - key: player_petition_forester
+    actorType: player
+    durationMinutes: 45
+    requirements:
+      unlocks: []
+      items:
+        coins: 12
+    costs:
+      coins: 12
+    outputs: {}
+    outputExpressions: {}
+    grantsUnlocks:
+      - forest_access
+    startMessage: "You wait in a long line to petition for forest cutting rights."
+    completeMessage: "A stamped permit is granted. The forest now opens to your axe."
+
+  - key: player_chop_wood
+    actorType: player
+    durationMinutes: 25
+    requirements:
+      unlocks:
+        - forest_access
+      items: {}
+    costs: {}
+    outputs: {}
+    outputExpressions:
+      wood: "1-3"
+    startMessage: "You enter the forest edge and begin chopping carefully."
+    completeMessage: "You haul back cut wood for crafting or sale."
+
+outputExpressionSyntax:
+  staticRange: "1-5"
+  diceRange: "1+d6"
+  staticValue: "3"
+  notes:
+    - Output expressions are optional and evaluated on behavior completion.
+    - Static `outputs` and `outputExpressions` can both be present and are added together.
+    - `outputChances` is optional and uses decimal probabilities from 0.0 to 1.0.

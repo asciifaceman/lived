@@ -1,0 +1,6 @@
+version: 1
+splitBehaviorFiles:
+  player: player-behaviors.yaml
+  world: world-behaviors.yaml
+related:
+  stats: player-stats.yaml
