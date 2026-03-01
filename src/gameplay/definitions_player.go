@@ -3,6 +3,8 @@ package gameplay
 var playerBehaviorDefinitions = map[string]BehaviorDefinition{
 	"player_scavenge_scrap": {
 		Key:             "player_scavenge_scrap",
+		Name:            "Scavenge Scrap",
+		Summary:         "Search for scrap and occasional coin in nearby alleys.",
 		ActorType:       ActorPlayer,
 		DurationMinutes: 30,
 		StaminaCost:     18,
@@ -20,6 +22,8 @@ var playerBehaviorDefinitions = map[string]BehaviorDefinition{
 	},
 	"player_sell_scrap": {
 		Key:             "player_sell_scrap",
+		Name:            "Sell Scrap",
+		Summary:         "Convert scrap into coins when the market is open.",
 		ActorType:       ActorPlayer,
 		DurationMinutes: 10,
 		StaminaCost:     4,
@@ -33,6 +37,8 @@ var playerBehaviorDefinitions = map[string]BehaviorDefinition{
 	},
 	"player_sell_wood": {
 		Key:             "player_sell_wood",
+		Name:            "Sell Wood",
+		Summary:         "Bring cut wood to market buyers for coins.",
 		ActorType:       ActorPlayer,
 		DurationMinutes: 12,
 		StaminaCost:     6,
@@ -46,6 +52,8 @@ var playerBehaviorDefinitions = map[string]BehaviorDefinition{
 	},
 	"player_petition_forester": {
 		Key:             "player_petition_forester",
+		Name:            "Petition Forester",
+		Summary:         "Purchase forest cutting rights to unlock wood gathering.",
 		ActorType:       ActorPlayer,
 		DurationMinutes: 45,
 		StaminaCost:     6,
@@ -59,6 +67,8 @@ var playerBehaviorDefinitions = map[string]BehaviorDefinition{
 	},
 	"player_chop_wood": {
 		Key:             "player_chop_wood",
+		Name:            "Chop Wood",
+		Summary:         "Gather wood from the forest once access is unlocked.",
 		ActorType:       ActorPlayer,
 		DurationMinutes: 25,
 		StaminaCost:     22,
@@ -73,7 +83,10 @@ var playerBehaviorDefinitions = map[string]BehaviorDefinition{
 	},
 	"player_pushups": {
 		Key:             "player_pushups",
+		Name:            "Pushups",
+		Summary:         "Train strength through bodyweight exercise.",
 		ActorType:       ActorPlayer,
+		ExclusiveGroup:  "body_state",
 		DurationMinutes: 20,
 		StaminaCost:     14,
 		StatDeltas: map[string]int64{
@@ -84,17 +97,33 @@ var playerBehaviorDefinitions = map[string]BehaviorDefinition{
 	},
 	"player_run_training": {
 		Key:             "player_run_training",
+		Name:            "Run Training",
+		Summary:         "Build endurance to improve stamina cap and recovery.",
 		ActorType:       ActorPlayer,
+		ExclusiveGroup:  "body_state",
 		DurationMinutes: 30,
 		StaminaCost:     20,
 		StatDeltas: map[string]int64{
-			"max_stamina": 2,
+			"endurance": 1,
 		},
 		StartMessage:    "You settle into a steady running pace to build endurance.",
 		CompleteMessage: "Your lungs and legs adapt. Your stamina ceiling improves.",
 	},
+	"player_rest": {
+		Key:             "player_rest",
+		Name:            "Rest",
+		Summary:         "Recover stamina faster than passive recovery by taking deliberate downtime.",
+		ActorType:       ActorPlayer,
+		ExclusiveGroup:  "body_state",
+		DurationMinutes: 30,
+		StaminaCost:     0,
+		StartMessage:    "You step back from work and focus on steady recovery.",
+		CompleteMessage: "The rest pays off, and your stamina rebounds quickly.",
+	},
 	"player_socialize_market": {
 		Key:             "player_socialize_market",
+		Name:            "Socialize at Market",
+		Summary:         "Improve social stat through market networking.",
 		ActorType:       ActorPlayer,
 		DurationMinutes: 30,
 		StaminaCost:     8,
@@ -106,6 +135,8 @@ var playerBehaviorDefinitions = map[string]BehaviorDefinition{
 	},
 	"player_buy_weights": {
 		Key:             "player_buy_weights",
+		Name:            "Buy Weights",
+		Summary:         "Buy home weights to unlock heavier strength training.",
 		ActorType:       ActorPlayer,
 		DurationMinutes: 15,
 		Requirements:    Requirement{Items: map[string]int64{"coins": 60}},
@@ -118,7 +149,10 @@ var playerBehaviorDefinitions = map[string]BehaviorDefinition{
 	},
 	"player_weight_training": {
 		Key:             "player_weight_training",
+		Name:            "Weight Training",
+		Summary:         "Advance strength quickly with home weight routines.",
 		ActorType:       ActorPlayer,
+		ExclusiveGroup:  "body_state",
 		DurationMinutes: 35,
 		StaminaCost:     26,
 		Requirements: Requirement{

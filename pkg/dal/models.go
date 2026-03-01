@@ -147,6 +147,53 @@ type AscensionState struct {
 	WealthBonusPct float64 `gorm:"not null;default:0"`
 }
 
+type ChatChannel struct {
+	BaseModel
+	RealmID      uint   `gorm:"not null;default:1;uniqueIndex:idx_chat_channel_realm_key,priority:1;index"`
+	ChannelKey   string `gorm:"size:32;not null;uniqueIndex:idx_chat_channel_realm_key,priority:2"`
+	DisplayName  string `gorm:"size:64;not null"`
+	Subject      string `gorm:"size:140;not null;default:''"`
+	Description  string `gorm:"size:255;not null;default:''"`
+	IsActive     bool   `gorm:"not null;default:true;index"`
+	ManagedByKey string `gorm:"size:32;not null;default:'system'"`
+}
+
+type ChatChannelModeration struct {
+	BaseModel
+	RealmID     uint       `gorm:"not null;default:1;index:idx_chat_moderation_lookup,priority:1"`
+	ChannelKey  string     `gorm:"size:32;not null;index:idx_chat_moderation_lookup,priority:2"`
+	AccountID   uint       `gorm:"not null;index:idx_chat_moderation_lookup,priority:3"`
+	ActionKey   string     `gorm:"size:16;not null"`
+	Active      bool       `gorm:"not null;default:true;index"`
+	ExpiresAt   *time.Time `gorm:"index"`
+	ReasonCode  string     `gorm:"size:64;not null;index"`
+	Note        string     `gorm:"size:500;not null;default:''"`
+	CreatedByID uint       `gorm:"not null;index"`
+}
+
+type ChatChannelWordRule struct {
+	BaseModel
+	Term        string `gorm:"size:128;not null;index:idx_chat_word_rule_lookup,priority:1"`
+	MatchMode   string `gorm:"size:16;not null;default:'contains';index:idx_chat_word_rule_lookup,priority:2"`
+	IsActive    bool   `gorm:"not null;default:true;index"`
+	ReasonCode  string `gorm:"size:64;not null;index"`
+	Note        string `gorm:"size:500;not null;default:''"`
+	CreatedByID uint   `gorm:"not null;index"`
+}
+
+type ChatMessageCensorshipTrace struct {
+	BaseModel
+	RealmID        uint   `gorm:"not null;default:1;index:idx_chat_censor_trace_lookup,priority:1"`
+	ChannelKey     string `gorm:"size:32;not null;index:idx_chat_censor_trace_lookup,priority:2"`
+	AccountID      uint   `gorm:"not null;default:0;index:idx_chat_censor_trace_lookup,priority:3"`
+	CharacterID    uint   `gorm:"not null;default:0;index"`
+	MessageID      uint   `gorm:"not null;default:0;index"`
+	MessageClass   string `gorm:"size:16;not null;default:'player'"`
+	OriginalLength int64  `gorm:"not null;default:0"`
+	CensoredCount  int64  `gorm:"not null;default:0"`
+	MatchedRules   int64  `gorm:"not null;default:0"`
+}
+
 type AdminAuditEvent struct {
 	BaseModel
 	RealmID        uint   `gorm:"not null;default:1;index"`
@@ -176,6 +223,10 @@ func Models() []any {
 		&MarketPrice{},
 		&MarketHistory{},
 		&AscensionState{},
+		&ChatChannel{},
+		&ChatChannelModeration{},
+		&ChatChannelWordRule{},
+		&ChatMessageCensorshipTrace{},
 		&AdminAuditEvent{},
 	}
 }

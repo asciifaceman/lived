@@ -24,6 +24,7 @@ const (
 	statusSuccess   = "success"
 	rolePlayer      = "player"
 	statusActive    = "active"
+	realmPauseState = "realm_pause_state"
 	claimTypeAccess = "access"
 	claimTypeRef    = "refresh"
 )
@@ -111,8 +112,8 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 		group.POST("/login", makeLoginHandler(database, cfg))
 		group.POST("/refresh", makeRefreshHandler(database, cfg))
 	}
-	group.POST("/logout", makeLogoutHandler(database, cfg), makeAuthMiddleware(database, cfg))
-	group.GET("/me", makeMeHandler(database), makeAuthMiddleware(database, cfg))
+	group.POST("/logout", makeLogoutHandler(database, cfg), RequireAuth(database, cfg))
+	group.GET("/me", makeMeHandler(database), RequireAuth(database, cfg))
 }
 
 func makeRegisterHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
@@ -177,6 +178,14 @@ func makeLoginHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 		}
 		if result.RowsAffected == 0 || account.Status != statusActive {
 			return echo.NewHTTPError(http.StatusUnauthorized, "invalid credentials")
+		}
+
+		blockedByMaintenance, err := accountBlockedByPausedRealm(c.Request().Context(), database, account.ID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to resolve realm maintenance state")
+		}
+		if blockedByMaintenance {
+			return echo.NewHTTPError(http.StatusLocked, "realm is under maintenance")
 		}
 
 		if err := bcrypt.CompareHashAndPassword([]byte(account.PasswordHash), []byte(req.Password)); err != nil {
@@ -245,6 +254,14 @@ func makeRefreshHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 		}
 		if accRes.RowsAffected == 0 || account.Status != statusActive {
 			return echo.NewHTTPError(http.StatusUnauthorized, "account is not active")
+		}
+
+		blockedByMaintenance, err := accountBlockedByPausedRealm(c.Request().Context(), database, account.ID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to resolve realm maintenance state")
+		}
+		if blockedByMaintenance {
+			return echo.NewHTTPError(http.StatusLocked, "realm is under maintenance")
 		}
 
 		roles, err := loadAccountRoles(c.Request().Context(), database, account.ID)
@@ -325,15 +342,23 @@ func makeMeHandler(database *gorm.DB) echo.HandlerFunc {
 	}
 }
 
-func makeAuthMiddleware(database *gorm.DB, cfg config.Config) echo.MiddlewareFunc {
+func makeAuthMiddleware(database *gorm.DB, cfg config.Config, allowQueryToken bool) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
+			token := ""
 			authHeader := c.Request().Header.Get("Authorization")
-			if !strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+			if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+				token = strings.TrimSpace(authHeader[len("Bearer "):])
+			}
+
+			if token == "" && allowQueryToken {
+				token = strings.TrimSpace(c.QueryParam("accessToken"))
+			}
+
+			if token == "" {
 				return echo.NewHTTPError(http.StatusUnauthorized, "missing bearer token")
 			}
 
-			token := strings.TrimSpace(authHeader[len("Bearer "):])
 			claims, err := parseToken(token, cfg)
 			if err != nil || claims.TokenType != claimTypeAccess {
 				return echo.NewHTTPError(http.StatusUnauthorized, "invalid access token")
@@ -470,13 +495,32 @@ func hashToken(token string) string {
 	return hex.EncodeToString(digest[:])
 }
 
+func accountBlockedByPausedRealm(ctx context.Context, database *gorm.DB, accountID uint) (bool, error) {
+	var count int64
+	err := database.WithContext(ctx).
+		Model(&dal.Character{}).
+		Joins("JOIN world_runtime_states ON world_runtime_states.realm_id = characters.realm_id AND world_runtime_states.key = ?", realmPauseState).
+		Where("characters.account_id = ? AND characters.status = ? AND world_runtime_states.carry_game_minutes >= 1", accountID, statusActive).
+		Distinct("characters.realm_id").
+		Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+
+	return count > 0, nil
+}
+
 func ActorFromContext(ctx context.Context) (ActorContext, bool) {
 	actor, ok := ctx.Value(actorContextKey).(ActorContext)
 	return actor, ok
 }
 
 func RequireAuth(database *gorm.DB, cfg config.Config) echo.MiddlewareFunc {
-	return makeAuthMiddleware(database, cfg)
+	return makeAuthMiddleware(database, cfg, false)
+}
+
+func RequireAuthWithQueryAccessToken(database *gorm.DB, cfg config.Config) echo.MiddlewareFunc {
+	return makeAuthMiddleware(database, cfg, true)
 }
 
 func respondSuccess(c echo.Context, code int, message string, data any) error {

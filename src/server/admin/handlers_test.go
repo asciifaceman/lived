@@ -64,7 +64,7 @@ func TestValidateRealmAction(t *testing.T) {
 		{
 			name: "unsupported action",
 			req: realmActionRequest{
-				Action:     "realm_pause",
+				Action:     "realm_shutdown",
 				ReasonCode: "maintenance",
 			},
 			wantErr: true,
@@ -172,6 +172,116 @@ func TestValidateRoleModeration(t *testing.T) {
 	}
 }
 
+func TestValidateAccountStatusModeration(t *testing.T) {
+	locked := true
+	tests := []struct {
+		name    string
+		req     moderationAccountStatusRequest
+		wantErr bool
+	}{
+		{
+			name: "valid active",
+			req: moderationAccountStatusRequest{
+				Status:     "active",
+				ReasonCode: "ops_review",
+			},
+		},
+		{
+			name: "valid locked explicit revoke",
+			req: moderationAccountStatusRequest{
+				Status:         "locked",
+				ReasonCode:     "abuse",
+				RevokeSessions: &locked,
+			},
+		},
+		{
+			name: "invalid status",
+			req: moderationAccountStatusRequest{
+				Status:     "banned",
+				ReasonCode: "abuse",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := validateAccountStatusModeration(test.req)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("expected validation error")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateCharacterModeration(t *testing.T) {
+	name := "Fixed Name"
+	status := "locked"
+	isPrimary := true
+
+	tests := []struct {
+		name    string
+		req     moderationCharacterRequest
+		wantErr bool
+	}{
+		{
+			name: "valid all fields",
+			req: moderationCharacterRequest{
+				Name:       &name,
+				Status:     &status,
+				IsPrimary:  &isPrimary,
+				ReasonCode: "profile_fix",
+			},
+		},
+		{
+			name: "missing fields",
+			req: moderationCharacterRequest{
+				ReasonCode: "profile_fix",
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid name",
+			req: moderationCharacterRequest{
+				Name:       ptrString("ab"),
+				ReasonCode: "profile_fix",
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid status",
+			req: moderationCharacterRequest{
+				Status:     ptrString("retired"),
+				ReasonCode: "profile_fix",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := validateCharacterModeration(test.req)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("expected validation error")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+		})
+	}
+}
+
 func TestParseAuditLimit(t *testing.T) {
 	if got, err := parseAuditLimit(""); err != nil || got != defaultAuditLimit {
 		t.Fatalf("expected default limit %d, got %d, err=%v", defaultAuditLimit, got, err)
@@ -242,16 +352,26 @@ func TestParseAuditIDPathParam(t *testing.T) {
 	}
 }
 
+func TestParseCharacterIDPathParam(t *testing.T) {
+	if got, err := parseCharacterIDPathParam("12"); err != nil || got != 12 {
+		t.Fatalf("expected parsed character id 12,nil; got %d,%v", got, err)
+	}
+
+	if _, err := parseCharacterIDPathParam("0"); err == nil {
+		t.Fatal("expected error for zero character id")
+	}
+}
+
 func TestParseAuditFilters(t *testing.T) {
 	e := echo.New()
-	req := newMockRequest(t, "/v1/admin/audit?realmId=2&actorAccountId=8&actionKey=ACCOUNT_LOCK&beforeId=91&includeRawJson=true&limit=44")
+	req := newMockRequest(t, "/v1/admin/audit?realmId=2&actorAccountId=8&actorUsername=AdminOne&actionKey=ACCOUNT_LOCK&beforeId=91&includeRawJson=true&limit=44")
 	c := e.NewContext(req, newMockResponseRecorder())
 
 	filters, err := parseAuditFilters(c)
 	if err != nil {
 		t.Fatalf("unexpected parse error: %v", err)
 	}
-	if filters.RealmID != 2 || filters.ActorAccountID != 8 || filters.ActionKey != "account_lock" || filters.BeforeID != 91 || !filters.IncludeRawJSON || filters.Limit != 44 {
+	if filters.RealmID != 2 || filters.ActorAccountID != 8 || filters.ActorUsername != "adminone" || filters.ActionKey != "account_lock" || filters.BeforeID != 91 || !filters.IncludeRawJSON || filters.Limit != 44 {
 		t.Fatalf("unexpected parsed filters: %+v", filters)
 	}
 }
@@ -263,6 +383,30 @@ func TestParseAuditFilters_InvalidBeforeID(t *testing.T) {
 
 	if _, err := parseAuditFilters(c); err == nil {
 		t.Fatal("expected parse error for invalid beforeId")
+	}
+}
+
+func TestParseCharacterModerationFilters(t *testing.T) {
+	e := echo.New()
+	req := newMockRequest(t, "/v1/admin/moderation/characters?accountId=5&accountUsername=AlphaUser&realmId=2&status=ACTIVE&nameLike=alex&beforeId=91&limit=44")
+	c := e.NewContext(req, newMockResponseRecorder())
+
+	filters, err := parseCharacterModerationFilters(c)
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if filters.AccountID != 5 || filters.AccountUsername != "alphauser" || filters.RealmID != 2 || filters.Status != "active" || filters.NameLike != "alex" || filters.BeforeID != 91 || filters.Limit != 44 {
+		t.Fatalf("unexpected parsed filters: %+v", filters)
+	}
+}
+
+func TestParseCharacterModerationFilters_InvalidStatus(t *testing.T) {
+	e := echo.New()
+	req := newMockRequest(t, "/v1/admin/moderation/characters?status=retired")
+	c := e.NewContext(req, newMockResponseRecorder())
+
+	if _, err := parseCharacterModerationFilters(c); err == nil {
+		t.Fatal("expected parse error for invalid status")
 	}
 }
 
@@ -306,4 +450,8 @@ func newMockRequest(t *testing.T, target string) *http.Request {
 
 func newMockResponseRecorder() *httptest.ResponseRecorder {
 	return httptest.NewRecorder()
+}
+
+func ptrString(value string) *string {
+	return &value
 }

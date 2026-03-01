@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -26,6 +27,7 @@ const (
 	roleAdmin               = "admin"
 	statusActive            = "active"
 	statusLocked            = "locked"
+	realmControlStateKey    = "realm_pause_state"
 	defaultAuditLimit       = 100
 	maxAuditLimit           = 500
 	defaultStatsWindowTicks = int64(24 * 60)
@@ -33,10 +35,21 @@ const (
 
 	actionMarketResetDefaults = "market_reset_defaults"
 	actionMarketSetPrice      = "market_set_price"
+	actionRealmPause          = "realm_pause"
+	actionRealmResume         = "realm_resume"
+	actionRealmCreate         = "realm_create"
 	actionAccountLock         = "account_lock"
 	actionAccountUnlock       = "account_unlock"
+	actionAccountStatusSet    = "account_status_set"
 	actionRoleGrant           = "account_role_grant"
 	actionRoleRevoke          = "account_role_revoke"
+	actionCharacterModify     = "character_modify"
+)
+
+var (
+	errCannotLockOwnAccount   = errors.New("cannot lock your own account")
+	errCannotRevokeOwnAdmin   = errors.New("cannot revoke your own admin role")
+	errLastActiveAdminBlocked = errors.New("operation would remove the last active admin account")
 )
 
 type apiResponse struct {
@@ -74,6 +87,21 @@ type moderationRoleRequest struct {
 	Note       string `json:"note,omitempty"`
 }
 
+type moderationAccountStatusRequest struct {
+	Status         string `json:"status"`
+	ReasonCode     string `json:"reasonCode"`
+	Note           string `json:"note,omitempty"`
+	RevokeSessions *bool  `json:"revokeSessions,omitempty"`
+}
+
+type moderationCharacterRequest struct {
+	Name       *string `json:"name,omitempty"`
+	Status     *string `json:"status,omitempty"`
+	IsPrimary  *bool   `json:"isPrimary,omitempty"`
+	ReasonCode string  `json:"reasonCode"`
+	Note       string  `json:"note,omitempty"`
+}
+
 type validatedRoleModeration struct {
 	RoleKey    string
 	Action     string
@@ -81,13 +109,39 @@ type validatedRoleModeration struct {
 	Note       string
 }
 
+type validatedAccountStatusModeration struct {
+	Status         string
+	ReasonCode     string
+	Note           string
+	RevokeSessions bool
+}
+
+type validatedCharacterModeration struct {
+	Name       *string
+	Status     *string
+	IsPrimary  *bool
+	ReasonCode string
+	Note       string
+}
+
 type auditQuery struct {
 	RealmID        uint
 	ActorAccountID uint
+	ActorUsername  string
 	ActionKey      string
 	BeforeID       uint
 	IncludeRawJSON bool
 	Limit          int
+}
+
+type characterModerationQuery struct {
+	AccountID       uint
+	AccountUsername string
+	RealmID         uint
+	Status          string
+	NameLike        string
+	BeforeID        uint
+	Limit           int
 }
 
 func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
@@ -103,7 +157,18 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 	group.POST("/realms/:id/actions", makeRealmActionHandler(database), authMW, requireAdminRole())
 	group.POST("/moderation/accounts/:id/lock", makeAccountLockHandler(database), authMW, requireAdminRole())
 	group.POST("/moderation/accounts/:id/unlock", makeAccountUnlockHandler(database), authMW, requireAdminRole())
+	group.POST("/moderation/accounts/:id/status", makeAccountStatusHandler(database), authMW, requireAdminRole())
 	group.POST("/moderation/accounts/:id/roles", makeAccountRoleModerationHandler(database), authMW, requireAdminRole())
+	group.GET("/moderation/characters", makeCharacterModerationListHandler(database), authMW, requireAdminRole())
+	group.POST("/moderation/characters/:id", makeCharacterModerationHandler(database), authMW, requireAdminRole())
+	group.POST("/chat/channels", makeChatChannelCreateHandler(database), authMW, requireAdminRole())
+	group.DELETE("/chat/channels/:key", makeChatChannelRemoveHandler(database), authMW, requireAdminRole())
+	group.POST("/chat/channels/:key/flush", makeChatChannelFlushHandler(database), authMW, requireAdminRole())
+	group.POST("/chat/channels/:key/moderation", makeChatChannelModerationHandler(database), authMW, requireAdminRole())
+	group.POST("/chat/channels/:key/system-message", makeChatSystemMessageHandler(database), authMW, requireAdminRole())
+	group.GET("/chat/wordlist", makeChatWordlistListHandler(database), authMW, requireAdminRole())
+	group.POST("/chat/wordlist", makeChatWordlistAddHandler(database), authMW, requireAdminRole())
+	group.DELETE("/chat/wordlist/:ruleId", makeChatWordlistRemoveHandler(database), authMW, requireAdminRole())
 	group.GET("/stats", makeStatsHandler(database), authMW, requireAdminRole())
 }
 
@@ -120,6 +185,9 @@ func makeAuditHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 		if filters.ActorAccountID != 0 {
 			query = query.Where("actor_account_id = ?", filters.ActorAccountID)
+		}
+		if filters.ActorUsername != "" {
+			query = query.Joins("JOIN accounts actor_accounts ON actor_accounts.id = admin_audit_events.actor_account_id").Where("LOWER(actor_accounts.username) LIKE ?", "%"+strings.ToLower(filters.ActorUsername)+"%")
 		}
 		if filters.ActionKey != "" {
 			query = query.Where("action_key = ?", filters.ActionKey)
@@ -163,6 +231,7 @@ func makeAuditHandler(database *gorm.DB) echo.HandlerFunc {
 			"filters": map[string]any{
 				"realmId":        filters.RealmID,
 				"actorAccountId": filters.ActorAccountID,
+				"actorUsername":  filters.ActorUsername,
 				"actionKey":      filters.ActionKey,
 				"beforeId":       filters.BeforeID,
 				"includeRawJson": filters.IncludeRawJSON,
@@ -230,6 +299,9 @@ func makeAuditExportHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 		if filters.ActorAccountID != 0 {
 			query = query.Where("actor_account_id = ?", filters.ActorAccountID)
+		}
+		if filters.ActorUsername != "" {
+			query = query.Joins("JOIN accounts actor_accounts ON actor_accounts.id = admin_audit_events.actor_account_id").Where("LOWER(actor_accounts.username) LIKE ?", "%"+strings.ToLower(filters.ActorUsername)+"%")
 		}
 		if filters.ActionKey != "" {
 			query = query.Where("action_key = ?", filters.ActionKey)
@@ -509,6 +581,30 @@ func makeRealmActionHandler(database *gorm.DB) echo.HandlerFunc {
 				afterState = after
 				resultData["itemKey"] = action.ItemKey
 				resultData["price"] = action.Price
+			case actionRealmPause:
+				before, after, revokedSessions, applyErr := applyRealmPause(c.Request().Context(), tx, realmID, action.ReasonCode, action.Note, tick)
+				if applyErr != nil {
+					return applyErr
+				}
+				beforeState = before
+				afterState = after
+				resultData["revokedSessions"] = revokedSessions
+			case actionRealmResume:
+				before, after, applyErr := applyRealmResume(c.Request().Context(), tx, realmID, action.ReasonCode, action.Note, tick)
+				if applyErr != nil {
+					return applyErr
+				}
+				beforeState = before
+				afterState = after
+			case actionRealmCreate:
+				before, after, applyErr := applyRealmCreate(c.Request().Context(), tx, realmID)
+				if applyErr != nil {
+					return applyErr
+				}
+				beforeState = before
+				afterState = after
+			default:
+				return fmt.Errorf("unsupported realm action")
 			}
 
 			beforeJSON, encodeErr := encodeJSON(beforeState)
@@ -571,7 +667,7 @@ func makeAccountLockHandler(database *gorm.DB) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
-		tick, err := adminAuditTick(c.Request().Context(), database)
+		tick, err := adminAuditTick(c.Request().Context(), database, 1)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
 		}
@@ -585,6 +681,23 @@ func makeAccountLockHandler(database *gorm.DB) echo.HandlerFunc {
 			}
 			if query.RowsAffected == 0 {
 				return gorm.ErrRecordNotFound
+			}
+			if accountID == actor.AccountID {
+				return errCannotLockOwnAccount
+			}
+
+			hasAdminRole, err := accountHasRole(c.Request().Context(), tx, accountID, roleAdmin)
+			if err != nil {
+				return err
+			}
+			if hasAdminRole {
+				remainingAdmins, err := countActiveAdminAccountsExcluding(c.Request().Context(), tx, accountID)
+				if err != nil {
+					return err
+				}
+				if remainingAdmins == 0 {
+					return errLastActiveAdminBlocked
+				}
 			}
 
 			previous := map[string]any{"status": account.Status}
@@ -615,6 +728,12 @@ func makeAccountLockHandler(database *gorm.DB) echo.HandlerFunc {
 			if err == gorm.ErrRecordNotFound {
 				return echo.NewHTTPError(http.StatusNotFound, "account not found")
 			}
+			if errors.Is(err, errCannotLockOwnAccount) {
+				return echo.NewHTTPError(http.StatusConflict, errCannotLockOwnAccount.Error())
+			}
+			if errors.Is(err, errLastActiveAdminBlocked) {
+				return echo.NewHTTPError(http.StatusConflict, errLastActiveAdminBlocked.Error())
+			}
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to lock account")
 		}
 
@@ -644,7 +763,7 @@ func makeAccountUnlockHandler(database *gorm.DB) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
-		tick, err := adminAuditTick(c.Request().Context(), database)
+		tick, err := adminAuditTick(c.Request().Context(), database, 1)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
 		}
@@ -709,7 +828,7 @@ func makeAccountRoleModerationHandler(database *gorm.DB) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
-		tick, err := adminAuditTick(c.Request().Context(), database)
+		tick, err := adminAuditTick(c.Request().Context(), database, 1)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
 		}
@@ -744,6 +863,20 @@ func makeAccountRoleModerationHandler(database *gorm.DB) echo.HandlerFunc {
 					}
 				}
 			case "revoke":
+				if validated.RoleKey == roleAdmin {
+					if accountID == actor.AccountID {
+						return errCannotRevokeOwnAdmin
+					}
+
+					remainingAdmins, err := countActiveAdminAccountsExcluding(c.Request().Context(), tx, accountID)
+					if err != nil {
+						return err
+					}
+					if remainingAdmins == 0 {
+						return errLastActiveAdminBlocked
+					}
+				}
+
 				if err := tx.WithContext(c.Request().Context()).Where("account_id = ? AND role_key = ?", accountID, validated.RoleKey).Delete(&dal.AccountRole{}).Error; err != nil {
 					return err
 				}
@@ -775,10 +908,331 @@ func makeAccountRoleModerationHandler(database *gorm.DB) echo.HandlerFunc {
 			if err == gorm.ErrRecordNotFound {
 				return echo.NewHTTPError(http.StatusNotFound, "account not found")
 			}
+			if errors.Is(err, errCannotRevokeOwnAdmin) {
+				return echo.NewHTTPError(http.StatusConflict, errCannotRevokeOwnAdmin.Error())
+			}
+			if errors.Is(err, errLastActiveAdminBlocked) {
+				return echo.NewHTTPError(http.StatusConflict, errLastActiveAdminBlocked.Error())
+			}
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to moderate account role")
 		}
 
 		return respondSuccess(c, http.StatusOK, "Account role moderation applied.", result)
+	}
+}
+
+func makeAccountStatusHandler(database *gorm.DB) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		accountID, err := parseAccountIDPathParam(c.Param("id"))
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+		if !ok {
+			return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+		}
+
+		var req moderationAccountStatusRequest
+		if err := c.Bind(&req); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "invalid account status payload")
+		}
+
+		validated, err := validateAccountStatusModeration(req)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		tick, err := adminAuditTick(c.Request().Context(), database, 1)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+		}
+
+		result := map[string]any{}
+		err = database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
+			account := dal.Account{}
+			query := tx.WithContext(c.Request().Context()).Where("id = ?", accountID).Limit(1).Find(&account)
+			if query.Error != nil {
+				return query.Error
+			}
+			if query.RowsAffected == 0 {
+				return gorm.ErrRecordNotFound
+			}
+
+			if validated.Status == statusLocked {
+				if accountID == actor.AccountID {
+					return errCannotLockOwnAccount
+				}
+
+				hasAdminRole, err := accountHasRole(c.Request().Context(), tx, accountID, roleAdmin)
+				if err != nil {
+					return err
+				}
+				if hasAdminRole {
+					remainingAdmins, err := countActiveAdminAccountsExcluding(c.Request().Context(), tx, accountID)
+					if err != nil {
+						return err
+					}
+					if remainingAdmins == 0 {
+						return errLastActiveAdminBlocked
+					}
+				}
+			}
+
+			previous := map[string]any{"status": account.Status}
+			if err := tx.WithContext(c.Request().Context()).Model(&dal.Account{}).Where("id = ?", accountID).Update("status", validated.Status).Error; err != nil {
+				return err
+			}
+
+			revokedSessions := int64(0)
+			if validated.RevokeSessions {
+				updates := tx.WithContext(c.Request().Context()).Model(&dal.AccountSession{}).
+					Where("account_id = ? AND revoked_at IS NULL", accountID).
+					Update("revoked_at", gorm.Expr("NOW()"))
+				if updates.Error != nil {
+					return updates.Error
+				}
+				revokedSessions = updates.RowsAffected
+			}
+
+			after := map[string]any{
+				"status":          validated.Status,
+				"revokeSessions":  validated.RevokeSessions,
+				"revokedSessions": revokedSessions,
+			}
+			if err := appendAdminAudit(tx, actor.AccountID, actionAccountStatusSet, validated.ReasonCode, validated.Note, previous, after, tick, 1); err != nil {
+				return err
+			}
+
+			result["accountId"] = accountID
+			result["status"] = validated.Status
+			result["revokeSessions"] = validated.RevokeSessions
+			result["revokedSessions"] = revokedSessions
+			result["reasonCode"] = validated.ReasonCode
+			result["occurredTick"] = tick
+			return nil
+		})
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return echo.NewHTTPError(http.StatusNotFound, "account not found")
+			}
+			if errors.Is(err, errCannotLockOwnAccount) {
+				return echo.NewHTTPError(http.StatusConflict, errCannotLockOwnAccount.Error())
+			}
+			if errors.Is(err, errLastActiveAdminBlocked) {
+				return echo.NewHTTPError(http.StatusConflict, errLastActiveAdminBlocked.Error())
+			}
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to update account status")
+		}
+
+		return respondSuccess(c, http.StatusOK, "Account status updated.", result)
+	}
+}
+
+func makeCharacterModerationHandler(database *gorm.DB) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		characterID, err := parseCharacterIDPathParam(c.Param("id"))
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+		if !ok {
+			return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+		}
+
+		var req moderationCharacterRequest
+		if err := c.Bind(&req); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "invalid character moderation payload")
+		}
+
+		validated, err := validateCharacterModeration(req)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		tick, err := adminAuditTick(c.Request().Context(), database, 1)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+		}
+
+		result := map[string]any{}
+		err = database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
+			character := dal.Character{}
+			query := tx.WithContext(c.Request().Context()).Where("id = ?", characterID).Limit(1).Find(&character)
+			if query.Error != nil {
+				return query.Error
+			}
+			if query.RowsAffected == 0 {
+				return gorm.ErrRecordNotFound
+			}
+
+			before := map[string]any{
+				"name":      character.Name,
+				"status":    character.Status,
+				"isPrimary": character.IsPrimary,
+			}
+
+			updates := map[string]any{}
+			if validated.Name != nil {
+				updates["name"] = *validated.Name
+			}
+			if validated.Status != nil {
+				updates["status"] = *validated.Status
+			}
+
+			if len(updates) > 0 {
+				if err := tx.WithContext(c.Request().Context()).Model(&dal.Character{}).Where("id = ?", characterID).Updates(updates).Error; err != nil {
+					return err
+				}
+			}
+
+			if validated.IsPrimary != nil {
+				if *validated.IsPrimary {
+					if err := tx.WithContext(c.Request().Context()).Model(&dal.Character{}).
+						Where("account_id = ?", character.AccountID).
+						Update("is_primary", false).Error; err != nil {
+						return err
+					}
+				}
+				if err := tx.WithContext(c.Request().Context()).Model(&dal.Character{}).
+					Where("id = ?", characterID).
+					Update("is_primary", *validated.IsPrimary).Error; err != nil {
+					return err
+				}
+			}
+
+			updated := dal.Character{}
+			if err := tx.WithContext(c.Request().Context()).Where("id = ?", characterID).Limit(1).Find(&updated).Error; err != nil {
+				return err
+			}
+
+			after := map[string]any{
+				"name":      updated.Name,
+				"status":    updated.Status,
+				"isPrimary": updated.IsPrimary,
+			}
+			if err := appendAdminAudit(tx, actor.AccountID, actionCharacterModify, validated.ReasonCode, validated.Note, before, after, tick, updated.RealmID); err != nil {
+				return err
+			}
+
+			result["characterId"] = updated.ID
+			result["accountId"] = updated.AccountID
+			result["playerId"] = updated.PlayerID
+			result["realmId"] = updated.RealmID
+			result["name"] = updated.Name
+			result["status"] = updated.Status
+			result["isPrimary"] = updated.IsPrimary
+			result["reasonCode"] = validated.ReasonCode
+			result["occurredTick"] = tick
+			return nil
+		})
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return echo.NewHTTPError(http.StatusNotFound, "character not found")
+			}
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to moderate character")
+		}
+
+		return respondSuccess(c, http.StatusOK, "Character moderation applied.", result)
+	}
+}
+
+func makeCharacterModerationListHandler(database *gorm.DB) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		filters, err := parseCharacterModerationFilters(c)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		query := database.WithContext(c.Request().Context()).Model(&dal.Character{})
+		if filters.AccountID != 0 {
+			query = query.Where("account_id = ?", filters.AccountID)
+		}
+		if filters.AccountUsername != "" {
+			query = query.Joins("JOIN accounts ON accounts.id = characters.account_id").Where("LOWER(accounts.username) LIKE ?", "%"+strings.ToLower(filters.AccountUsername)+"%")
+		}
+		if filters.RealmID != 0 {
+			query = query.Where("realm_id = ?", filters.RealmID)
+		}
+		if filters.Status != "" {
+			query = query.Where("status = ?", filters.Status)
+		}
+		if filters.NameLike != "" {
+			query = query.Where("LOWER(name) LIKE ?", "%"+strings.ToLower(filters.NameLike)+"%")
+		}
+		if filters.BeforeID != 0 {
+			query = query.Where("id < ?", filters.BeforeID)
+		}
+
+		rows := make([]dal.Character, 0)
+		if err := query.Order("id DESC").Limit(filters.Limit + 1).Find(&rows).Error; err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load characters")
+		}
+
+		hasMore := len(rows) > filters.Limit
+		nextBeforeID := uint(0)
+		if hasMore {
+			rows = rows[:filters.Limit]
+			nextBeforeID = rows[len(rows)-1].ID
+		}
+
+		accountIDs := make([]uint, 0, len(rows))
+		seenAccount := map[uint]struct{}{}
+		for _, row := range rows {
+			if _, exists := seenAccount[row.AccountID]; exists {
+				continue
+			}
+			seenAccount[row.AccountID] = struct{}{}
+			accountIDs = append(accountIDs, row.AccountID)
+		}
+
+		accountRows := make([]dal.Account, 0, len(accountIDs))
+		if len(accountIDs) > 0 {
+			if err := database.WithContext(c.Request().Context()).
+				Select("id, username").
+				Where("id IN ?", accountIDs).
+				Find(&accountRows).Error; err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character account info")
+			}
+		}
+
+		accountUsernameByID := map[uint]string{}
+		for _, account := range accountRows {
+			accountUsernameByID[account.ID] = account.Username
+		}
+
+		entries := make([]map[string]any, 0, len(rows))
+		for _, row := range rows {
+			entries = append(entries, map[string]any{
+				"id":              row.ID,
+				"accountId":       row.AccountID,
+				"accountUsername": accountUsernameByID[row.AccountID],
+				"playerId":        row.PlayerID,
+				"realmId":         row.RealmID,
+				"name":            row.Name,
+				"isPrimary":       row.IsPrimary,
+				"status":          row.Status,
+				"updatedAt":       row.UpdatedAt,
+			})
+		}
+
+		return respondSuccess(c, http.StatusOK, "Character moderation list loaded.", map[string]any{
+			"filters": map[string]any{
+				"accountId":       filters.AccountID,
+				"accountUsername": filters.AccountUsername,
+				"realmId":         filters.RealmID,
+				"status":          filters.Status,
+				"nameLike":        filters.NameLike,
+				"beforeId":        filters.BeforeID,
+				"limit":           filters.Limit,
+			},
+			"pagination": map[string]any{
+				"hasMore":      hasMore,
+				"nextBeforeId": nextBeforeID,
+			},
+			"entries": entries,
+		})
 	}
 }
 
@@ -794,6 +1248,14 @@ func parseAccountIDPathParam(raw string) (uint, error) {
 	parsed, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
 	if err != nil || parsed == 0 {
 		return 0, fmt.Errorf("account id must be a positive integer")
+	}
+	return uint(parsed), nil
+}
+
+func parseCharacterIDPathParam(raw string) (uint, error) {
+	parsed, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+	if err != nil || parsed == 0 {
+		return 0, fmt.Errorf("character id must be a positive integer")
 	}
 	return uint(parsed), nil
 }
@@ -832,6 +1294,11 @@ func parseAuditFilters(c echo.Context) (auditQuery, error) {
 		return auditQuery{}, fmt.Errorf("actionKey must be 64 characters or less")
 	}
 
+	actorUsername := strings.TrimSpace(strings.ToLower(c.QueryParam("actorUsername")))
+	if len(actorUsername) > 64 {
+		return auditQuery{}, fmt.Errorf("actorUsername must be 64 characters or less")
+	}
+
 	limit, err := parseAuditLimit(c.QueryParam("limit"))
 	if err != nil {
 		return auditQuery{}, err
@@ -840,10 +1307,58 @@ func parseAuditFilters(c echo.Context) (auditQuery, error) {
 	return auditQuery{
 		RealmID:        realmID,
 		ActorAccountID: actorAccountID,
+		ActorUsername:  actorUsername,
 		ActionKey:      actionKey,
 		BeforeID:       beforeID,
 		IncludeRawJSON: includeRawJSON,
 		Limit:          limit,
+	}, nil
+}
+
+func parseCharacterModerationFilters(c echo.Context) (characterModerationQuery, error) {
+	accountID, err := parseOptionalUintQuery(c.QueryParam("accountId"), "accountId")
+	if err != nil {
+		return characterModerationQuery{}, err
+	}
+
+	accountUsername := strings.TrimSpace(strings.ToLower(c.QueryParam("accountUsername")))
+	if len(accountUsername) > 64 {
+		return characterModerationQuery{}, fmt.Errorf("accountUsername must be 64 characters or less")
+	}
+
+	realmID, err := parseOptionalUintQuery(c.QueryParam("realmId"), "realmId")
+	if err != nil {
+		return characterModerationQuery{}, err
+	}
+
+	beforeID, err := parseOptionalUintQuery(c.QueryParam("beforeId"), "beforeId")
+	if err != nil {
+		return characterModerationQuery{}, err
+	}
+
+	status := strings.TrimSpace(strings.ToLower(c.QueryParam("status")))
+	if status != "" && status != statusActive && status != statusLocked {
+		return characterModerationQuery{}, fmt.Errorf("status must be active or locked")
+	}
+
+	nameLike := strings.TrimSpace(c.QueryParam("nameLike"))
+	if len(nameLike) > 64 {
+		return characterModerationQuery{}, fmt.Errorf("nameLike must be 64 characters or less")
+	}
+
+	limit, err := parseAuditLimit(c.QueryParam("limit"))
+	if err != nil {
+		return characterModerationQuery{}, err
+	}
+
+	return characterModerationQuery{
+		AccountID:       accountID,
+		AccountUsername: accountUsername,
+		RealmID:         realmID,
+		Status:          status,
+		NameLike:        nameLike,
+		BeforeID:        beforeID,
+		Limit:           limit,
 	}, nil
 }
 
@@ -958,6 +1473,8 @@ func validateRealmAction(req realmActionRequest) (validatedRealmAction, error) {
 			return validatedRealmAction{}, fmt.Errorf("price must be a positive integer for market_set_price")
 		}
 		return validated, nil
+	case actionRealmPause, actionRealmResume, actionRealmCreate:
+		return validated, nil
 	default:
 		return validatedRealmAction{}, fmt.Errorf("unsupported action")
 	}
@@ -1012,8 +1529,74 @@ func validateRoleModeration(req moderationRoleRequest) (validatedRoleModeration,
 	}, nil
 }
 
-func adminAuditTick(ctx context.Context, database *gorm.DB) (int64, error) {
-	return gameplay.CurrentWorldTickForRealm(ctx, database, 1)
+func validateAccountStatusModeration(req moderationAccountStatusRequest) (validatedAccountStatusModeration, error) {
+	status := strings.TrimSpace(strings.ToLower(req.Status))
+	if status != statusActive && status != statusLocked {
+		return validatedAccountStatusModeration{}, fmt.Errorf("status must be active or locked")
+	}
+
+	reasonCode, note, err := validateReasonAndNote(req.ReasonCode, req.Note)
+	if err != nil {
+		return validatedAccountStatusModeration{}, err
+	}
+
+	revokeSessions := status == statusLocked
+	if req.RevokeSessions != nil {
+		revokeSessions = *req.RevokeSessions
+	}
+
+	return validatedAccountStatusModeration{
+		Status:         status,
+		ReasonCode:     reasonCode,
+		Note:           note,
+		RevokeSessions: revokeSessions,
+	}, nil
+}
+
+func validateCharacterModeration(req moderationCharacterRequest) (validatedCharacterModeration, error) {
+	reasonCode, note, err := validateReasonAndNote(req.ReasonCode, req.Note)
+	if err != nil {
+		return validatedCharacterModeration{}, err
+	}
+
+	validated := validatedCharacterModeration{
+		ReasonCode: reasonCode,
+		Note:       note,
+	}
+
+	if req.Name != nil {
+		trimmed := strings.TrimSpace(*req.Name)
+		if len(trimmed) < 3 || len(trimmed) > 64 {
+			return validatedCharacterModeration{}, fmt.Errorf("name must be between 3 and 64 characters")
+		}
+		validated.Name = &trimmed
+	}
+
+	if req.Status != nil {
+		trimmedStatus := strings.TrimSpace(strings.ToLower(*req.Status))
+		if trimmedStatus != statusActive && trimmedStatus != statusLocked {
+			return validatedCharacterModeration{}, fmt.Errorf("status must be active or locked")
+		}
+		validated.Status = &trimmedStatus
+	}
+
+	if req.IsPrimary != nil {
+		isPrimary := *req.IsPrimary
+		validated.IsPrimary = &isPrimary
+	}
+
+	if validated.Name == nil && validated.Status == nil && validated.IsPrimary == nil {
+		return validatedCharacterModeration{}, fmt.Errorf("at least one character field must be provided")
+	}
+
+	return validated, nil
+}
+
+func adminAuditTick(ctx context.Context, database *gorm.DB, realmID uint) (int64, error) {
+	if realmID == 0 {
+		realmID = 1
+	}
+	return gameplay.CurrentWorldTickForRealm(ctx, database, realmID)
 }
 
 func appendAdminAudit(tx *gorm.DB, actorAccountID uint, actionKey, reasonCode, note string, before any, after any, tick int64, realmID uint) error {
@@ -1052,6 +1635,185 @@ func loadAccountRoles(ctx context.Context, database *gorm.DB, accountID uint) ([
 	}
 	sort.Strings(roles)
 	return roles, nil
+}
+
+func accountHasRole(ctx context.Context, database *gorm.DB, accountID uint, roleKey string) (bool, error) {
+	var count int64
+	err := database.WithContext(ctx).
+		Model(&dal.AccountRole{}).
+		Where("account_id = ? AND role_key = ?", accountID, roleKey).
+		Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+
+	return count > 0, nil
+}
+
+func countActiveAdminAccountsExcluding(ctx context.Context, database *gorm.DB, excludedAccountID uint) (int64, error) {
+	query := database.WithContext(ctx).
+		Model(&dal.AccountRole{}).
+		Joins("JOIN accounts ON accounts.id = account_roles.account_id").
+		Where("account_roles.role_key = ? AND accounts.status = ?", roleAdmin, statusActive)
+	if excludedAccountID != 0 {
+		query = query.Where("account_roles.account_id <> ?", excludedAccountID)
+	}
+
+	var count int64
+	err := query.Distinct("account_roles.account_id").Count(&count).Error
+	if err != nil {
+		return 0, err
+	}
+
+	return count, nil
+}
+
+func applyRealmPause(ctx context.Context, tx *gorm.DB, realmID uint, reasonCode, note string, tick int64) (map[string]any, map[string]any, int64, error) {
+	beforePaused, beforeReason, err := loadRealmPauseState(ctx, tx, realmID)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	updates := tx.WithContext(ctx).Model(&dal.AccountSession{}).
+		Where("account_id IN (SELECT DISTINCT account_id FROM characters WHERE realm_id = ? AND status = ?) AND revoked_at IS NULL", realmID, statusActive).
+		Update("revoked_at", gorm.Expr("NOW()"))
+	if updates.Error != nil {
+		return nil, nil, 0, updates.Error
+	}
+
+	state := map[string]any{
+		"paused":        true,
+		"reasonCode":    reasonCode,
+		"note":          note,
+		"effectiveTick": tick,
+	}
+	encoded, err := encodeJSON(state)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	if err := upsertRealmControlState(ctx, tx, realmID, 1, encoded); err != nil {
+		return nil, nil, 0, err
+	}
+
+	return map[string]any{"paused": beforePaused, "reasonCode": beforeReason}, state, updates.RowsAffected, nil
+}
+
+func applyRealmResume(ctx context.Context, tx *gorm.DB, realmID uint, reasonCode, note string, tick int64) (map[string]any, map[string]any, error) {
+	beforePaused, beforeReason, err := loadRealmPauseState(ctx, tx, realmID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	state := map[string]any{
+		"paused":        false,
+		"reasonCode":    reasonCode,
+		"note":          note,
+		"effectiveTick": tick,
+	}
+	encoded, err := encodeJSON(state)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := upsertRealmControlState(ctx, tx, realmID, 0, encoded); err != nil {
+		return nil, nil, err
+	}
+
+	return map[string]any{"paused": beforePaused, "reasonCode": beforeReason}, state, nil
+}
+
+func applyRealmCreate(ctx context.Context, tx *gorm.DB, realmID uint) (map[string]any, map[string]any, error) {
+	before := map[string]any{"existed": false}
+	created := map[string]any{"worldState": false, "worldRuntime": false, "realmControl": false}
+
+	state := dal.WorldState{}
+	stateResult := tx.WithContext(ctx).Where("realm_id = ?", realmID).Limit(1).Find(&state)
+	if stateResult.Error != nil {
+		return nil, nil, stateResult.Error
+	}
+	if stateResult.RowsAffected > 0 {
+		before["existed"] = true
+	} else {
+		if err := tx.WithContext(ctx).Create(&dal.WorldState{RealmID: realmID, SimulationTick: 0}).Error; err != nil {
+			return nil, nil, err
+		}
+		created["worldState"] = true
+	}
+
+	runtime := dal.WorldRuntimeState{}
+	runtimeResult := tx.WithContext(ctx).Where("realm_id = ? AND key = ?", realmID, "world").Limit(1).Find(&runtime)
+	if runtimeResult.Error != nil {
+		return nil, nil, runtimeResult.Error
+	}
+	if runtimeResult.RowsAffected == 0 {
+		if err := tx.WithContext(ctx).Create(&dal.WorldRuntimeState{
+			RealmID:              realmID,
+			Key:                  "world",
+			LastProcessedTickAt:  time.Now().UTC(),
+			CarryGameMinutes:     0,
+			PendingBehaviorsJSON: "[]",
+		}).Error; err != nil {
+			return nil, nil, err
+		}
+		created["worldRuntime"] = true
+	}
+
+	if err := upsertRealmControlState(ctx, tx, realmID, 0, `{"paused":false}`); err != nil {
+		return nil, nil, err
+	}
+	created["realmControl"] = true
+
+	after := map[string]any{"realmId": realmID, "created": created}
+	return before, after, nil
+}
+
+func loadRealmPauseState(ctx context.Context, database *gorm.DB, realmID uint) (bool, string, error) {
+	state := dal.WorldRuntimeState{}
+	result := database.WithContext(ctx).Where("realm_id = ? AND key = ?", realmID, realmControlStateKey).Limit(1).Find(&state)
+	if result.Error != nil {
+		return false, "", result.Error
+	}
+	if result.RowsAffected == 0 {
+		return false, "", nil
+	}
+
+	reasonCode := ""
+	decoded := map[string]any{}
+	if err := json.Unmarshal([]byte(state.PendingBehaviorsJSON), &decoded); err == nil {
+		if rawReason, ok := decoded["reasonCode"].(string); ok {
+			reasonCode = strings.TrimSpace(rawReason)
+		}
+	}
+
+	return state.CarryGameMinutes >= 1, reasonCode, nil
+}
+
+func upsertRealmControlState(ctx context.Context, database *gorm.DB, realmID uint, pausedFlag float64, payload string) error {
+	state := dal.WorldRuntimeState{}
+	result := database.WithContext(ctx).Where("realm_id = ? AND key = ?", realmID, realmControlStateKey).Limit(1).Find(&state)
+	if result.Error != nil {
+		return result.Error
+	}
+
+	now := time.Now().UTC()
+	if result.RowsAffected == 0 {
+		return database.WithContext(ctx).Create(&dal.WorldRuntimeState{
+			RealmID:              realmID,
+			Key:                  realmControlStateKey,
+			LastProcessedTickAt:  now,
+			CarryGameMinutes:     pausedFlag,
+			PendingBehaviorsJSON: payload,
+		}).Error
+	}
+
+	return database.WithContext(ctx).Model(&dal.WorldRuntimeState{}).
+		Where("id = ?", state.ID).
+		Updates(map[string]any{
+			"last_processed_tick_at": now,
+			"carry_game_minutes":     pausedFlag,
+			"pending_behaviors_json": payload,
+		}).Error
 }
 
 func applyMarketResetDefaults(_ context.Context, tx *gorm.DB, realmID uint, tick int64) (map[string]int64, map[string]int64, error) {

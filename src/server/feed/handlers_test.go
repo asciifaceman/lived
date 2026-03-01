@@ -32,3 +32,32 @@ func TestPositiveMinuteOfDay(t *testing.T) {
 		t.Fatalf("expected 61, got %d", got)
 	}
 }
+
+func TestParseOptionalPositiveUint_Empty(t *testing.T) {
+	value, err := parseOptionalPositiveUint("", "characterId")
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if value != 0 {
+		t.Fatalf("expected zero for empty input, got %d", value)
+	}
+}
+
+func TestParseOptionalPositiveUint_Valid(t *testing.T) {
+	value, err := parseOptionalPositiveUint("12", "characterId")
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if value != 12 {
+		t.Fatalf("expected parsed value 12, got %d", value)
+	}
+}
+
+func TestParseOptionalPositiveUint_Invalid(t *testing.T) {
+	if _, err := parseOptionalPositiveUint("0", "characterId"); err == nil {
+		t.Fatal("expected error for zero value")
+	}
+	if _, err := parseOptionalPositiveUint("abc", "characterId"); err == nil {
+		t.Fatal("expected error for non-numeric value")
+	}
+}

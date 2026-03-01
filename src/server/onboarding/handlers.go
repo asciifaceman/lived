@@ -14,6 +14,7 @@ import (
 )
 
 const statusSuccess = "success"
+const realmPauseStateKey = "realm_pause_state"
 
 type startRequest struct {
 	Name    string `json:"name"`
@@ -94,6 +95,14 @@ func makeStartHandler(database *gorm.DB) echo.HandlerFunc {
 			realmID = 1
 		}
 
+		paused, err := isRealmPaused(c.Request().Context(), database, realmID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to resolve realm maintenance state")
+		}
+		if paused {
+			return echo.NewHTTPError(http.StatusLocked, "realm is under maintenance")
+		}
+
 		existing := dal.Character{}
 		res := database.WithContext(c.Request().Context()).
 			Where("account_id = ? AND realm_id = ?", actor.AccountID, realmID).
@@ -108,7 +117,7 @@ func makeStartHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		createdCharacter := dal.Character{}
-		err := database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
+		err = database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
 			var accountCharacterCount int64
 			if err := tx.Model(&dal.Character{}).Where("account_id = ?", actor.AccountID).Count(&accountCharacterCount).Error; err != nil {
 				return err
@@ -195,4 +204,20 @@ func isUniqueConstraint(err error) bool {
 	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "duplicate key") || strings.Contains(message, "unique constraint")
+}
+
+func isRealmPaused(ctx context.Context, database *gorm.DB, realmID uint) (bool, error) {
+	state := dal.WorldRuntimeState{}
+	result := database.WithContext(ctx).
+		Where("realm_id = ? AND key = ?", realmID, realmPauseStateKey).
+		Limit(1).
+		Find(&state)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return false, nil
+	}
+
+	return state.CarryGameMinutes >= 1, nil
 }

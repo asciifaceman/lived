@@ -47,6 +47,10 @@ type Config struct {
 	MMOChatEnabled           bool
 	MMOAdminEnabled          bool
 	MMOOTelEnabled           bool
+	OTELServiceName          string
+	OTELEndpoint             string
+	OTELInsecure             bool
+	OTELSampleRatio          float64
 	MMOJWTIssuer             string
 	MMOJWTSecret             string
 	MMOAccessTokenTTL        time.Duration
@@ -91,6 +95,10 @@ func LoadFromEnv() Config {
 	mmoChatEnabled := getBoolOrDefault("LIVED_MMO_CHAT_ENABLED", true)
 	mmoAdminEnabled := getBoolOrDefault("LIVED_MMO_ADMIN_ENABLED", true)
 	mmoOTelEnabled := getBoolOrDefault("LIVED_MMO_OTEL_ENABLED", false)
+	otelServiceName := getEnvOrDefault("LIVED_OTEL_SERVICE_NAME", "lived")
+	otelEndpoint := getEnvOrDefault("LIVED_OTEL_ENDPOINT", "localhost:4317")
+	otelInsecure := getBoolOrDefault("LIVED_OTEL_INSECURE", true)
+	otelSampleRatio := getOTELSampleRatio("LIVED_OTEL_SAMPLE_RATIO", getDefaultOTELSampleRatio(getEnvOrDefault("LIVED_ENV", "development")))
 	mmoJWTIssuer := getEnvOrDefault("LIVED_MMO_JWT_ISSUER", "lived")
 	mmoJWTSecret := getEnvOrDefault("LIVED_MMO_JWT_SECRET", "")
 	if mmoAuthEnabled && mmoJWTSecret == "" {
@@ -131,6 +139,10 @@ func LoadFromEnv() Config {
 			MMOChatEnabled:           mmoChatEnabled,
 			MMOAdminEnabled:          mmoAdminEnabled,
 			MMOOTelEnabled:           mmoOTelEnabled,
+			OTELServiceName:          otelServiceName,
+			OTELEndpoint:             otelEndpoint,
+			OTELInsecure:             otelInsecure,
+			OTELSampleRatio:          otelSampleRatio,
 			MMOJWTIssuer:             mmoJWTIssuer,
 			MMOJWTSecret:             mmoJWTSecret,
 			MMOAccessTokenTTL:        mmoAccessTokenTTL,
@@ -163,6 +175,10 @@ func LoadFromEnv() Config {
 		MMOChatEnabled:           mmoChatEnabled,
 		MMOAdminEnabled:          mmoAdminEnabled,
 		MMOOTelEnabled:           mmoOTelEnabled,
+		OTELServiceName:          otelServiceName,
+		OTELEndpoint:             otelEndpoint,
+		OTELInsecure:             otelInsecure,
+		OTELSampleRatio:          otelSampleRatio,
 		MMOJWTIssuer:             mmoJWTIssuer,
 		MMOJWTSecret:             mmoJWTSecret,
 		MMOAccessTokenTTL:        mmoAccessTokenTTL,
@@ -261,4 +277,32 @@ func getRateLimitIdentityOrDefault(key string, fallback string) string {
 	default:
 		return fallback
 	}
+}
+
+func getOTELSampleRatio(key string, fallback float64) float64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return fallback
+	}
+	if parsed < 0 {
+		return 0
+	}
+	if parsed > 1 {
+		return 1
+	}
+
+	return parsed
+}
+
+func getDefaultOTELSampleRatio(env string) float64 {
+	normalized := strings.ToLower(strings.TrimSpace(env))
+	if normalized == "production" || normalized == "prod" {
+		return 0.1
+	}
+	return 1.0
 }

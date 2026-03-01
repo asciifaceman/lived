@@ -8,7 +8,10 @@ import (
 
 	"github.com/asciifaceman/lived/pkg/config"
 	"github.com/asciifaceman/lived/pkg/dal"
+	"github.com/asciifaceman/lived/pkg/telemetry"
 	"github.com/asciifaceman/lived/src/gameplay"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"gorm.io/gorm"
 )
 
@@ -17,6 +20,8 @@ const (
 	tickDBTimeout        = 10 * time.Second
 	defaultRealmID       = uint(1)
 )
+
+var worldLoopTracer = otel.Tracer("lived/world-loop")
 
 func runWorldLoop(ctx context.Context, cfg config.Config, database *gorm.DB) error {
 	startupTime := time.Now().UTC()
@@ -44,6 +49,9 @@ func runWorldLoop(ctx context.Context, cfg config.Config, database *gorm.DB) err
 }
 
 func runTickAtForKnownRealms(database *gorm.DB, cfg config.Config, tickTime time.Time) error {
+	spanCtx, span := worldLoopTracer.Start(context.Background(), "world.tick.discover_realms")
+	defer span.End()
+
 	discoveryCtx, cancel := context.WithTimeout(context.Background(), tickDBTimeout)
 	defer cancel()
 
@@ -53,7 +61,11 @@ func runTickAtForKnownRealms(database *gorm.DB, cfg config.Config, tickTime time
 	}
 
 	for _, realmID := range realmIDs {
-		if err := runTickAt(database, cfg, tickTime, realmID); err != nil {
+		realmCtx, realmSpan := worldLoopTracer.Start(spanCtx, "world.tick.realm")
+		realmSpan.SetAttributes(attribute.Int64("realm.id", int64(realmID)))
+		err := runTickAtWithContext(realmCtx, database, cfg, tickTime, realmID)
+		realmSpan.End()
+		if err != nil {
 			return err
 		}
 	}
@@ -62,11 +74,27 @@ func runTickAtForKnownRealms(database *gorm.DB, cfg config.Config, tickTime time
 }
 
 func runTickAt(database *gorm.DB, cfg config.Config, tickTime time.Time, realmID uint) error {
+	return runTickAtWithContext(context.Background(), database, cfg, tickTime, realmID)
+}
+
+func runTickAtWithContext(ctx context.Context, database *gorm.DB, cfg config.Config, tickTime time.Time, realmID uint) error {
+	_, span := worldLoopTracer.Start(ctx, "world.tick.realm.process")
+	span.SetAttributes(attribute.Int64("realm.id", int64(realmID)))
+	defer span.End()
+
+	startedAt := time.Now()
+	advanceByMinutes := int64(0)
+	failed := false
+	defer func() {
+		telemetry.RecordWorldTick(ctx, realmID, advanceByMinutes, time.Since(startedAt), failed)
+	}()
+
 	opCtx, cancel := context.WithTimeout(context.Background(), tickDBTimeout)
 	defer cancel()
 
 	runtimeState, err := loadOrInitRuntimeState(opCtx, database, realmID)
 	if err != nil {
+		failed = true
 		return opCtxErrGuard(err)
 	}
 
@@ -80,26 +108,34 @@ func runTickAt(database *gorm.DB, cfg config.Config, tickTime time.Time, realmID
 	}
 
 	gameMinutesFloat := cfg.GameMinutesRate*(elapsed.Minutes()) + runtimeState.CarryGameMinutes
-	advanceByMinutes := int64(gameMinutesFloat)
+	advanceByMinutes = int64(gameMinutesFloat)
+	span.SetAttributes(attribute.Int64("tick.advance_minutes", advanceByMinutes))
 	runtimeState.CarryGameMinutes = gameMinutesFloat - float64(advanceByMinutes)
 	runtimeState.LastProcessedTickAt = tickTime
 
 	currentTick, err := advanceWorldAndPersistRuntime(opCtx, database, advanceByMinutes, runtimeState, realmID)
 	if err != nil {
+		failed = true
 		return opCtxErrGuard(err)
 	}
 
 	if err := gameplay.ProcessWorldTickForRealm(opCtx, database, currentTick, realmID); err != nil {
+		failed = true
 		return opCtxErrGuard(err)
 	}
 
 	pendingSummary, err := gameplay.BuildPendingBehaviorSummaryJSONForRealm(opCtx, database, realmID)
 	if err != nil {
+		failed = true
 		return opCtxErrGuard(err)
 	}
 	runtimeState.PendingBehaviorsJSON = pendingSummary
 
-	return opCtxErrGuard(persistRuntimeState(opCtx, database, runtimeState, realmID))
+	err = persistRuntimeState(opCtx, database, runtimeState, realmID)
+	if err != nil {
+		failed = true
+	}
+	return opCtxErrGuard(err)
 }
 
 func listKnownRealmIDs(ctx context.Context, database *gorm.DB) ([]uint, error) {

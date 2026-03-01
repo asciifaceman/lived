@@ -62,14 +62,18 @@ func makeHTTPErrorHandler(logger *slog.Logger) echo.HTTPErrorHandler {
 			requestID = c.Request().Header.Get(echo.HeaderXRequestID)
 		}
 
-		logger.Error(
-			"http_error",
+		attrs := []any{
 			"status", statusCode,
 			"request_id", requestID,
 			"method", c.Request().Method,
 			"path", c.Path(),
 			"error", err,
-		)
+		}
+		if correlation := traceLogAttrs(c.Request().Context()); len(correlation) > 0 {
+			attrs = append(attrs, correlation...)
+		}
+
+		logger.Error("http_error", attrs...)
 
 		_ = c.JSON(statusCode, apiResponse{
 			Status:    statusError,

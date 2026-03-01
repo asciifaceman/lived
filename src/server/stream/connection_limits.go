@@ -1,6 +1,11 @@
 package stream
 
-import "sync"
+import (
+	"context"
+	"sync"
+
+	"github.com/asciifaceman/lived/pkg/telemetry"
+)
 
 type streamConnectionLimiter struct {
 	maxPerAccount int
@@ -32,6 +37,7 @@ func (l *streamConnectionLimiter) tryAcquire(accountID uint, sessionID uint) boo
 		return true
 	}
 	if accountID == 0 || sessionID == 0 {
+		telemetry.StreamConnectionRejected(context.Background(), "invalid_identity")
 		return false
 	}
 
@@ -40,6 +46,7 @@ func (l *streamConnectionLimiter) tryAcquire(accountID uint, sessionID uint) boo
 
 	accountCount := l.byAccount[accountID]
 	if accountCount >= l.maxPerAccount {
+		telemetry.StreamConnectionRejected(context.Background(), "per_account_limit")
 		return false
 	}
 
@@ -51,11 +58,13 @@ func (l *streamConnectionLimiter) tryAcquire(accountID uint, sessionID uint) boo
 
 	sessionCount := sessionMap[sessionID]
 	if sessionCount >= l.maxPerSession {
+		telemetry.StreamConnectionRejected(context.Background(), "per_session_limit")
 		return false
 	}
 
 	l.byAccount[accountID] = accountCount + 1
 	sessionMap[sessionID] = sessionCount + 1
+	telemetry.StreamConnectionOpened(context.Background())
 	return true
 }
 
@@ -90,4 +99,6 @@ func (l *streamConnectionLimiter) release(accountID uint, sessionID uint) {
 	if len(sessionMap) == 0 {
 		delete(l.byAccountSess, accountID)
 	}
+
+	telemetry.StreamConnectionClosed(context.Background())
 }

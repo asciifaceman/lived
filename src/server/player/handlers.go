@@ -36,6 +36,8 @@ type playerStatusData struct {
 	HasPrimaryPlayer bool                          `json:"hasPrimaryPlayer"`
 	PlayerName       string                        `json:"playerName,omitempty"`
 	Inventory        map[string]int64              `json:"inventory"`
+	CoreStats        map[string]int64              `json:"coreStats"`
+	DerivedStats     map[string]int64              `json:"derivedStats"`
 	Stats            map[string]int64              `json:"stats"`
 	Behaviors        []gameplay.BehaviorView       `json:"behaviors"`
 	AscensionCount   int64                         `json:"ascensionCount"`
@@ -88,14 +90,20 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 
 func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		save, err := loadCurrentSave(c.Request().Context(), database)
-		if err != nil {
-			return err
-		}
+		save := saveGame{SimulationTick: 0, Players: []string{}}
+		encodedSave := ""
+		if !cfg.MMOAuthEnabled {
+			loadedSave, err := loadCurrentSave(c.Request().Context(), database)
+			if err != nil {
+				return err
+			}
+			save = loadedSave
 
-		encodedSave, err := encodeSave(save)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to encode save")
+			encoded, err := encodeSave(save)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to encode save")
+			}
+			encodedSave = encoded
 		}
 
 		data := playerStatusData{
@@ -108,6 +116,8 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 			WorldAgeDays:     save.SimulationTick / (60 * 24),
 			HasPrimaryPlayer: false,
 			Inventory:        map[string]int64{},
+			CoreStats:        map[string]int64{},
+			DerivedStats:     map[string]int64{},
 			Stats:            map[string]int64{},
 			Behaviors:        []gameplay.BehaviorView{},
 			Ascension:        gameplay.AscensionEligibility{},
@@ -193,6 +203,8 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 		data.HasPrimaryPlayer = true
 		data.PlayerName = resolvedName
 		data.Inventory = snapshot.Inventory
+		data.CoreStats = snapshot.CoreStats
+		data.DerivedStats = snapshot.DerivedStats
 		data.Stats = snapshot.Stats
 		data.Behaviors = filterPlayerBehaviors(snapshot.Behaviors, resolvedPlayer.ID)
 		data.AscensionCount = snapshot.AscensionCount
@@ -204,12 +216,16 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 }
 
 func loadActorCharacter(ctx context.Context, database *gorm.DB, accountID uint, characterID uint) (*dal.Character, error) {
+	const defaultRealmID uint = 1
+
 	character := &dal.Character{}
 	query := database.WithContext(ctx).
 		Where("account_id = ? AND status = ?", accountID, "active")
 
 	if characterID != 0 {
 		query = query.Where("id = ?", characterID)
+	} else {
+		query = query.Where("realm_id = ?", defaultRealmID)
 	}
 
 	result := query.Order("is_primary DESC, id ASC").Limit(1).Find(character)
@@ -246,9 +262,13 @@ func currentVersionData() versionData {
 
 func makeInventoryHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		simulationTick, err := gameplay.CurrentWorldTick(c.Request().Context(), database)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+		simulationTick := int64(0)
+		if !cfg.MMOAuthEnabled {
+			loadedTick, err := gameplay.CurrentWorldTick(c.Request().Context(), database)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+			}
+			simulationTick = loadedTick
 		}
 
 		data := playerInventoryData{
@@ -336,9 +356,13 @@ func makeInventoryHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc
 
 func makeBehaviorsHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		simulationTick, err := gameplay.CurrentWorldTick(c.Request().Context(), database)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+		simulationTick := int64(0)
+		if !cfg.MMOAuthEnabled {
+			loadedTick, err := gameplay.CurrentWorldTick(c.Request().Context(), database)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+			}
+			simulationTick = loadedTick
 		}
 
 		data := playerBehaviorsData{
@@ -483,8 +507,23 @@ func encodeSave(save saveGame) (string, error) {
 }
 
 func loadPrimaryPlayer(ctx context.Context, database *gorm.DB) (*dal.Player, error) {
+	const defaultRealmID uint = 1
+
+	character := &dal.Character{}
+	characterResult := database.WithContext(ctx).
+		Where("realm_id = ? AND status = ?", defaultRealmID, "active").
+		Order("is_primary DESC, id ASC").
+		Limit(1).
+		Find(character)
+	if characterResult.Error != nil {
+		return nil, characterResult.Error
+	}
+	if characterResult.RowsAffected == 0 {
+		return nil, nil
+	}
+
 	player := &dal.Player{}
-	result := database.WithContext(ctx).Order("id ASC").Limit(1).Find(player)
+	result := database.WithContext(ctx).Where("id = ?", character.PlayerID).Limit(1).Find(player)
 	if result.Error != nil {
 		return nil, result.Error
 	}

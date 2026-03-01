@@ -1,5 +1,15 @@
 # 40 Persistence Instructions
 
+## Release Phase (Pre-Alpha)
+
+- The project is currently **pre-alpha**.
+- During pre-alpha, prefer speed over compatibility for persistence work:
+	- breaking schema changes are acceptable,
+	- backward-compatible migration paths are optional,
+	- destructive reset/recreate flows are acceptable for local/test databases.
+- Assume developers may frequently recreate databases while iterating.
+- When pre-alpha ends (explicitly stated by the user or removed from instructions), return to conservative migration planning and compatibility expectations.
+
 ## Model Conventions
 
 - Use `dal.BaseModel` for ID and timestamps.

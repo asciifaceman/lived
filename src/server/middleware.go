@@ -3,6 +3,8 @@ package server
 import (
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
@@ -25,12 +27,13 @@ func registerMiddleware(e *echo.Echo, logger *slog.Logger, customMiddlewares []e
 		LogContentLength: true,
 		LogResponseSize:  true,
 		LogValuesFunc: func(c echo.Context, values middleware.RequestLoggerValues) error {
+			safeURI := sanitizeLoggedURI(values.URI)
 			attrs := []any{
 				"request_id", values.RequestID,
 				"remote_ip", values.RemoteIP,
 				"host", values.Host,
 				"method", values.Method,
-				"uri", values.URI,
+				"uri", safeURI,
 				"user_agent", values.UserAgent,
 				"status", values.Status,
 				"latency", values.Latency.String(),
@@ -40,6 +43,10 @@ func registerMiddleware(e *echo.Echo, logger *slog.Logger, customMiddlewares []e
 
 			if values.Error != nil {
 				attrs = append(attrs, "error", values.Error.Error())
+			}
+
+			if correlation := traceLogAttrs(c.Request().Context()); len(correlation) > 0 {
+				attrs = append(attrs, correlation...)
 			}
 
 			switch {
@@ -58,4 +65,27 @@ func registerMiddleware(e *echo.Echo, logger *slog.Logger, customMiddlewares []e
 	for _, middlewareFunc := range customMiddlewares {
 		e.Use(middlewareFunc)
 	}
+}
+
+func sanitizeLoggedURI(uri string) string {
+	parsed, err := url.ParseRequestURI(uri)
+	if err != nil || parsed == nil {
+		return uri
+	}
+
+	if parsed.RawQuery == "" {
+		return uri
+	}
+
+	query := parsed.Query()
+	for key := range query {
+		normalized := strings.ToLower(strings.TrimSpace(key))
+		switch normalized {
+		case "accesstoken", "access_token", "refreshtoken", "refresh_token", "token", "authorization":
+			query.Set(key, "<redacted>")
+		}
+	}
+
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }

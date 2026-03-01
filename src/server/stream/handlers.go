@@ -63,7 +63,7 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 
 	handler := makeWorldStreamHandler(database, cfg, limiter)
 	if cfg.MMOAuthEnabled {
-		group.GET("/world", handler, serverAuth.RequireAuth(database, cfg))
+		group.GET("/world", handler, serverAuth.RequireAuthWithQueryAccessToken(database, cfg))
 		return
 	}
 	group.GET("/world", handler)
@@ -240,6 +240,8 @@ func writeWorldSnapshot(ctx context.Context, conn *websocket.Conn, database *gor
 }
 
 func resolveStreamViewer(ctx context.Context, rawCharacterID string, database *gorm.DB) (*streamViewer, error) {
+	const defaultRealmID uint = 1
+
 	actor, ok := serverAuth.ActorFromContext(ctx)
 	if !ok {
 		return nil, echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
@@ -254,6 +256,8 @@ func resolveStreamViewer(ctx context.Context, rawCharacterID string, database *g
 			return nil, echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
 		}
 		query = query.Where("id = ?", uint(parsed))
+	} else {
+		query = query.Where("realm_id = ?", defaultRealmID)
 	}
 
 	character := dal.Character{}
@@ -269,8 +273,23 @@ func resolveStreamViewer(ctx context.Context, rawCharacterID string, database *g
 }
 
 func loadPrimaryPlayer(ctx context.Context, database *gorm.DB) (*dal.Player, error) {
+	const defaultRealmID uint = 1
+
+	character := &dal.Character{}
+	characterResult := database.WithContext(ctx).
+		Where("realm_id = ? AND status = ?", defaultRealmID, "active").
+		Order("is_primary DESC, id ASC").
+		Limit(1).
+		Find(character)
+	if characterResult.Error != nil {
+		return nil, characterResult.Error
+	}
+	if characterResult.RowsAffected == 0 {
+		return nil, nil
+	}
+
 	player := &dal.Player{}
-	result := database.WithContext(ctx).Order("id ASC").Limit(1).Find(player)
+	result := database.WithContext(ctx).Where("id = ?", character.PlayerID).Limit(1).Find(player)
 	if result.Error != nil {
 		return nil, result.Error
 	}

@@ -17,10 +17,13 @@ import (
 )
 
 const (
-	behaviorQueued    = "queued"
-	behaviorActive    = "active"
-	behaviorCompleted = "completed"
-	behaviorFailed    = "failed"
+	behaviorQueued          = "queued"
+	behaviorActive          = "active"
+	behaviorCompleted       = "completed"
+	behaviorFailed          = "failed"
+	behaviorModeOnce        = "once"
+	behaviorModeRepeat      = "repeat"
+	behaviorModeRepeatUntil = "repeat-until"
 
 	worldRuntimeStateKey = "world"
 	ascensionKey         = "global"
@@ -36,18 +39,24 @@ const (
 	defaultMarketWaitDurationMinutes int64 = 24 * 60
 	maxMarketWaitDurationMinutes     int64 = 14 * 24 * 60
 
-	statStrength = "strength"
-	statSocial   = "social"
+	statStrength  = "strength"
+	statSocial    = "social"
+	statEndurance = "endurance"
 
 	statStamina              = "stamina"
 	statMaxStamina           = "max_stamina"
 	statStaminaRecoveryRate  = "stamina_recovery_rate"
 	statStaminaRecoveryCarry = "stamina_recovery_carry"
-	statStaminaTrainingXP    = "stamina_training_xp"
 
 	defaultMaxStamina          int64 = 100
 	defaultStaminaRecoveryRate int64 = 8
-	recoveryXPPerRatePoint     int64 = 120
+
+	maxStaminaPerEndurancePoint     int64 = 3
+	recoveryRatePerEnduranceDivisor int64 = 4
+
+	restBehaviorKey                 = "player_rest"
+	restRecoveryMultiplier    int64 = 4
+	restMinimumRecoveryPoints int64 = 6
 )
 
 var ErrAscensionNotEligible = errors.New("ascension is not yet available")
@@ -58,6 +67,9 @@ type BehaviorView struct {
 	ActorType                 string `json:"actorType"`
 	ActorID                   uint   `json:"actorId"`
 	State                     string `json:"state"`
+	Mode                      string `json:"mode,omitempty"`
+	RepeatIntervalMinutes     int64  `json:"repeatIntervalMinutes,omitempty"`
+	RepeatUntilTick           int64  `json:"repeatUntilTick,omitempty"`
 	ScheduledAt               int64  `json:"scheduledAtTick"`
 	StartedAt                 int64  `json:"startedAtTick"`
 	CompletesAt               int64  `json:"completesAtTick"`
@@ -80,6 +92,8 @@ type RecentEventView struct {
 
 type WorldSnapshot struct {
 	Inventory      map[string]int64     `json:"inventory"`
+	CoreStats      map[string]int64     `json:"coreStats"`
+	DerivedStats   map[string]int64     `json:"derivedStats"`
 	Stats          map[string]int64     `json:"stats"`
 	MarketPrices   map[string]int64     `json:"marketPrices"`
 	Behaviors      []BehaviorView       `json:"behaviors"`
@@ -128,11 +142,16 @@ type MarketHistoryEntry struct {
 type QueueBehaviorOptions struct {
 	MarketWaitDurationMinutes int64
 	RealmID                   uint
+	Mode                      string
+	RepeatUntilTick           int64
 }
 
 type behaviorRuntimePayload struct {
-	MarketWaitDurationMinutes int64 `json:"marketWaitDurationMinutes,omitempty"`
-	MarketWaitUntilTick       int64 `json:"marketWaitUntilTick,omitempty"`
+	MarketWaitDurationMinutes int64  `json:"marketWaitDurationMinutes,omitempty"`
+	MarketWaitUntilTick       int64  `json:"marketWaitUntilTick,omitempty"`
+	Mode                      string `json:"mode,omitempty"`
+	RepeatIntervalMinutes     int64  `json:"repeatIntervalMinutes,omitempty"`
+	RepeatUntilTick           int64  `json:"repeatUntilTick,omitempty"`
 }
 
 func QueuePlayerBehavior(ctx context.Context, database *gorm.DB, playerID uint, behaviorKey string, currentTick int64, options QueueBehaviorOptions) error {
@@ -141,8 +160,30 @@ func QueuePlayerBehavior(ctx context.Context, database *gorm.DB, playerID uint, 
 	}
 
 	definition, _ := GetBehaviorDefinition(behaviorKey)
+	mode := strings.ToLower(strings.TrimSpace(options.Mode))
+	if mode == "" {
+		mode = behaviorModeOnce
+	}
+	if mode != behaviorModeOnce && mode != behaviorModeRepeat && mode != behaviorModeRepeatUntil {
+		return fmt.Errorf("mode must be once, repeat, or repeat-until")
+	}
 
-	payload := behaviorRuntimePayload{}
+	realmID := normalizeRealmID(options.RealmID)
+	if hasConflict, err := hasActiveExclusiveConflict(ctx, database, dal.BehaviorInstance{
+		RealmID:   realmID,
+		ActorType: ActorPlayer,
+		ActorID:   playerID,
+	}, definition); err != nil {
+		return err
+	} else if hasConflict {
+		group := behaviorExclusiveGroup(definition)
+		if group == "" {
+			group = "exclusive"
+		}
+		return fmt.Errorf("cannot queue %s while another %s behavior is active", behaviorKey, group)
+	}
+
+	payload := behaviorRuntimePayload{Mode: mode}
 	if definition.RequiresMarketOpen {
 		waitDuration := options.MarketWaitDurationMinutes
 		if waitDuration <= 0 {
@@ -156,25 +197,37 @@ func QueuePlayerBehavior(ctx context.Context, database *gorm.DB, playerID uint, 
 		payload.MarketWaitUntilTick = currentTick + waitDuration
 	}
 
+	if mode == behaviorModeRepeat || mode == behaviorModeRepeatUntil {
+		repeatIntervalMinutes := definition.DurationMinutes
+		if repeatIntervalMinutes <= 0 {
+			return fmt.Errorf("behavior duration must be positive for repeat mode")
+		}
+		payload.RepeatIntervalMinutes = repeatIntervalMinutes
+	}
+
+	if mode == behaviorModeRepeatUntil {
+		if options.RepeatUntilTick <= currentTick {
+			return fmt.Errorf("repeatUntil must resolve to a future tick")
+		}
+		payload.RepeatUntilTick = options.RepeatUntilTick
+	}
+
 	payloadJSON, err := marshalBehaviorRuntimePayload(payload)
 	if err != nil {
 		return err
 	}
 
 	instance := dal.BehaviorInstance{
-		RealmID:         options.RealmID,
-		Key:             behaviorKey,
-		ActorType:       ActorPlayer,
-		ActorID:         playerID,
-		State:           behaviorQueued,
-		ScheduledAtTick: currentTick,
-		DurationMinutes: definition.DurationMinutes,
-		PayloadJSON:     payloadJSON,
+		RealmID:           realmID,
+		Key:               behaviorKey,
+		ActorType:         ActorPlayer,
+		ActorID:           playerID,
+		State:             behaviorQueued,
+		ScheduledAtTick:   currentTick,
+		DurationMinutes:   definition.DurationMinutes,
+		RepeatIntervalMin: payload.RepeatIntervalMinutes,
+		PayloadJSON:       payloadJSON,
 	}
-	if instance.RealmID == 0 {
-		instance.RealmID = 1
-	}
-
 	return database.WithContext(ctx).Create(&instance).Error
 }
 
@@ -338,6 +391,7 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint, re
 	if err != nil {
 		return WorldSnapshot{}, err
 	}
+	coreStats, derivedStats := splitCoreAndDerivedStats(stats)
 
 	marketRows := make([]dal.MarketPrice, 0)
 	if err := database.WithContext(ctx).Where("realm_id = ?", realmID).Order("item_key ASC").Find(&marketRows).Error; err != nil {
@@ -367,6 +421,9 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint, re
 			ActorType:                 behavior.ActorType,
 			ActorID:                   behavior.ActorID,
 			State:                     behavior.State,
+			Mode:                      payload.Mode,
+			RepeatIntervalMinutes:     maxInt64(behavior.RepeatIntervalMin, payload.RepeatIntervalMinutes),
+			RepeatUntilTick:           payload.RepeatUntilTick,
 			ScheduledAt:               behavior.ScheduledAtTick,
 			StartedAt:                 behavior.StartedAtTick,
 			CompletesAt:               behavior.CompletesAtTick,
@@ -409,6 +466,8 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint, re
 
 	return WorldSnapshot{
 		Inventory:      inventory,
+		CoreStats:      coreStats,
+		DerivedStats:   derivedStats,
 		Stats:          stats,
 		MarketPrices:   marketPrices,
 		Behaviors:      views,
@@ -417,6 +476,61 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint, re
 		WealthBonusPct: ascension.WealthBonusPct,
 		Ascension:      ascensionEligibility,
 	}, nil
+}
+
+func splitCoreAndDerivedStats(stats map[string]int64) (map[string]int64, map[string]int64) {
+	core := map[string]int64{
+		statStrength:  stats[statStrength],
+		statSocial:    stats[statSocial],
+		statEndurance: stats[statEndurance],
+	}
+
+	derived := map[string]int64{
+		statStamina:             stats[statStamina],
+		statMaxStamina:          stats[statMaxStamina],
+		statStaminaRecoveryRate: stats[statStaminaRecoveryRate],
+	}
+
+	return core, derived
+}
+
+func deriveStaminaByEndurance(endurance int64) (int64, int64) {
+	if endurance < 0 {
+		endurance = 0
+	}
+
+	maxStamina := defaultMaxStamina + (endurance * maxStaminaPerEndurancePoint)
+	if maxStamina < defaultMaxStamina {
+		maxStamina = defaultMaxStamina
+	}
+
+	recoveryRate := defaultStaminaRecoveryRate + (endurance / recoveryRatePerEnduranceDivisor)
+	if recoveryRate < defaultStaminaRecoveryRate {
+		recoveryRate = defaultStaminaRecoveryRate
+	}
+
+	return maxStamina, recoveryRate
+}
+
+func inferEnduranceFromLegacyStats(rawStats map[string]int64) int64 {
+	legacyMax := rawStats[statMaxStamina]
+	legacyRecovery := rawStats[statStaminaRecoveryRate]
+
+	fromMax := int64(0)
+	if legacyMax > defaultMaxStamina {
+		fromMax = (legacyMax - defaultMaxStamina) / maxStaminaPerEndurancePoint
+	}
+
+	fromRecovery := int64(0)
+	if legacyRecovery > defaultStaminaRecoveryRate {
+		fromRecovery = (legacyRecovery - defaultStaminaRecoveryRate) * recoveryRatePerEnduranceDivisor
+	}
+
+	if fromRecovery > fromMax {
+		return fromRecovery
+	}
+
+	return fromMax
 }
 
 func positiveMinuteOfDay(tick int64) int64 {
@@ -658,15 +772,7 @@ func loadPlayerCoinsForPlayer(ctx context.Context, database *gorm.DB, playerID u
 
 func loadPlayerStats(ctx context.Context, database *gorm.DB, playerID uint, realmID uint) (map[string]int64, error) {
 	realmID = normalizeRealmID(realmID)
-	stats := map[string]int64{
-		statStrength:             0,
-		statSocial:               0,
-		statMaxStamina:           defaultMaxStamina,
-		statStaminaRecoveryRate:  defaultStaminaRecoveryRate,
-		statStaminaRecoveryCarry: 0,
-		statStaminaTrainingXP:    0,
-		statStamina:              defaultMaxStamina,
-	}
+	rawStats := map[string]int64{}
 	rows := make([]dal.PlayerStat, 0)
 	if err := database.WithContext(ctx).
 		Where("realm_id = ? AND player_id = ?", realmID, playerID).
@@ -675,20 +781,53 @@ func loadPlayerStats(ctx context.Context, database *gorm.DB, playerID uint, real
 	}
 
 	for _, row := range rows {
-		stats[row.StatKey] = row.Value
+		rawStats[row.StatKey] = row.Value
 	}
 
-	if stats[statMaxStamina] <= 0 {
-		stats[statMaxStamina] = defaultMaxStamina
+	strength := rawStats[statStrength]
+	if strength < 0 {
+		strength = 0
 	}
-	if stats[statStaminaRecoveryRate] <= 0 {
-		stats[statStaminaRecoveryRate] = defaultStaminaRecoveryRate
+
+	social := rawStats[statSocial]
+	if social < 0 {
+		social = 0
 	}
-	if stats[statStamina] <= 0 {
-		stats[statStamina] = stats[statMaxStamina]
+
+	endurance, foundEndurance := rawStats[statEndurance]
+	if !foundEndurance {
+		endurance = inferEnduranceFromLegacyStats(rawStats)
 	}
-	if stats[statStamina] > stats[statMaxStamina] {
-		stats[statStamina] = stats[statMaxStamina]
+	if endurance < 0 {
+		endurance = 0
+	}
+
+	maxStamina, recoveryRate := deriveStaminaByEndurance(endurance)
+
+	stamina, foundStamina := rawStats[statStamina]
+	if !foundStamina {
+		stamina = maxStamina
+	}
+	if stamina < 0 {
+		stamina = 0
+	}
+	if stamina > maxStamina {
+		stamina = maxStamina
+	}
+
+	recoveryCarry := rawStats[statStaminaRecoveryCarry]
+	if recoveryCarry < 0 {
+		recoveryCarry = 0
+	}
+
+	stats := map[string]int64{
+		statStrength:             strength,
+		statSocial:               social,
+		statEndurance:            endurance,
+		statStamina:              stamina,
+		statMaxStamina:           maxStamina,
+		statStaminaRecoveryRate:  recoveryRate,
+		statStaminaRecoveryCarry: recoveryCarry,
 	}
 
 	return stats, nil
@@ -817,7 +956,13 @@ func consumeBehaviorStamina(ctx context.Context, tx *gorm.DB, behavior dal.Behav
 		return nil
 	}
 
-	current, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statStamina, defaultMaxStamina, behavior.RealmID)
+	endurance, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statEndurance, 0, behavior.RealmID)
+	if err != nil {
+		return err
+	}
+	maxStamina, _ := deriveStaminaByEndurance(endurance)
+
+	current, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statStamina, maxStamina, behavior.RealmID)
 	if err != nil {
 		return err
 	}
@@ -830,38 +975,6 @@ func consumeBehaviorStamina(ctx context.Context, tx *gorm.DB, behavior dal.Behav
 	}
 
 	return nil
-}
-
-func awardStaminaRecoveryProgress(ctx context.Context, tx *gorm.DB, behavior dal.BehaviorInstance, definition BehaviorDefinition) error {
-	if behavior.ActorType != ActorPlayer || behavior.ActorID == 0 || definition.StaminaCost <= 0 {
-		return nil
-	}
-
-	if err := applyStatDelta(ctx, tx, behavior.ActorID, behavior.RealmID, map[string]int64{statStaminaTrainingXP: definition.StaminaCost}); err != nil {
-		return err
-	}
-
-	xp, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statStaminaTrainingXP, 0, behavior.RealmID)
-	if err != nil {
-		return err
-	}
-	if xp < recoveryXPPerRatePoint {
-		return nil
-	}
-
-	gain := xp / recoveryXPPerRatePoint
-	remainingXP := xp % recoveryXPPerRatePoint
-
-	rate, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statStaminaRecoveryRate, defaultStaminaRecoveryRate, behavior.RealmID)
-	if err != nil {
-		return err
-	}
-
-	if err := setPlayerStatValue(ctx, tx, behavior.ActorID, statStaminaRecoveryRate, rate+gain, behavior.RealmID); err != nil {
-		return err
-	}
-
-	return setPlayerStatValue(ctx, tx, behavior.ActorID, statStaminaTrainingXP, remainingXP, behavior.RealmID)
 }
 
 func recoverPlayerStaminaTick(ctx context.Context, tx *gorm.DB, realmID uint) error {
@@ -878,23 +991,18 @@ func recoverPlayerStaminaTick(ctx context.Context, tx *gorm.DB, realmID uint) er
 	}
 
 	for _, characterPlayer := range characterPlayers {
-		maxStamina, err := getPlayerStatValueOrDefault(ctx, tx, characterPlayer.PlayerID, statMaxStamina, defaultMaxStamina, realmID)
+		endurance, err := getPlayerStatValueOrDefault(ctx, tx, characterPlayer.PlayerID, statEndurance, 0, realmID)
 		if err != nil {
 			return err
 		}
-		if maxStamina <= 0 {
-			maxStamina = defaultMaxStamina
-		}
-		recoveryRate, err := getPlayerStatValueOrDefault(ctx, tx, characterPlayer.PlayerID, statStaminaRecoveryRate, defaultStaminaRecoveryRate, realmID)
-		if err != nil {
-			return err
-		}
-		if recoveryRate <= 0 {
-			recoveryRate = defaultStaminaRecoveryRate
-		}
+		maxStamina, recoveryRate := deriveStaminaByEndurance(endurance)
+
 		currentStamina, err := getPlayerStatValueOrDefault(ctx, tx, characterPlayer.PlayerID, statStamina, maxStamina, realmID)
 		if err != nil {
 			return err
+		}
+		if currentStamina < 0 {
+			currentStamina = 0
 		}
 		recoveryCarry, err := getPlayerStatValueOrDefault(ctx, tx, characterPlayer.PlayerID, statStaminaRecoveryCarry, 0, realmID)
 		if err != nil {
@@ -910,12 +1018,6 @@ func recoverPlayerStaminaTick(ctx context.Context, tx *gorm.DB, realmID uint) er
 			next = maxStamina
 		}
 
-		if err := setPlayerStatValue(ctx, tx, characterPlayer.PlayerID, statMaxStamina, maxStamina, realmID); err != nil {
-			return err
-		}
-		if err := setPlayerStatValue(ctx, tx, characterPlayer.PlayerID, statStaminaRecoveryRate, recoveryRate, realmID); err != nil {
-			return err
-		}
 		if err := setPlayerStatValue(ctx, tx, characterPlayer.PlayerID, statStaminaRecoveryCarry, nextCarry, realmID); err != nil {
 			return err
 		}
@@ -1010,6 +1112,14 @@ func processActivations(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 		}
 
 		payload := parseBehaviorRuntimePayload(behavior.PayloadJSON)
+
+		hasConflict, err := hasActiveExclusiveConflict(ctx, tx, behavior, definition)
+		if err != nil {
+			return err
+		}
+		if hasConflict {
+			continue
+		}
 
 		if definition.RequiresMarketOpen && !IsMarketOpen(currentTick) {
 			if payload.MarketWaitUntilTick > 0 && currentTick >= payload.MarketWaitUntilTick {
@@ -1140,7 +1250,8 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 			continue
 		}
 
-		if err := awardStaminaRecoveryProgress(ctx, tx, behavior, definition); err != nil {
+		restMessage, err := applyRestRecoveryOnCompletion(ctx, tx, behavior, definition)
+		if err != nil {
 			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
 				return err
 			}
@@ -1162,6 +1273,9 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 		if dynamicMessage != "" {
 			message = strings.TrimSpace(message + " " + dynamicMessage)
 		}
+		if restMessage != "" {
+			message = strings.TrimSpace(message + " " + restMessage)
+		}
 		if marketMessage != "" {
 			message = strings.TrimSpace(message + " " + marketMessage)
 		}
@@ -1180,17 +1294,56 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 			return err
 		}
 
-		if definition.RepeatIntervalMin > 0 {
+		repeatIntervalMinutes := behavior.RepeatIntervalMin
+		if repeatIntervalMinutes <= 0 {
+			repeatIntervalMinutes = payload.RepeatIntervalMinutes
+		}
+		if repeatIntervalMinutes <= 0 {
+			repeatIntervalMinutes = definition.RepeatIntervalMin
+		}
+
+		shouldQueueNext := false
+		switch payload.Mode {
+		case behaviorModeOnce:
+			shouldQueueNext = false
+		case behaviorModeRepeat:
+			shouldQueueNext = repeatIntervalMinutes > 0
+		case behaviorModeRepeatUntil:
+			shouldQueueNext = repeatIntervalMinutes > 0 && (payload.RepeatUntilTick == 0 || currentTick < payload.RepeatUntilTick)
+		default:
+			shouldQueueNext = repeatIntervalMinutes > 0
+		}
+
+		if shouldQueueNext {
+			nextPayload := payload
+			if definition.RequiresMarketOpen {
+				waitDuration := payload.MarketWaitDurationMinutes
+				if waitDuration <= 0 {
+					waitDuration = defaultMarketWaitDurationMinutes
+				}
+				if waitDuration > maxMarketWaitDurationMinutes {
+					waitDuration = maxMarketWaitDurationMinutes
+				}
+
+				nextPayload.MarketWaitDurationMinutes = waitDuration
+				nextPayload.MarketWaitUntilTick = currentTick + waitDuration
+			}
+
+			nextPayloadJSON, err := marshalBehaviorRuntimePayload(nextPayload)
+			if err != nil {
+				return err
+			}
+
 			next := dal.BehaviorInstance{
 				RealmID:           behavior.RealmID,
 				Key:               behavior.Key,
 				ActorType:         behavior.ActorType,
 				ActorID:           behavior.ActorID,
 				State:             behaviorQueued,
-				ScheduledAtTick:   currentTick + definition.RepeatIntervalMin,
+				ScheduledAtTick:   currentTick + repeatIntervalMinutes,
 				DurationMinutes:   definition.DurationMinutes,
-				PayloadJSON:       "{}",
-				RepeatIntervalMin: definition.RepeatIntervalMin,
+				PayloadJSON:       nextPayloadJSON,
+				RepeatIntervalMin: repeatIntervalMinutes,
 			}
 			if err := tx.WithContext(ctx).Create(&next).Error; err != nil {
 				return err
@@ -1199,6 +1352,105 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 	}
 
 	return nil
+}
+
+func applyRestRecoveryOnCompletion(ctx context.Context, tx *gorm.DB, behavior dal.BehaviorInstance, definition BehaviorDefinition) (string, error) {
+	if behavior.ActorType != ActorPlayer || behavior.ActorID == 0 || behavior.Key != restBehaviorKey {
+		return "", nil
+	}
+
+	endurance, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statEndurance, 0, behavior.RealmID)
+	if err != nil {
+		return "", err
+	}
+	maxStamina, recoveryRate := deriveStaminaByEndurance(endurance)
+	currentStamina, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statStamina, maxStamina, behavior.RealmID)
+	if err != nil {
+		return "", err
+	}
+
+	recovered := computeRestRecoveryPoints(recoveryRate, definition.DurationMinutes)
+	if recovered <= 0 {
+		return "", nil
+	}
+
+	nextStamina := currentStamina + recovered
+	if nextStamina > maxStamina {
+		nextStamina = maxStamina
+	}
+
+	actualRecovered := nextStamina - currentStamina
+	if actualRecovered <= 0 {
+		return "Stamina is already full.", nil
+	}
+
+	if err := setPlayerStatValue(ctx, tx, behavior.ActorID, statStamina, nextStamina, behavior.RealmID); err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("Rest recovery restored %d stamina.", actualRecovered), nil
+}
+
+func computeRestRecoveryPoints(recoveryRate int64, durationMinutes int64) int64 {
+	if durationMinutes <= 0 {
+		durationMinutes = 1
+	}
+	if recoveryRate < 0 {
+		recoveryRate = 0
+	}
+
+	recovered := (recoveryRate * durationMinutes * restRecoveryMultiplier) / 60
+	if recovered < restMinimumRecoveryPoints {
+		recovered = restMinimumRecoveryPoints
+	}
+	return recovered
+}
+
+func behaviorExclusiveGroup(definition BehaviorDefinition) string {
+	return strings.ToLower(strings.TrimSpace(definition.ExclusiveGroup))
+}
+
+func behaviorDefinitionsConflict(left BehaviorDefinition, right BehaviorDefinition) bool {
+	leftGroup := behaviorExclusiveGroup(left)
+	rightGroup := behaviorExclusiveGroup(right)
+	if leftGroup == "" || rightGroup == "" {
+		return false
+	}
+	return leftGroup == rightGroup
+}
+
+func hasActiveExclusiveConflict(ctx context.Context, tx *gorm.DB, behavior dal.BehaviorInstance, definition BehaviorDefinition) (bool, error) {
+	if behaviorExclusiveGroup(definition) == "" {
+		return false, nil
+	}
+
+	active := make([]dal.BehaviorInstance, 0)
+	if err := tx.WithContext(ctx).
+		Where("realm_id = ? AND actor_type = ? AND actor_id = ? AND state = ?", behavior.RealmID, behavior.ActorType, behavior.ActorID, behaviorActive).
+		Find(&active).Error; err != nil {
+		return false, err
+	}
+
+	return hasExclusiveConflictWithActiveBehaviorKeys(definition, behavior.ID, active), nil
+}
+
+func hasExclusiveConflictWithActiveBehaviorKeys(definition BehaviorDefinition, candidateBehaviorID uint, active []dal.BehaviorInstance) bool {
+	for _, activeBehavior := range active {
+		if activeBehavior.ID == candidateBehaviorID {
+			continue
+		}
+
+		activeDefinition, ok := GetBehaviorDefinition(activeBehavior.Key)
+		if !ok {
+			continue
+		}
+
+		if behaviorDefinitionsConflict(definition, activeDefinition) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func validateRequirements(ctx context.Context, tx *gorm.DB, playerID uint, requirements Requirement, realmID uint) error {
@@ -1826,7 +2078,24 @@ func parseBehaviorRuntimePayload(raw string) behaviorRuntimePayload {
 	if payload.MarketWaitUntilTick < 0 {
 		payload.MarketWaitUntilTick = 0
 	}
+	payload.Mode = strings.ToLower(strings.TrimSpace(payload.Mode))
+	if payload.Mode != "" && payload.Mode != behaviorModeOnce && payload.Mode != behaviorModeRepeat && payload.Mode != behaviorModeRepeatUntil {
+		payload.Mode = behaviorModeOnce
+	}
+	if payload.RepeatIntervalMinutes < 0 {
+		payload.RepeatIntervalMinutes = 0
+	}
+	if payload.RepeatUntilTick < 0 {
+		payload.RepeatUntilTick = 0
+	}
 	return payload
+}
+
+func maxInt64(left int64, right int64) int64 {
+	if left >= right {
+		return left
+	}
+	return right
 }
 
 func marshalBehaviorRuntimePayload(payload behaviorRuntimePayload) (string, error) {
@@ -1926,7 +2195,12 @@ func SortBehaviorDefinitions(definitions []BehaviorDefinition) []BehaviorDefinit
 	sorted := make([]BehaviorDefinition, len(definitions))
 	copy(sorted, definitions)
 	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Key < sorted[j].Key
+		leftName := BehaviorDisplayName(sorted[i])
+		rightName := BehaviorDisplayName(sorted[j])
+		if leftName == rightName {
+			return sorted[i].Key < sorted[j].Key
+		}
+		return leftName < rightName
 	})
 	return sorted
 }

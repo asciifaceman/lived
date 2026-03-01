@@ -1,6 +1,11 @@
 package system
 
-import "testing"
+import (
+	"net/http/httptest"
+	"testing"
+
+	"github.com/labstack/echo/v4"
+)
 
 func TestParseGameDurationMinutes(t *testing.T) {
 	tests := []struct {
@@ -34,6 +39,107 @@ func TestParseGameDurationMinutes(t *testing.T) {
 			}
 			if got != test.want {
 				t.Fatalf("expected %d, got %d", test.want, got)
+			}
+		})
+	}
+}
+
+func TestParseOptionalPositiveUintQuery(t *testing.T) {
+	value, err := parseOptionalPositiveUintQuery("", "realmId", 1)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if value != 1 {
+		t.Fatalf("expected fallback value 1, got %d", value)
+	}
+
+	value, err = parseOptionalPositiveUintQuery("7", "realmId", 1)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if value != 7 {
+		t.Fatalf("expected parsed value 7, got %d", value)
+	}
+
+	if _, err := parseOptionalPositiveUintQuery("0", "realmId", 1); err == nil {
+		t.Fatal("expected error for zero value")
+	}
+}
+
+func TestParseMarketHistoryQuery(t *testing.T) {
+	e := echo.New()
+
+	req := httptest.NewRequest("GET", "/v1/system/market/history", nil)
+	c := e.NewContext(req, httptest.NewRecorder())
+	query, err := parseMarketHistoryQuery(c, 1)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if query.Limit != 100 {
+		t.Fatalf("expected default limit 100, got %d", query.Limit)
+	}
+	if query.Realm != 1 {
+		t.Fatalf("expected default realm 1, got %d", query.Realm)
+	}
+
+	req = httptest.NewRequest("GET", "/v1/system/market/history?symbol=wood&limit=999&realmId=3", nil)
+	c = e.NewContext(req, httptest.NewRecorder())
+	query, err = parseMarketHistoryQuery(c, 1)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if query.Symbol != "wood" {
+		t.Fatalf("expected symbol wood, got %q", query.Symbol)
+	}
+	if query.Limit != 500 {
+		t.Fatalf("expected clamped limit 500, got %d", query.Limit)
+	}
+	if query.Realm != 3 {
+		t.Fatalf("expected realm 3, got %d", query.Realm)
+	}
+
+	req = httptest.NewRequest("GET", "/v1/system/market/history?limit=0", nil)
+	c = e.NewContext(req, httptest.NewRecorder())
+	if _, err := parseMarketHistoryQuery(c, 1); err == nil {
+		t.Fatal("expected error for invalid limit")
+	}
+}
+
+func TestParseBehaviorQueueMode(t *testing.T) {
+	tests := []struct {
+		name            string
+		mode            string
+		repeatUntil     string
+		wantMode        string
+		wantRepeatUntil int64
+		wantErr         bool
+	}{
+		{name: "default once", mode: "", repeatUntil: "", wantMode: "once", wantRepeatUntil: 0},
+		{name: "repeat mode", mode: "repeat", repeatUntil: "", wantMode: "repeat", wantRepeatUntil: 0},
+		{name: "repeat-until", mode: "repeat-until", repeatUntil: "2h", wantMode: "repeat-until", wantRepeatUntil: 120},
+		{name: "invalid mode", mode: "loop", repeatUntil: "", wantErr: true},
+		{name: "repeat-until missing duration", mode: "repeat-until", repeatUntil: "", wantErr: true},
+		{name: "once with repeatUntil", mode: "once", repeatUntil: "30m", wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mode, repeatUntil, err := parseBehaviorQueueMode(test.mode, test.repeatUntil)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if mode != test.wantMode {
+				t.Fatalf("expected mode %q, got %q", test.wantMode, mode)
+			}
+			if repeatUntil != test.wantRepeatUntil {
+				t.Fatalf("expected repeatUntil %d, got %d", test.wantRepeatUntil, repeatUntil)
 			}
 		})
 	}

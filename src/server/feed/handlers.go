@@ -1,6 +1,7 @@
 package feed
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -8,11 +9,15 @@ import (
 	"github.com/asciifaceman/lived/pkg/config"
 	"github.com/asciifaceman/lived/pkg/dal"
 	"github.com/asciifaceman/lived/src/gameplay"
+	serverAuth "github.com/asciifaceman/lived/src/server/auth"
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
 )
 
-const statusSuccess = "success"
+const (
+	statusSuccess = "success"
+	statusActive  = "active"
+)
 
 type apiResponse struct {
 	Status    string `json:"status"`
@@ -33,15 +38,20 @@ type feedEvent struct {
 	ReferenceID uint   `json:"referenceId"`
 }
 
-func RegisterRoutes(group *echo.Group, database *gorm.DB, _ config.Config) {
-	group.GET("/public", makePublicFeedHandler(database))
+func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
+	if cfg.MMOAuthEnabled {
+		group.GET("/public", makePublicFeedHandler(database, cfg), serverAuth.RequireAuth(database, cfg))
+		return
+	}
+
+	group.GET("/public", makePublicFeedHandler(database, cfg))
 }
 
-func makePublicFeedHandler(database *gorm.DB) echo.HandlerFunc {
+func makePublicFeedHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		realmID, err := parseRealmID(c.QueryParam("realmId"))
+		realmID, err := resolveRealmIDForFeedRequest(c, database, cfg)
 		if err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+			return err
 		}
 
 		limit := 50
@@ -93,6 +103,82 @@ func makePublicFeedHandler(database *gorm.DB) echo.HandlerFunc {
 			"events":      events,
 		})
 	}
+}
+
+func resolveRealmIDForFeedRequest(c echo.Context, database *gorm.DB, cfg config.Config) (uint, error) {
+	realmID := uint(1)
+	rawRealmID := strings.TrimSpace(c.QueryParam("realmId"))
+	if rawRealmID != "" {
+		parsedRealmID, err := parseRealmID(rawRealmID)
+		if err != nil {
+			return 0, err
+		}
+		realmID = parsedRealmID
+	}
+
+	if !cfg.MMOAuthEnabled {
+		return realmID, nil
+	}
+
+	actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+	if !ok {
+		return 0, echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+	}
+
+	characterID, err := parseOptionalPositiveUint(c.QueryParam("characterId"), "characterId")
+	if err != nil {
+		return 0, err
+	}
+
+	character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, characterID)
+	if err != nil {
+		return 0, echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+	}
+	if character == nil {
+		return 0, echo.NewHTTPError(http.StatusBadRequest, "complete onboarding first")
+	}
+
+	if rawRealmID != "" && realmID != character.RealmID {
+		return 0, echo.NewHTTPError(http.StatusForbidden, "realmId does not match authenticated character realm")
+	}
+
+	return character.RealmID, nil
+}
+
+func parseOptionalPositiveUint(raw string, fieldName string) (uint, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, nil
+	}
+
+	parsed, err := strconv.ParseUint(trimmed, 10, 64)
+	if err != nil || parsed == 0 {
+		return 0, echo.NewHTTPError(http.StatusBadRequest, fieldName+" must be a positive integer")
+	}
+
+	return uint(parsed), nil
+}
+
+func loadActorCharacter(ctx context.Context, database *gorm.DB, accountID uint, characterID uint) (*dal.Character, error) {
+	const defaultRealmID uint = 1
+
+	character := &dal.Character{}
+	query := database.WithContext(ctx).Where("account_id = ? AND status = ?", accountID, statusActive)
+	if characterID != 0 {
+		query = query.Where("id = ?", characterID)
+	} else {
+		query = query.Where("realm_id = ?", defaultRealmID)
+	}
+
+	result := query.Order("is_primary DESC, id ASC").Limit(1).Find(character)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return nil, nil
+	}
+
+	return character, nil
 }
 
 func parseRealmID(raw string) (uint, error) {

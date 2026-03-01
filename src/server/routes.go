@@ -13,6 +13,7 @@ import (
 	serverStream "github.com/asciifaceman/lived/src/server/stream"
 	serverSystem "github.com/asciifaceman/lived/src/server/system"
 	"github.com/labstack/echo/v4"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gorm.io/gorm"
 )
 
@@ -31,6 +32,8 @@ func registerRoutes(e *echo.Echo, database *gorm.DB, cfg config.Config) {
 
 		return respondSuccess(c, 200, "Lived service heartbeat is steady.", payload)
 	})
+
+	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 
 	v1 := e.Group("/v1")
 	if cfg.MMOAdminEnabled {

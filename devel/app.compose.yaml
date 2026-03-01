@@ -1,0 +1,26 @@
+services:
+  lived-app:
+    build:
+      context: ..
+      dockerfile: devel/Dockerfile
+    image: lived:devel
+    container_name: lived-app-devel
+    restart: unless-stopped
+    environment:
+      LIVED_HTTP_ADDR: :8080
+      LIVED_AUTO_MIGRATE: "true"
+      LIVED_DATABASE_URL: ${LIVED_DATABASE_URL:-postgres://lived:lived@lived-db:5432/lived?sslmode=disable}
+
+      LIVED_MMO_AUTH_ENABLED: "true"
+      LIVED_MMO_REALM_SCOPING_ENABLED: "true"
+      LIVED_MMO_CHAT_ENABLED: "true"
+      LIVED_MMO_ADMIN_ENABLED: "true"
+
+      LIVED_MMO_OTEL_ENABLED: "true"
+      LIVED_ENV: development
+      LIVED_OTEL_SERVICE_NAME: lived
+      LIVED_OTEL_ENDPOINT: ${LIVED_OTEL_ENDPOINT:-jaeger:4317}
+      LIVED_OTEL_INSECURE: "true"
+      LIVED_OTEL_SAMPLE_RATIO: "1.0"
+    ports:
+      - "8080:8080"

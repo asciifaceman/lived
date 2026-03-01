@@ -44,6 +44,8 @@ type newGameRequest struct {
 type startBehaviorRequest struct {
 	BehaviorKey string `json:"behaviorKey"`
 	MarketWait  string `json:"marketWait,omitempty"`
+	Mode        string `json:"mode,omitempty"`
+	RepeatUntil string `json:"repeatUntil,omitempty"`
 }
 
 type ascendRequest struct {
@@ -69,6 +71,8 @@ type systemStatusData struct {
 	AutoMigrate         bool                          `json:"autoMigrate"`
 	PendingBehaviorsRaw string                        `json:"pendingBehaviorsRaw"`
 	Inventory           map[string]int64              `json:"inventory"`
+	CoreStats           map[string]int64              `json:"coreStats"`
+	DerivedStats        map[string]int64              `json:"derivedStats"`
 	Stats               map[string]int64              `json:"stats"`
 	MarketPrices        map[string]int64              `json:"marketPrices"`
 	Behaviors           []gameplay.BehaviorView       `json:"behaviors"`
@@ -162,8 +166,15 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 	} else {
 		group.GET("/behaviors/catalog", catalogHandler)
 	}
-	group.GET("/market/status", makeMarketStatusHandler(database))
-	group.GET("/market/history", makeMarketHistoryHandler(database))
+	marketStatusHandler := makeMarketStatusHandler(database, cfg)
+	marketHistoryHandler := makeMarketHistoryHandler(database, cfg)
+	if cfg.MMOAuthEnabled {
+		group.GET("/market/status", marketStatusHandler, serverAuth.RequireAuth(database, cfg))
+		group.GET("/market/history", marketHistoryHandler, serverAuth.RequireAuth(database, cfg))
+	} else {
+		group.GET("/market/status", marketStatusHandler)
+		group.GET("/market/history", marketHistoryHandler)
+	}
 	ascendHandler := makeAscendHandler(database, cfg)
 	if cfg.MMOAuthEnabled {
 		group.POST("/ascend", ascendHandler, serverAuth.RequireAuth(database, cfg))
@@ -261,14 +272,15 @@ func makeNewGameHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 
 func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		simulationTick, err := gameplay.CurrentWorldTick(c.Request().Context(), database)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
-		}
-
-		save := saveGame{SimulationTick: simulationTick, Players: []string{}}
+		save := saveGame{SimulationTick: 0, Players: []string{}}
 		encodedSave := ""
 		if !cfg.MMOAuthEnabled {
+			simulationTick, err := gameplay.CurrentWorldTick(c.Request().Context(), database)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+			}
+			save = saveGame{SimulationTick: simulationTick, Players: []string{}}
+
 			save, err = loadCurrentSave(c.Request().Context(), database)
 			if err != nil {
 				return err
@@ -298,6 +310,8 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 			AutoMigrate:         cfg.AutoMigrate,
 			PendingBehaviorsRaw: runtimeState.PendingBehaviorsJSON,
 			Inventory:           map[string]int64{},
+			CoreStats:           map[string]int64{},
+			DerivedStats:        map[string]int64{},
 			Stats:               map[string]int64{},
 			MarketPrices:        map[string]int64{},
 			Behaviors:           []gameplay.BehaviorView{},
@@ -384,6 +398,8 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 			}
 
 			data.Inventory = snapshot.Inventory
+			data.CoreStats = snapshot.CoreStats
+			data.DerivedStats = snapshot.DerivedStats
 			data.Stats = snapshot.Stats
 			data.MarketPrices = snapshot.MarketPrices
 			if cfg.MMOAuthEnabled {
@@ -440,6 +456,11 @@ func makeStartBehaviorHandler(database *gorm.DB, cfg config.Config) echo.Handler
 		}
 		if marketWaitMinutes > gameplay.MaxMarketWaitDurationMinutes() {
 			return echo.NewHTTPError(http.StatusBadRequest, "marketWait exceeds maximum allowed duration")
+		}
+
+		queueMode, repeatUntilMinutes, err := parseBehaviorQueueMode(req.Mode, req.RepeatUntil)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
 		resolvedPlayer := (*dal.Player)(nil)
@@ -505,20 +526,39 @@ func makeStartBehaviorHandler(database *gorm.DB, cfg config.Config) echo.Handler
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
 		}
 
+		repeatUntilTick := int64(0)
+		if queueMode == "repeat-until" {
+			repeatUntilTick = currentTick + repeatUntilMinutes
+		}
+
 		if err := gameplay.QueuePlayerBehavior(
 			c.Request().Context(),
 			database,
 			resolvedPlayer.ID,
 			key,
 			currentTick,
-			gameplay.QueueBehaviorOptions{MarketWaitDurationMinutes: marketWaitMinutes, RealmID: resolvedRealmID},
+			gameplay.QueueBehaviorOptions{MarketWaitDurationMinutes: marketWaitMinutes, RealmID: resolvedRealmID, Mode: queueMode, RepeatUntilTick: repeatUntilTick},
 		); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
-		response := map[string]any{"behaviorKey": key, "player": resolvedName}
+		behaviorName := gameplay.HumanizeIdentifier(key)
+		if definition, ok := gameplay.GetBehaviorDefinition(key); ok {
+			behaviorName = gameplay.BehaviorDisplayName(definition)
+		}
+
+		response := map[string]any{"behaviorKey": key, "behaviorName": behaviorName, "player": resolvedName}
+		if queueMode != "" {
+			response["mode"] = queueMode
+		}
 		if marketWaitMinutes > 0 {
 			response["marketWaitMinutes"] = marketWaitMinutes
+		}
+		if repeatUntilMinutes > 0 {
+			response["repeatUntilMinutes"] = repeatUntilMinutes
+		}
+		if repeatUntilTick > 0 {
+			response["repeatUntilTick"] = repeatUntilTick
 		}
 
 		return respondSuccess(c, http.StatusOK, "The task is set in motion.", response)
@@ -526,12 +566,16 @@ func makeStartBehaviorHandler(database *gorm.DB, cfg config.Config) echo.Handler
 }
 
 func loadActorCharacter(ctx context.Context, database *gorm.DB, accountID uint, characterID uint) (*dal.Character, error) {
+	const defaultRealmID uint = 1
+
 	character := &dal.Character{}
 	query := database.WithContext(ctx).
 		Where("account_id = ? AND status = ?", accountID, "active")
 
 	if characterID != 0 {
 		query = query.Where("id = ?", characterID)
+	} else {
+		query = query.Where("realm_id = ?", defaultRealmID)
 	}
 
 	result := query.Order("is_primary DESC, id ASC").Limit(1).Find(character)
@@ -634,10 +678,15 @@ func makeBehaviorCatalogHandler(database *gorm.DB, cfg config.Config) echo.Handl
 			}
 
 			available, queueVisible, unavailableReason := evaluateBehaviorAvailability(definition, inventory, stats, unlockSet, hasPrimaryPlayer)
+			displayName := gameplay.BehaviorDisplayName(definition)
 
 			catalog = append(catalog, map[string]any{
 				"key":               definition.Key,
+				"name":              displayName,
+				"label":             displayName,
+				"summary":           definition.Summary,
 				"actorType":         definition.ActorType,
+				"exclusiveGroup":    definition.ExclusiveGroup,
 				"durationMinutes":   definition.DurationMinutes,
 				"staminaCost":       definition.StaminaCost,
 				"available":         available,
@@ -677,7 +726,7 @@ func evaluateBehaviorAvailability(
 
 	for _, unlock := range definition.Requirements.Unlocks {
 		if _, ok := unlockSet[unlock]; !ok {
-			return false, false, "Requires unlock: " + unlock
+			return false, false, "Requires unlock: " + gameplay.HumanizeIdentifier(unlock)
 		}
 	}
 
@@ -687,7 +736,7 @@ func evaluateBehaviorAvailability(
 		}
 
 		if inventory[itemKey] < requiredQuantity {
-			return false, true, "Requires " + strconv.FormatInt(requiredQuantity, 10) + " " + itemKey
+			return false, true, "Requires " + strconv.FormatInt(requiredQuantity, 10) + " " + gameplay.HumanizeIdentifier(itemKey)
 		}
 	}
 
@@ -698,15 +747,11 @@ func evaluateBehaviorAvailability(
 	return true, true, ""
 }
 
-func makeMarketStatusHandler(database *gorm.DB) echo.HandlerFunc {
+func makeMarketStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		realmID := uint(1)
-		if rawRealmID := strings.TrimSpace(c.QueryParam("realmId")); rawRealmID != "" {
-			parsedID, parseErr := strconv.ParseUint(rawRealmID, 10, 64)
-			if parseErr != nil || parsedID == 0 {
-				return echo.NewHTTPError(http.StatusBadRequest, "realmId must be a positive integer")
-			}
-			realmID = uint(parsedID)
+		realmID, err := resolveRealmIDForSystemRead(c, database, cfg)
+		if err != nil {
+			return err
 		}
 
 		currentTick, err := gameplay.CurrentWorldTickForRealm(c.Request().Context(), database, realmID)
@@ -728,14 +773,16 @@ func makeMarketStatusHandler(database *gorm.DB) echo.HandlerFunc {
 	}
 }
 
-func makeMarketHistoryHandler(database *gorm.DB) echo.HandlerFunc {
+func makeMarketHistoryHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		query := marketHistoryQuery{Limit: 100}
-		if err := c.Bind(&query); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid market history query")
+		realmID, err := resolveRealmIDForSystemRead(c, database, cfg)
+		if err != nil {
+			return err
 		}
-		if query.Realm == 0 {
-			query.Realm = 1
+
+		query, err := parseMarketHistoryQuery(c, realmID)
+		if err != nil {
+			return err
 		}
 
 		history, err := gameplay.GetMarketHistory(c.Request().Context(), database, query.Symbol, query.Limit, query.Realm)
@@ -750,6 +797,83 @@ func makeMarketHistoryHandler(database *gorm.DB) echo.HandlerFunc {
 			"history": history,
 		})
 	}
+}
+
+func parseMarketHistoryQuery(c echo.Context, fallbackRealmID uint) (marketHistoryQuery, error) {
+	const defaultLimit = 100
+	const maxLimit = 500
+
+	limit := defaultLimit
+	if rawLimit := strings.TrimSpace(c.QueryParam("limit")); rawLimit != "" {
+		parsedLimit, parseErr := strconv.Atoi(rawLimit)
+		if parseErr != nil || parsedLimit <= 0 {
+			return marketHistoryQuery{}, echo.NewHTTPError(http.StatusBadRequest, "limit must be a positive integer")
+		}
+		if parsedLimit > maxLimit {
+			parsedLimit = maxLimit
+		}
+		limit = parsedLimit
+	}
+
+	realmID, err := parseOptionalPositiveUintQuery(c.QueryParam("realmId"), "realmId", fallbackRealmID)
+	if err != nil {
+		return marketHistoryQuery{}, err
+	}
+
+	return marketHistoryQuery{
+		Symbol: strings.TrimSpace(c.QueryParam("symbol")),
+		Limit:  limit,
+		Realm:  realmID,
+	}, nil
+}
+
+func resolveRealmIDForSystemRead(c echo.Context, database *gorm.DB, cfg config.Config) (uint, error) {
+	realmID, err := parseOptionalPositiveUintQuery(c.QueryParam("realmId"), "realmId", 1)
+	if err != nil {
+		return 0, err
+	}
+
+	if !cfg.MMOAuthEnabled {
+		return realmID, nil
+	}
+
+	actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+	if !ok {
+		return 0, echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+	}
+
+	characterID, err := parseOptionalPositiveUintQuery(c.QueryParam("characterId"), "characterId", 0)
+	if err != nil {
+		return 0, err
+	}
+
+	character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, characterID)
+	if err != nil {
+		return 0, echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+	}
+	if character == nil {
+		return 0, echo.NewHTTPError(http.StatusBadRequest, "complete onboarding first")
+	}
+
+	if strings.TrimSpace(c.QueryParam("realmId")) != "" && realmID != character.RealmID {
+		return 0, echo.NewHTTPError(http.StatusForbidden, "realmId does not match authenticated character realm")
+	}
+
+	return character.RealmID, nil
+}
+
+func parseOptionalPositiveUintQuery(raw string, fieldName string, fallback uint) (uint, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.ParseUint(trimmed, 10, 64)
+	if err != nil || parsed == 0 {
+		return 0, echo.NewHTTPError(http.StatusBadRequest, fieldName+" must be a positive integer")
+	}
+
+	return uint(parsed), nil
 }
 
 func makeAscendHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
@@ -948,6 +1072,34 @@ func parseGameDurationMinutes(raw string) (int64, error) {
 	return 0, errors.New("marketWait must include a unit (m, h, d), for example 90m, 12h, or 2d")
 }
 
+func parseBehaviorQueueMode(rawMode string, rawRepeatUntil string) (string, int64, error) {
+	mode := strings.ToLower(strings.TrimSpace(rawMode))
+	if mode == "" {
+		mode = "once"
+	}
+	if mode != "once" && mode != "repeat" && mode != "repeat-until" {
+		return "", 0, errors.New("mode must be once, repeat, or repeat-until")
+	}
+
+	repeatUntilMinutes, err := parseGameDurationMinutes(rawRepeatUntil)
+	if err != nil {
+		return "", 0, err
+	}
+
+	if mode == "repeat-until" {
+		if repeatUntilMinutes <= 0 {
+			return "", 0, errors.New("repeatUntil is required when mode is repeat-until")
+		}
+		return mode, repeatUntilMinutes, nil
+	}
+
+	if repeatUntilMinutes > 0 {
+		return "", 0, errors.New("repeatUntil is only supported when mode is repeat-until")
+	}
+
+	return mode, 0, nil
+}
+
 func replaceGameState(ctx context.Context, database *gorm.DB, save saveGame) error {
 	return database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&dal.InventoryEntry{}).Error; err != nil {
@@ -1058,8 +1210,23 @@ func loadOrInitRuntimeState(ctx context.Context, database *gorm.DB, realmID uint
 }
 
 func loadPrimaryPlayer(ctx context.Context, database *gorm.DB) (*dal.Player, error) {
+	const defaultRealmID uint = 1
+
+	character := &dal.Character{}
+	characterResult := database.WithContext(ctx).
+		Where("realm_id = ? AND status = ?", defaultRealmID, "active").
+		Order("is_primary DESC, id ASC").
+		Limit(1).
+		Find(character)
+	if characterResult.Error != nil {
+		return nil, characterResult.Error
+	}
+	if characterResult.RowsAffected == 0 {
+		return nil, nil
+	}
+
 	player := &dal.Player{}
-	result := database.WithContext(ctx).Order("id ASC").Limit(1).Find(player)
+	result := database.WithContext(ctx).Where("id = ?", character.PlayerID).Limit(1).Find(player)
 	if result.Error != nil {
 		return nil, result.Error
 	}
