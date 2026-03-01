@@ -1,0 +1,15 @@
+.git
+.github
+.vscode
+.DS_Store
+.env
+.env.*
+*.log
+bin
+build
+dist
+coverage
+node_modules
+web/node_modules
+web/dist
+src/server/webdist

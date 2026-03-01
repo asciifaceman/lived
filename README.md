@@ -12,6 +12,49 @@ This project is entirely vibe coded for fun so it may be absolutely ridiculous. 
 
 ## Local Development
 
+## Docker (Player Build)
+
+Build a production image with embedded frontend (single container):
+
+```bash
+docker build -t lived:player .
+```
+
+Run the container:
+
+```bash
+docker run --rm -p 8080:8080 \
+	-e LIVED_DATABASE_URL="postgres://postgres:postgres@host.docker.internal:5432/lived?sslmode=disable" \
+	lived:player
+```
+
+The image serves both API and frontend from the same binary using `embed_frontend`.
+
+Use Docker Compose for a full local player stack (app + Postgres on lived network):
+
+```bash
+docker compose up --build
+```
+
+Compose details:
+
+- app service: `lived-app`
+- database service: `lived-db`
+- network: `lived-network`
+- postgres volume: `lived-postgres-data`
+
+Stop stack:
+
+```bash
+docker compose down
+```
+
+Stop and remove DB volume:
+
+```bash
+docker compose down -v
+```
+
 ### 1) Configure environment
 
 Create a local `.env` file from `.env.example` and fill in values for your Postgres server.

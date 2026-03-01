@@ -114,6 +114,9 @@ export function App() {
   }, [catalog]);
   const selectedBehaviorMeta = catalog.find((behavior) => behavior.key === selectedBehavior);
   const selectedRequiresMarketOpen = !!selectedBehaviorMeta?.requiresMarketOpen;
+  const selectedBehaviorStaminaCost = selectedBehaviorMeta?.staminaCost ?? 0;
+  const currentStamina = stats.stamina ?? 0;
+  const hasStaminaWarning = selectedBehaviorStaminaCost > 0 && currentStamina < selectedBehaviorStaminaCost;
 
   useEffect(() => {
     if (queueBehaviors.length === 0) {
@@ -355,15 +358,26 @@ export function App() {
                 )}
               </select>
             </label>
+
+            {selectedBehaviorStaminaCost > 0 ? (
+              <div className={hasStaminaWarning ? "stamina-badge warning" : "stamina-badge"}>
+                Stamina cost: {selectedBehaviorStaminaCost} · Current: {currentStamina}
+              </div>
+            ) : null}
+
             <button
               onClick={() => startBehaviorMutation.mutate({
                 behaviorKey: selectedBehavior,
                 marketWait: selectedRequiresMarketOpen ? marketWait : undefined
               })}
-              disabled={startBehaviorMutation.isPending || !selectedBehavior}
+              disabled={startBehaviorMutation.isPending || !selectedBehavior || hasStaminaWarning}
             >
               {startBehaviorMutation.isPending ? "Queuing..." : "Queue Behavior"}
             </button>
+
+            {hasStaminaWarning ? (
+              <p className="subtle">You need more stamina before this behavior can be queued.</p>
+            ) : null}
 
             {!selectedBehaviorMeta?.available && selectedBehaviorMeta?.unavailableReason ? (
               <p className="subtle">Current prep needed: {selectedBehaviorMeta.unavailableReason}</p>

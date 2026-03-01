@@ -202,6 +202,21 @@ body {
   gap: 0.5rem;
 }
 
+.stamina-badge {
+  padding: 0.35rem 0.5rem;
+  border-radius: 8px;
+  border: 1px solid rgba(111, 182, 239, 0.28);
+  background: rgba(10, 23, 40, 0.62);
+  color: #cbeaff;
+  font-size: 0.76rem;
+}
+
+.stamina-badge.warning {
+  border-color: rgba(255, 173, 120, 0.45);
+  background: rgba(74, 35, 8, 0.42);
+  color: #ffd6a3;
+}
+
 .control-tabs {
   display: flex;
   gap: 0.5rem;
