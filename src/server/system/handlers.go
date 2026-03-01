@@ -14,6 +14,7 @@ import (
 	"github.com/asciifaceman/lived/pkg/dal"
 	"github.com/asciifaceman/lived/pkg/version"
 	"github.com/asciifaceman/lived/src/gameplay"
+	serverAuth "github.com/asciifaceman/lived/src/server/auth"
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
 )
@@ -88,20 +89,44 @@ type apiResponse struct {
 }
 
 func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
-	group.GET("/export", makeExportHandler(database))
-	group.POST("/import", makeImportHandler(database))
-	group.POST("/new", makeNewGameHandler(database))
-	group.GET("/status", makeStatusHandler(database, cfg))
+	group.GET("/export", makeExportHandler(database, cfg))
+	group.POST("/import", makeImportHandler(database, cfg))
+	group.POST("/new", makeNewGameHandler(database, cfg))
+	statusHandler := makeStatusHandler(database, cfg)
+	if cfg.MMOAuthEnabled {
+		group.GET("/status", statusHandler, serverAuth.RequireAuth(database, cfg))
+	} else {
+		group.GET("/status", statusHandler)
+	}
 	group.GET("/version", makeVersionHandler())
-	group.POST("/behaviors/start", makeStartBehaviorHandler(database))
-	group.GET("/behaviors/catalog", makeBehaviorCatalogHandler(database))
+	startBehaviorHandler := makeStartBehaviorHandler(database, cfg)
+	if cfg.MMOAuthEnabled {
+		group.POST("/behaviors/start", startBehaviorHandler, serverAuth.RequireAuth(database, cfg))
+	} else {
+		group.POST("/behaviors/start", startBehaviorHandler)
+	}
+	catalogHandler := makeBehaviorCatalogHandler(database, cfg)
+	if cfg.MMOAuthEnabled {
+		group.GET("/behaviors/catalog", catalogHandler, serverAuth.RequireAuth(database, cfg))
+	} else {
+		group.GET("/behaviors/catalog", catalogHandler)
+	}
 	group.GET("/market/status", makeMarketStatusHandler(database))
 	group.GET("/market/history", makeMarketHistoryHandler(database))
-	group.POST("/ascend", makeAscendHandler(database))
+	ascendHandler := makeAscendHandler(database, cfg)
+	if cfg.MMOAuthEnabled {
+		group.POST("/ascend", ascendHandler, serverAuth.RequireAuth(database, cfg))
+	} else {
+		group.POST("/ascend", ascendHandler)
+	}
 }
 
-func makeExportHandler(database *gorm.DB) echo.HandlerFunc {
+func makeExportHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		if cfg.MMOAuthEnabled {
+			return echo.NewHTTPError(http.StatusConflict, "save export is disabled in MMO mode")
+		}
+
 		save, err := loadCurrentSave(c.Request().Context(), database)
 		if err != nil {
 			return err
@@ -116,8 +141,12 @@ func makeExportHandler(database *gorm.DB) echo.HandlerFunc {
 	}
 }
 
-func makeImportHandler(database *gorm.DB) echo.HandlerFunc {
+func makeImportHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		if cfg.MMOAuthEnabled {
+			return echo.NewHTTPError(http.StatusConflict, "save import is disabled in MMO mode")
+		}
+
 		var req importRequest
 		if err := c.Bind(&req); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, "invalid import payload")
@@ -149,8 +178,12 @@ func makeImportHandler(database *gorm.DB) echo.HandlerFunc {
 	}
 }
 
-func makeNewGameHandler(database *gorm.DB) echo.HandlerFunc {
+func makeNewGameHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		if cfg.MMOAuthEnabled {
+			return echo.NewHTTPError(http.StatusConflict, "new game is disabled in MMO mode; use onboarding")
+		}
+
 		var req newGameRequest
 		if err := c.Bind(&req); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, "invalid new game payload")
@@ -177,14 +210,23 @@ func makeNewGameHandler(database *gorm.DB) echo.HandlerFunc {
 
 func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		save, err := loadCurrentSave(c.Request().Context(), database)
+		simulationTick, err := gameplay.CurrentWorldTick(c.Request().Context(), database)
 		if err != nil {
-			return err
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
 		}
 
-		encodedSave, err := encodeSave(save)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to encode save")
+		save := saveGame{SimulationTick: simulationTick, Players: []string{}}
+		encodedSave := ""
+		if !cfg.MMOAuthEnabled {
+			save, err = loadCurrentSave(c.Request().Context(), database)
+			if err != nil {
+				return err
+			}
+
+			encodedSave, err = encodeSave(save)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to encode save")
+			}
 		}
 
 		runtimeState, err := loadOrInitRuntimeState(c.Request().Context(), database)
@@ -212,13 +254,61 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 			Ascension:           gameplay.AscensionEligibility{},
 		}
 
-		primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+		resolvedPlayer := (*dal.Player)(nil)
+		resolvedPlayerName := ""
+		if cfg.MMOAuthEnabled {
+			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+			}
+
+			requestedCharacterID := uint(0)
+			hasRequestedCharacter := false
+			if rawCharacterID := c.QueryParam("characterId"); rawCharacterID != "" {
+				parsedID, parseErr := strconv.ParseUint(rawCharacterID, 10, 64)
+				if parseErr != nil || parsedID == 0 {
+					return echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+				}
+				hasRequestedCharacter = true
+				requestedCharacterID = uint(parsedID)
+			}
+
+			character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, requestedCharacterID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+			}
+			if character == nil {
+				if hasRequestedCharacter {
+					return echo.NewHTTPError(http.StatusNotFound, "character not found for account")
+				}
+				return respondSuccess(c, http.StatusOK, "No character onboarded yet. Complete onboarding to begin.", data)
+			}
+
+			player, err := loadPlayerByID(c.Request().Context(), database, character.PlayerID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character player state")
+			}
+			if player == nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "character player state is missing")
+			}
+
+			resolvedPlayer = player
+			resolvedPlayerName = character.Name
+			data.Players = []string{character.Name}
+			data.Save = ""
+		} else {
+			primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+			}
+			resolvedPlayer = primaryPlayer
+			if primaryPlayer != nil {
+				resolvedPlayerName = primaryPlayer.Name
+			}
 		}
 
-		if primaryPlayer != nil {
-			snapshot, err := gameplay.LoadWorldSnapshot(c.Request().Context(), database, primaryPlayer.ID)
+		if resolvedPlayer != nil {
+			snapshot, err := gameplay.LoadWorldSnapshot(c.Request().Context(), database, resolvedPlayer.ID)
 			if err != nil {
 				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load gameplay snapshot")
 			}
@@ -226,15 +316,34 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 			data.Inventory = snapshot.Inventory
 			data.Stats = snapshot.Stats
 			data.MarketPrices = snapshot.MarketPrices
-			data.Behaviors = snapshot.Behaviors
+			if cfg.MMOAuthEnabled {
+				data.Behaviors = filterPlayerBehaviors(snapshot.Behaviors, resolvedPlayer.ID)
+			} else {
+				data.Behaviors = snapshot.Behaviors
+			}
 			data.RecentEvents = snapshot.RecentEvents
 			data.AscensionCount = snapshot.AscensionCount
 			data.WealthBonusPct = snapshot.WealthBonusPct
 			data.Ascension = snapshot.Ascension
+
+			if cfg.MMOAuthEnabled && resolvedPlayerName != "" {
+				data.Players = []string{resolvedPlayerName}
+			}
 		}
 
 		return respondSuccess(c, http.StatusOK, "The world turns, and its state is known.", data)
 	}
+}
+
+func filterPlayerBehaviors(behaviors []gameplay.BehaviorView, playerID uint) []gameplay.BehaviorView {
+	playerBehaviors := make([]gameplay.BehaviorView, 0, len(behaviors))
+	for _, behavior := range behaviors {
+		if behavior.ActorType == gameplay.ActorPlayer && behavior.ActorID == playerID {
+			playerBehaviors = append(playerBehaviors, behavior)
+		}
+	}
+
+	return playerBehaviors
 }
 
 func makeVersionHandler() echo.HandlerFunc {
@@ -243,7 +352,7 @@ func makeVersionHandler() echo.HandlerFunc {
 	}
 }
 
-func makeStartBehaviorHandler(database *gorm.DB) echo.HandlerFunc {
+func makeStartBehaviorHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		var req startBehaviorRequest
 		if err := c.Bind(&req); err != nil {
@@ -263,12 +372,58 @@ func makeStartBehaviorHandler(database *gorm.DB) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, "marketWait exceeds maximum allowed duration")
 		}
 
-		player, err := loadPrimaryPlayer(c.Request().Context(), database)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
-		}
-		if player == nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "create a new game first")
+		resolvedPlayer := (*dal.Player)(nil)
+		resolvedName := ""
+
+		if cfg.MMOAuthEnabled {
+			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+			}
+
+			requestedCharacterID := uint(0)
+			hasRequestedCharacter := false
+			if rawCharacterID := c.QueryParam("characterId"); rawCharacterID != "" {
+				parsedID, parseErr := strconv.ParseUint(rawCharacterID, 10, 64)
+				if parseErr != nil || parsedID == 0 {
+					return echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+				}
+				hasRequestedCharacter = true
+				requestedCharacterID = uint(parsedID)
+			}
+
+			character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, requestedCharacterID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+			}
+			if character == nil {
+				if hasRequestedCharacter {
+					return echo.NewHTTPError(http.StatusNotFound, "character not found for account")
+				}
+				return echo.NewHTTPError(http.StatusBadRequest, "complete onboarding first")
+			}
+
+			player, err := loadPlayerByID(c.Request().Context(), database, character.PlayerID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character player state")
+			}
+			if player == nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "character player state is missing")
+			}
+
+			resolvedPlayer = player
+			resolvedName = character.Name
+		} else {
+			player, err := loadPrimaryPlayer(c.Request().Context(), database)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+			}
+			if player == nil {
+				return echo.NewHTTPError(http.StatusBadRequest, "create a new game first")
+			}
+
+			resolvedPlayer = player
+			resolvedName = player.Name
 		}
 
 		currentTick, err := gameplay.CurrentWorldTick(c.Request().Context(), database)
@@ -279,7 +434,7 @@ func makeStartBehaviorHandler(database *gorm.DB) echo.HandlerFunc {
 		if err := gameplay.QueuePlayerBehavior(
 			c.Request().Context(),
 			database,
-			player.ID,
+			resolvedPlayer.ID,
 			key,
 			currentTick,
 			gameplay.QueueBehaviorOptions{MarketWaitDurationMinutes: marketWaitMinutes},
@@ -287,7 +442,7 @@ func makeStartBehaviorHandler(database *gorm.DB) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
-		response := map[string]any{"behaviorKey": key, "player": player.Name}
+		response := map[string]any{"behaviorKey": key, "player": resolvedName}
 		if marketWaitMinutes > 0 {
 			response["marketWaitMinutes"] = marketWaitMinutes
 		}
@@ -296,22 +451,87 @@ func makeStartBehaviorHandler(database *gorm.DB) echo.HandlerFunc {
 	}
 }
 
-func makeBehaviorCatalogHandler(database *gorm.DB) echo.HandlerFunc {
+func loadActorCharacter(ctx context.Context, database *gorm.DB, accountID uint, characterID uint) (*dal.Character, error) {
+	character := &dal.Character{}
+	query := database.WithContext(ctx).
+		Where("account_id = ? AND status = ?", accountID, "active")
+
+	if characterID != 0 {
+		query = query.Where("id = ?", characterID)
+	}
+
+	result := query.Order("is_primary DESC, id ASC").Limit(1).Find(character)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return nil, nil
+	}
+
+	return character, nil
+}
+
+func loadPlayerByID(ctx context.Context, database *gorm.DB, playerID uint) (*dal.Player, error) {
+	player := &dal.Player{}
+	result := database.WithContext(ctx).Where("id = ?", playerID).Limit(1).Find(player)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return nil, nil
+	}
+
+	return player, nil
+}
+
+func makeBehaviorCatalogHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		inventory := map[string]int64{}
 		stats := map[string]int64{}
 		unlockSet := map[string]struct{}{}
 		hasPrimaryPlayer := false
 
-		primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+		resolvedPlayer := (*dal.Player)(nil)
+		if cfg.MMOAuthEnabled {
+			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+			}
+
+			requestedCharacterID := uint(0)
+			if rawCharacterID := c.QueryParam("characterId"); rawCharacterID != "" {
+				parsedID, parseErr := strconv.ParseUint(rawCharacterID, 10, 64)
+				if parseErr != nil || parsedID == 0 {
+					return echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+				}
+				requestedCharacterID = uint(parsedID)
+			}
+
+			character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, requestedCharacterID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+			}
+			if character != nil {
+				player, err := loadPlayerByID(c.Request().Context(), database, character.PlayerID)
+				if err != nil {
+					return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character player state")
+				}
+				if player != nil {
+					resolvedPlayer = player
+				}
+			}
+		} else {
+			primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+			}
+			resolvedPlayer = primaryPlayer
 		}
 
-		if primaryPlayer != nil {
+		if resolvedPlayer != nil {
 			hasPrimaryPlayer = true
 
-			snapshot, err := gameplay.LoadWorldSnapshot(c.Request().Context(), database, primaryPlayer.ID)
+			snapshot, err := gameplay.LoadWorldSnapshot(c.Request().Context(), database, resolvedPlayer.ID)
 			if err != nil {
 				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load gameplay snapshot")
 			}
@@ -320,7 +540,7 @@ func makeBehaviorCatalogHandler(database *gorm.DB) echo.HandlerFunc {
 
 			unlocks := make([]dal.PlayerUnlock, 0)
 			if err := database.WithContext(c.Request().Context()).
-				Where("player_id = ?", primaryPlayer.ID).
+				Where("player_id = ?", resolvedPlayer.ID).
 				Find(&unlocks).Error; err != nil {
 				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load player unlocks")
 			}
@@ -443,8 +663,15 @@ func makeMarketHistoryHandler(database *gorm.DB) echo.HandlerFunc {
 	}
 }
 
-func makeAscendHandler(database *gorm.DB) echo.HandlerFunc {
+func makeAscendHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		if cfg.MMOAuthEnabled {
+			if _, ok := serverAuth.ActorFromContext(c.Request().Context()); !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+			}
+			return echo.NewHTTPError(http.StatusConflict, "ascension is temporarily disabled in MMO mode until realm-scoped ascension is implemented")
+		}
+
 		var req ascendRequest
 		if err := c.Bind(&req); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, "invalid ascension payload")

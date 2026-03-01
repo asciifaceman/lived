@@ -17,6 +17,40 @@ type Player struct {
 	Name string `gorm:"size:64;not null;uniqueIndex"`
 }
 
+type Character struct {
+	BaseModel
+	AccountID uint   `gorm:"not null;index:idx_character_account_realm,priority:1"`
+	PlayerID  uint   `gorm:"not null;uniqueIndex"`
+	RealmID   uint   `gorm:"not null;default:1;index:idx_character_account_realm,priority:2;index:idx_character_realm_name,priority:1"`
+	Name      string `gorm:"size:64;not null;index:idx_character_realm_name,priority:2"`
+	IsPrimary bool   `gorm:"not null;default:false;index"`
+	Status    string `gorm:"size:16;not null;default:'active';index"`
+}
+
+type Account struct {
+	BaseModel
+	Username     string `gorm:"size:64;not null;uniqueIndex"`
+	PasswordHash string `gorm:"size:255;not null"`
+	Status       string `gorm:"size:16;not null;default:'active';index"`
+}
+
+type AccountRole struct {
+	BaseModel
+	AccountID uint   `gorm:"not null;index:idx_account_role,priority:1"`
+	RoleKey   string `gorm:"size:32;not null;index:idx_account_role,priority:2"`
+}
+
+type AccountSession struct {
+	BaseModel
+	AccountID  uint       `gorm:"not null;index"`
+	TokenHash  string     `gorm:"size:128;not null;uniqueIndex"`
+	ExpiresAt  time.Time  `gorm:"not null;index"`
+	RevokedAt  *time.Time `gorm:"index"`
+	UserAgent  string     `gorm:"size:255;not null;default:''"`
+	RemoteAddr string     `gorm:"size:64;not null;default:''"`
+	LastUsedAt *time.Time `gorm:"index"`
+}
+
 type WorldState struct {
 	BaseModel
 	SimulationTick int64 `gorm:"not null;default:0"`
@@ -105,7 +139,11 @@ type AscensionState struct {
 
 func Models() []any {
 	return []any{
+		&Account{},
+		&AccountRole{},
+		&AccountSession{},
 		&Player{},
+		&Character{},
 		&WorldState{},
 		&WorldRuntimeState{},
 		&InventoryEntry{},

@@ -41,6 +41,11 @@ type Config struct {
 	TickInterval        time.Duration
 	GameMinutesRate     float64
 	FrontendDevProxyURL string
+	MMOAuthEnabled      bool
+	MMOJWTIssuer        string
+	MMOJWTSecret        string
+	MMOAccessTokenTTL   time.Duration
+	MMORefreshTokenTTL  time.Duration
 }
 
 func LoadFromEnv() Config {
@@ -65,6 +70,14 @@ func LoadFromEnv() Config {
 	tickInterval := getDurationOrDefault("LIVED_GAME_TICK_INTERVAL", time.Second)
 	gameMinutesRate := getFloatOrDefault("LIVED_GAME_MINUTES_PER_REAL_MINUTE", 60)
 	frontendDevProxyURL := getEnvOrDefault("LIVED_WEB_DEV_PROXY_URL", "")
+	mmoAuthEnabled := getBoolOrDefault("LIVED_MMO_AUTH_ENABLED", false)
+	mmoJWTIssuer := getEnvOrDefault("LIVED_MMO_JWT_ISSUER", "lived")
+	mmoJWTSecret := getEnvOrDefault("LIVED_MMO_JWT_SECRET", "")
+	if mmoAuthEnabled && mmoJWTSecret == "" {
+		mmoJWTSecret = "dev-insecure-change-me"
+	}
+	mmoAccessTokenTTL := getDurationOrDefault("LIVED_MMO_ACCESS_TOKEN_TTL", 15*time.Minute)
+	mmoRefreshTokenTTL := getDurationOrDefault("LIVED_MMO_REFRESH_TOKEN_TTL", 30*24*time.Hour)
 
 	databaseURL := os.Getenv("LIVED_DATABASE_URL")
 	if databaseURL == "" {
@@ -82,6 +95,11 @@ func LoadFromEnv() Config {
 			TickInterval:        tickInterval,
 			GameMinutesRate:     gameMinutesRate,
 			FrontendDevProxyURL: frontendDevProxyURL,
+			MMOAuthEnabled:      mmoAuthEnabled,
+			MMOJWTIssuer:        mmoJWTIssuer,
+			MMOJWTSecret:        mmoJWTSecret,
+			MMOAccessTokenTTL:   mmoAccessTokenTTL,
+			MMORefreshTokenTTL:  mmoRefreshTokenTTL,
 		}
 	}
 
@@ -94,6 +112,11 @@ func LoadFromEnv() Config {
 		TickInterval:        tickInterval,
 		GameMinutesRate:     gameMinutesRate,
 		FrontendDevProxyURL: frontendDevProxyURL,
+		MMOAuthEnabled:      mmoAuthEnabled,
+		MMOJWTIssuer:        mmoJWTIssuer,
+		MMOJWTSecret:        mmoJWTSecret,
+		MMOAccessTokenTTL:   mmoAccessTokenTTL,
+		MMORefreshTokenTTL:  mmoRefreshTokenTTL,
 	}
 }
 
@@ -132,4 +155,21 @@ func getFloatOrDefault(key string, fallback float64) float64 {
 	}
 
 	return parsed
+}
+
+func getBoolOrDefault(key string, fallback bool) bool {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+
+	lower := value
+	if lower == "true" || lower == "1" || lower == "yes" || lower == "on" {
+		return true
+	}
+	if lower == "false" || lower == "0" || lower == "no" || lower == "off" {
+		return false
+	}
+
+	return fallback
 }

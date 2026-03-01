@@ -119,6 +119,7 @@
 - `admin` role:
    - full control over realms/economy toggles/moderation/operational actions.
 - All handlers must enforce: authenticated account, role checks, ownership checks, realm checks.
+- Public market observability endpoints (for example ticker and history) may remain unauthenticated by product design when they expose no account-private state.
 
 ## WebSocket/Session Rules
 
@@ -252,3 +253,4 @@
 
 - No email dependency in initial MMO auth stack.
 - Multiple characters per account are supported.
+- Character ownership is modeled with a dedicated `characters` table linked to accounts and runtime player rows.

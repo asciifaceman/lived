@@ -3,6 +3,8 @@ package server
 import (
 	"github.com/asciifaceman/lived/pkg/config"
 	"github.com/asciifaceman/lived/pkg/version"
+	serverAuth "github.com/asciifaceman/lived/src/server/auth"
+	serverOnboarding "github.com/asciifaceman/lived/src/server/onboarding"
 	serverPlayer "github.com/asciifaceman/lived/src/server/player"
 	serverStream "github.com/asciifaceman/lived/src/server/stream"
 	serverSystem "github.com/asciifaceman/lived/src/server/system"
@@ -27,8 +29,10 @@ func registerRoutes(e *echo.Echo, database *gorm.DB, cfg config.Config) {
 	})
 
 	v1 := e.Group("/v1")
+	serverAuth.RegisterRoutes(v1.Group("/auth"), database, cfg)
+	serverOnboarding.RegisterRoutes(v1.Group("/onboarding"), database, cfg)
 	serverSystem.RegisterRoutes(v1.Group("/system"), database, cfg)
-	serverPlayer.RegisterRoutes(v1.Group("/player"), database)
+	serverPlayer.RegisterRoutes(v1.Group("/player"), database, cfg)
 	serverStream.RegisterRoutes(v1.Group("/stream"), database, cfg)
 	v1.GET("", func(c echo.Context) error {
 		return respondSuccess(c, 200, "API gateway is listening.", map[string]any{"version": version.APIVersion, "backend": version.BackendVersion})

@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
+	"github.com/asciifaceman/lived/pkg/config"
 	"github.com/asciifaceman/lived/pkg/dal"
 	"github.com/asciifaceman/lived/pkg/version"
 	"github.com/asciifaceman/lived/src/gameplay"
+	serverAuth "github.com/asciifaceman/lived/src/server/auth"
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
 )
@@ -67,13 +70,23 @@ type apiResponse struct {
 	Data      any    `json:"data,omitempty"`
 }
 
-func RegisterRoutes(group *echo.Group, database *gorm.DB) {
-	group.GET("/status", makeStatusHandler(database))
-	group.GET("/inventory", makeInventoryHandler(database))
-	group.GET("/behaviors", makeBehaviorsHandler(database))
+func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
+	authMW := serverAuth.RequireAuth(database, cfg)
+	inventoryHandler := makeInventoryHandler(database, cfg)
+	behaviorsHandler := makeBehaviorsHandler(database, cfg)
+	statusHandler := makeStatusHandler(database, cfg)
+	if cfg.MMOAuthEnabled {
+		group.GET("/status", statusHandler, authMW)
+		group.GET("/inventory", inventoryHandler, authMW)
+		group.GET("/behaviors", behaviorsHandler, authMW)
+	} else {
+		group.GET("/status", statusHandler)
+		group.GET("/inventory", inventoryHandler)
+		group.GET("/behaviors", behaviorsHandler)
+	}
 }
 
-func makeStatusHandler(database *gorm.DB) echo.HandlerFunc {
+func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		save, err := loadCurrentSave(c.Request().Context(), database)
 		if err != nil {
@@ -100,31 +113,115 @@ func makeStatusHandler(database *gorm.DB) echo.HandlerFunc {
 			Ascension:        gameplay.AscensionEligibility{},
 		}
 
-		primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+		resolvedPlayer := (*dal.Player)(nil)
+		resolvedName := ""
+
+		if cfg.MMOAuthEnabled {
+			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+			}
+
+			requestedCharacterID := uint(0)
+			hasRequestedCharacter := false
+			if rawCharacterID := c.QueryParam("characterId"); rawCharacterID != "" {
+				parsedID, parseErr := strconv.ParseUint(rawCharacterID, 10, 64)
+				if parseErr != nil || parsedID == 0 {
+					return echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+				}
+				hasRequestedCharacter = true
+				requestedCharacterID = uint(parsedID)
+			}
+
+			character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, requestedCharacterID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+			}
+
+			if character == nil {
+				if hasRequestedCharacter {
+					return echo.NewHTTPError(http.StatusNotFound, "character not found for account")
+				}
+				data.Save = ""
+				data.Players = []string{}
+				return respondSuccess(c, http.StatusOK, "No character onboarded yet. Complete onboarding to begin.", data)
+			}
+
+			player, err := loadPlayerByID(c.Request().Context(), database, character.PlayerID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character player state")
+			}
+			if player == nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "character player state is missing")
+			}
+
+			resolvedPlayer = player
+			resolvedName = character.Name
+			data.Save = ""
+			data.Players = []string{character.Name}
+		} else {
+			primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+			}
+
+			if primaryPlayer == nil {
+				return respondSuccess(c, http.StatusOK, "No active player yet. Create a new game to begin.", data)
+			}
+
+			resolvedPlayer = primaryPlayer
+			resolvedName = primaryPlayer.Name
 		}
 
-		if primaryPlayer == nil {
-			return respondSuccess(c, http.StatusOK, "No active player yet. Create a new game to begin.", data)
-		}
-
-		snapshot, err := loadPrimaryPlayerSnapshot(c.Request().Context(), database, primaryPlayer)
+		snapshot, err := loadPrimaryPlayerSnapshot(c.Request().Context(), database, resolvedPlayer)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load player snapshot")
 		}
 
 		data.HasPrimaryPlayer = true
-		data.PlayerName = primaryPlayer.Name
+		data.PlayerName = resolvedName
 		data.Inventory = snapshot.Inventory
 		data.Stats = snapshot.Stats
-		data.Behaviors = filterPlayerBehaviors(snapshot.Behaviors, primaryPlayer.ID)
+		data.Behaviors = filterPlayerBehaviors(snapshot.Behaviors, resolvedPlayer.ID)
 		data.AscensionCount = snapshot.AscensionCount
 		data.WealthBonusPct = snapshot.WealthBonusPct
 		data.Ascension = snapshot.Ascension
 
 		return respondSuccess(c, http.StatusOK, "Player save status loaded.", data)
 	}
+}
+
+func loadActorCharacter(ctx context.Context, database *gorm.DB, accountID uint, characterID uint) (*dal.Character, error) {
+	character := &dal.Character{}
+	query := database.WithContext(ctx).
+		Where("account_id = ? AND status = ?", accountID, "active")
+
+	if characterID != 0 {
+		query = query.Where("id = ?", characterID)
+	}
+
+	result := query.Order("is_primary DESC, id ASC").Limit(1).Find(character)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return nil, nil
+	}
+
+	return character, nil
+}
+
+func loadPlayerByID(ctx context.Context, database *gorm.DB, playerID uint) (*dal.Player, error) {
+	player := &dal.Player{}
+	result := database.WithContext(ctx).Where("id = ?", playerID).Limit(1).Find(player)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return nil, nil
+	}
+
+	return player, nil
 }
 
 func currentVersionData() versionData {
@@ -135,7 +232,7 @@ func currentVersionData() versionData {
 	}
 }
 
-func makeInventoryHandler(database *gorm.DB) echo.HandlerFunc {
+func makeInventoryHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		simulationTick, err := gameplay.CurrentWorldTick(c.Request().Context(), database)
 		if err != nil {
@@ -148,29 +245,75 @@ func makeInventoryHandler(database *gorm.DB) echo.HandlerFunc {
 			Inventory:        map[string]int64{},
 		}
 
-		primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+		resolvedPlayer := (*dal.Player)(nil)
+		resolvedName := ""
+
+		if cfg.MMOAuthEnabled {
+			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+			}
+
+			requestedCharacterID := uint(0)
+			hasRequestedCharacter := false
+			if rawCharacterID := c.QueryParam("characterId"); rawCharacterID != "" {
+				parsedID, parseErr := strconv.ParseUint(rawCharacterID, 10, 64)
+				if parseErr != nil || parsedID == 0 {
+					return echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+				}
+				hasRequestedCharacter = true
+				requestedCharacterID = uint(parsedID)
+			}
+
+			character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, requestedCharacterID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+			}
+			if character == nil {
+				if hasRequestedCharacter {
+					return echo.NewHTTPError(http.StatusNotFound, "character not found for account")
+				}
+				return respondSuccess(c, http.StatusOK, "No character onboarded yet. Complete onboarding to begin.", data)
+			}
+
+			player, err := loadPlayerByID(c.Request().Context(), database, character.PlayerID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character player state")
+			}
+			if player == nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "character player state is missing")
+			}
+
+			resolvedPlayer = player
+			resolvedName = character.Name
+		} else {
+			primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+			}
+
+			if primaryPlayer == nil {
+				return respondSuccess(c, http.StatusOK, "No active player yet. Create a new game to begin.", data)
+			}
+
+			resolvedPlayer = primaryPlayer
+			resolvedName = primaryPlayer.Name
 		}
 
-		if primaryPlayer == nil {
-			return respondSuccess(c, http.StatusOK, "No active player yet. Create a new game to begin.", data)
-		}
-
-		snapshot, err := loadPrimaryPlayerSnapshot(c.Request().Context(), database, primaryPlayer)
+		snapshot, err := loadPrimaryPlayerSnapshot(c.Request().Context(), database, resolvedPlayer)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load player snapshot")
 		}
 
 		data.HasPrimaryPlayer = true
-		data.PlayerName = primaryPlayer.Name
+		data.PlayerName = resolvedName
 		data.Inventory = snapshot.Inventory
 
 		return respondSuccess(c, http.StatusOK, "Player inventory loaded.", data)
 	}
 }
 
-func makeBehaviorsHandler(database *gorm.DB) echo.HandlerFunc {
+func makeBehaviorsHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		simulationTick, err := gameplay.CurrentWorldTick(c.Request().Context(), database)
 		if err != nil {
@@ -183,23 +326,69 @@ func makeBehaviorsHandler(database *gorm.DB) echo.HandlerFunc {
 			Behaviors:        []gameplay.BehaviorView{},
 		}
 
-		primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+		resolvedPlayer := (*dal.Player)(nil)
+		resolvedName := ""
+
+		if cfg.MMOAuthEnabled {
+			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+			}
+
+			requestedCharacterID := uint(0)
+			hasRequestedCharacter := false
+			if rawCharacterID := c.QueryParam("characterId"); rawCharacterID != "" {
+				parsedID, parseErr := strconv.ParseUint(rawCharacterID, 10, 64)
+				if parseErr != nil || parsedID == 0 {
+					return echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+				}
+				hasRequestedCharacter = true
+				requestedCharacterID = uint(parsedID)
+			}
+
+			character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, requestedCharacterID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+			}
+			if character == nil {
+				if hasRequestedCharacter {
+					return echo.NewHTTPError(http.StatusNotFound, "character not found for account")
+				}
+				return respondSuccess(c, http.StatusOK, "No character onboarded yet. Complete onboarding to begin.", data)
+			}
+
+			player, err := loadPlayerByID(c.Request().Context(), database, character.PlayerID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character player state")
+			}
+			if player == nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "character player state is missing")
+			}
+
+			resolvedPlayer = player
+			resolvedName = character.Name
+		} else {
+			primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+			}
+
+			if primaryPlayer == nil {
+				return respondSuccess(c, http.StatusOK, "No active player yet. Create a new game to begin.", data)
+			}
+
+			resolvedPlayer = primaryPlayer
+			resolvedName = primaryPlayer.Name
 		}
 
-		if primaryPlayer == nil {
-			return respondSuccess(c, http.StatusOK, "No active player yet. Create a new game to begin.", data)
-		}
-
-		snapshot, err := loadPrimaryPlayerSnapshot(c.Request().Context(), database, primaryPlayer)
+		snapshot, err := loadPrimaryPlayerSnapshot(c.Request().Context(), database, resolvedPlayer)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load player snapshot")
 		}
 
 		data.HasPrimaryPlayer = true
-		data.PlayerName = primaryPlayer.Name
-		data.Behaviors = filterPlayerBehaviors(snapshot.Behaviors, primaryPlayer.ID)
+		data.PlayerName = resolvedName
+		data.Behaviors = filterPlayerBehaviors(snapshot.Behaviors, resolvedPlayer.ID)
 
 		return respondSuccess(c, http.StatusOK, "Player behaviors loaded.", data)
 	}

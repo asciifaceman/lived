@@ -26,6 +26,14 @@ const openAPISpecJSON = `{
       "description": "Player-facing save and progression status operations."
     },
     {
+      "name": "Auth",
+      "description": "Account authentication and session management endpoints."
+    },
+    {
+      "name": "Onboarding",
+      "description": "Character onboarding endpoints for authenticated accounts."
+    },
+    {
       "name": "Stream",
       "description": "UI-oriented live stream endpoints."
     }
@@ -54,7 +62,7 @@ const openAPISpecJSON = `{
           "System"
         ],
         "summary": "Export save game",
-        "description": "Exports the complete save as minified base64url JSON for re-ingestion.",
+        "description": "Exports the complete save as minified base64url JSON for re-ingestion. Disabled when MMO auth mode is enabled.",
         "responses": {
           "200": {
             "description": "Exported save payload",
@@ -65,6 +73,9 @@ const openAPISpecJSON = `{
                 }
               }
             }
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {
             "$ref": "#/components/responses/ErrorResponse"
@@ -78,7 +89,7 @@ const openAPISpecJSON = `{
           "System"
         ],
         "summary": "Import save game",
-        "description": "Replaces all stored game state with the supplied save payload.",
+        "description": "Replaces all stored game state with the supplied save payload. Disabled when MMO auth mode is enabled.",
         "requestBody": {
           "required": true,
           "content": {
@@ -103,6 +114,9 @@ const openAPISpecJSON = `{
           "400": {
             "$ref": "#/components/responses/ErrorResponse"
           },
+          "409": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
           "500": {
             "$ref": "#/components/responses/ErrorResponse"
           }
@@ -115,7 +129,7 @@ const openAPISpecJSON = `{
           "System"
         ],
         "summary": "Start new game",
-        "description": "Re-bootstrap state to a new game with the provided initial player name.",
+        "description": "Re-bootstrap state to a new game with the provided initial player name. Disabled when MMO auth mode is enabled (use onboarding endpoints).",
         "requestBody": {
           "required": true,
           "content": {
@@ -140,6 +154,9 @@ const openAPISpecJSON = `{
           "400": {
             "$ref": "#/components/responses/ErrorResponse"
           },
+          "409": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
           "500": {
             "$ref": "#/components/responses/ErrorResponse"
           }
@@ -152,7 +169,24 @@ const openAPISpecJSON = `{
           "System"
         ],
         "summary": "Get world status",
-        "description": "Returns current game status including players, inventory, stats, world age, version metadata, and exportable save blob.",
+        "description": "Returns world/runtime status. In MMO mode this endpoint requires bearer auth, resolves the authenticated account character (optional characterId), and omits legacy global save payload.",
+        "parameters": [
+          {
+            "name": "characterId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Optional character selector in MMO mode."
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
         "responses": {
           "200": {
             "description": "World status snapshot",
@@ -163,6 +197,15 @@ const openAPISpecJSON = `{
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {
             "$ref": "#/components/responses/ErrorResponse"
@@ -191,13 +234,239 @@ const openAPISpecJSON = `{
         }
       }
     },
+    "/v1/auth/register": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Register account",
+        "description": "Creates account and returns access/refresh tokens.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Account registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ErrorResponse" },
+          "409": { "$ref": "#/components/responses/ErrorResponse" },
+          "500": { "$ref": "#/components/responses/ErrorResponse" }
+        }
+      }
+    },
+    "/v1/auth/login": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Login",
+        "description": "Authenticates account credentials and returns access/refresh tokens.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Login successful",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ErrorResponse" },
+          "401": { "$ref": "#/components/responses/ErrorResponse" },
+          "500": { "$ref": "#/components/responses/ErrorResponse" }
+        }
+      }
+    },
+    "/v1/auth/refresh": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Refresh session",
+        "description": "Rotates refresh session and returns a new access/refresh pair.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session refreshed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ErrorResponse" },
+          "401": { "$ref": "#/components/responses/ErrorResponse" },
+          "500": { "$ref": "#/components/responses/ErrorResponse" }
+        }
+      }
+    },
+    "/v1/auth/logout": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Logout",
+        "description": "Revokes current authenticated session.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/ErrorResponse" },
+          "500": { "$ref": "#/components/responses/ErrorResponse" }
+        }
+      }
+    },
+    "/v1/auth/me": {
+      "get": {
+        "tags": ["Auth"],
+        "summary": "Get account context",
+        "description": "Returns authenticated account identity, roles, and linked characters.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "responses": {
+          "200": {
+            "description": "Account context",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/ErrorResponse" },
+          "500": { "$ref": "#/components/responses/ErrorResponse" }
+        }
+      }
+    },
+    "/v1/onboarding/start": {
+      "post": {
+        "tags": ["Onboarding"],
+        "summary": "Start onboarding",
+        "description": "Creates initial character for authenticated account in selected realm. Idempotent per account+realm.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OnboardingStartRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Already onboarded for realm",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Onboarding completed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ErrorResponse" },
+          "401": { "$ref": "#/components/responses/ErrorResponse" },
+          "409": { "$ref": "#/components/responses/ErrorResponse" },
+          "500": { "$ref": "#/components/responses/ErrorResponse" }
+        }
+      }
+    },
+    "/v1/onboarding/status": {
+      "get": {
+        "tags": ["Onboarding"],
+        "summary": "Get onboarding status",
+        "description": "Returns onboarding status and characters for authenticated account.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "responses": {
+          "200": {
+            "description": "Onboarding status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/ErrorResponse" },
+          "500": { "$ref": "#/components/responses/ErrorResponse" }
+        }
+      }
+    },
     "/v1/player/status": {
       "get": {
         "tags": [
           "Player"
         ],
         "summary": "Get player save status",
-        "description": "Returns player-facing save status including version metadata, encoded save blob, primary player profile, inventory, stats, behavior queue history, and ascension meta.",
+        "description": "Returns player-facing status. In MMO mode this requires bearer auth and resolves the authenticated account character (optional characterId selector).",
+        "parameters": [
+          {
+            "name": "characterId",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1 },
+            "description": "Optional character selector in MMO mode."
+          }
+        ],
+        "security": [
+          { "BearerAuth": [] }
+        ],
         "responses": {
           "200": {
             "description": "Player save status snapshot",
@@ -208,6 +477,15 @@ const openAPISpecJSON = `{
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {
             "$ref": "#/components/responses/ErrorResponse"
@@ -221,7 +499,19 @@ const openAPISpecJSON = `{
           "Player"
         ],
         "summary": "Get player inventory",
-        "description": "Returns player-facing inventory status for the primary player.",
+        "description": "Returns player inventory status. In MMO mode this requires bearer auth and resolves the authenticated account character (optional characterId selector).",
+        "parameters": [
+          {
+            "name": "characterId",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1 },
+            "description": "Optional character selector in MMO mode."
+          }
+        ],
+        "security": [
+          { "BearerAuth": [] }
+        ],
         "responses": {
           "200": {
             "description": "Player inventory snapshot",
@@ -232,6 +522,15 @@ const openAPISpecJSON = `{
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {
             "$ref": "#/components/responses/ErrorResponse"
@@ -245,7 +544,19 @@ const openAPISpecJSON = `{
           "Player"
         ],
         "summary": "Get player behaviors",
-        "description": "Returns player behavior queue/history view for the primary player.",
+        "description": "Returns player behavior queue/history. In MMO mode this requires bearer auth and resolves the authenticated account character (optional characterId selector).",
+        "parameters": [
+          {
+            "name": "characterId",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1 },
+            "description": "Optional character selector in MMO mode."
+          }
+        ],
+        "security": [
+          { "BearerAuth": [] }
+        ],
         "responses": {
           "200": {
             "description": "Player behaviors snapshot",
@@ -256,6 +567,15 @@ const openAPISpecJSON = `{
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {
             "$ref": "#/components/responses/ErrorResponse"
@@ -286,7 +606,19 @@ const openAPISpecJSON = `{
           "System"
         ],
         "summary": "Queue player behavior",
-        "description": "Queues a player behavior to be processed by the world loop. For market-open-required behaviors, optional marketWait (e.g. 12h, 2d) controls how long it waits for market open before failing.",
+        "description": "Queues a player behavior to be processed by the world loop. In MMO mode this requires bearer auth and resolves the authenticated account character (optional characterId selector). For market-open-required behaviors, optional marketWait (e.g. 12h, 2d) controls how long it waits for market open before failing.",
+        "parameters": [
+          {
+            "name": "characterId",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1 },
+            "description": "Optional character selector in MMO mode."
+          }
+        ],
+        "security": [
+          { "BearerAuth": [] }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -311,6 +643,12 @@ const openAPISpecJSON = `{
           "400": {
             "$ref": "#/components/responses/ErrorResponse"
           },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
           "500": {
             "$ref": "#/components/responses/ErrorResponse"
           }
@@ -323,7 +661,19 @@ const openAPISpecJSON = `{
           "System"
         ],
         "summary": "List player behaviors",
-        "description": "Returns the player-accessible behavior catalog. World/AI behaviors are not exposed here.",
+        "description": "Returns the player-accessible behavior catalog. World/AI behaviors are not exposed here. In MMO mode this requires bearer auth and evaluates availability for the authenticated account character (optional characterId selector).",
+        "parameters": [
+          {
+            "name": "characterId",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1 },
+            "description": "Optional character selector in MMO mode."
+          }
+        ],
+        "security": [
+          { "BearerAuth": [] }
+        ],
         "responses": {
           "200": {
             "description": "Behavior catalog",
@@ -335,6 +685,12 @@ const openAPISpecJSON = `{
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
           "500": {
             "$ref": "#/components/responses/ErrorResponse"
           }
@@ -345,7 +701,7 @@ const openAPISpecJSON = `{
       "get": {
         "tags": ["System"],
         "summary": "Get market ticker status",
-        "description": "Returns ticker-style market data including session open/close state.",
+        "description": "Returns ticker-style market data including session open/close state. Intentionally public for market-monitor tooling.",
         "responses": {
           "200": {
             "description": "Market ticker snapshot",
@@ -367,7 +723,7 @@ const openAPISpecJSON = `{
       "get": {
         "tags": ["System"],
         "summary": "Get market history",
-        "description": "Returns market history entries with tick/price/delta/source.",
+        "description": "Returns market history entries with tick/price/delta/source. Intentionally public for market-monitor tooling.",
         "parameters": [
           {
             "name": "symbol",
@@ -412,7 +768,10 @@ const openAPISpecJSON = `{
           "System"
         ],
         "summary": "Ascend to next run",
-        "description": "Resets run-state and grants permanent meta bonuses.",
+        "description": "Resets run-state and grants permanent meta bonuses. In MMO mode this endpoint is authenticated but currently disabled pending realm-scoped ascension implementation.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
         "requestBody": {
           "required": false,
           "content": {
@@ -435,6 +794,12 @@ const openAPISpecJSON = `{
             }
           },
           "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "409": {
             "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {
@@ -529,6 +894,57 @@ const openAPISpecJSON = `{
           }
         }
       },
+      "RegisterRequest": {
+        "type": "object",
+        "required": ["username", "password"],
+        "properties": {
+          "username": {
+            "type": "string",
+            "minLength": 3
+          },
+          "password": {
+            "type": "string",
+            "minLength": 8
+          }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "required": ["username", "password"],
+        "properties": {
+          "username": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          }
+        }
+      },
+      "RefreshRequest": {
+        "type": "object",
+        "required": ["refreshToken"],
+        "properties": {
+          "refreshToken": {
+            "type": "string"
+          }
+        }
+      },
+      "OnboardingStartRequest": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 64
+          },
+          "realmId": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1
+          }
+        }
+      },
       "ErrorResponse": {
         "type": "object",
         "properties": {
@@ -536,6 +952,13 @@ const openAPISpecJSON = `{
           "message": { "type": "string" },
           "requestId": { "type": "string" }
         }
+      }
+    },
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
       }
     },
     "responses": {

@@ -74,6 +74,11 @@ Environment variables used by the app:
 - `LIVED_POSTGRES_SSLMODE` (default `disable`)
 - `LIVED_POSTGRES_TIMEZONE` (default `UTC`)
 - `LIVED_DATABASE_URL` (optional DSN override; bypasses split Postgres fields)
+- `LIVED_MMO_AUTH_ENABLED` (default `false`; enables `/v1/auth/*` routes)
+- `LIVED_MMO_JWT_ISSUER` (default `lived`)
+- `LIVED_MMO_JWT_SECRET` (required in real deployments when MMO auth is enabled)
+- `LIVED_MMO_ACCESS_TOKEN_TTL` (default `15m`)
+- `LIVED_MMO_REFRESH_TOKEN_TTL` (default `720h`)
 
 ### 2) Create or recreate the development database
 
@@ -201,28 +206,34 @@ Base path: `/v1/system`
 
 - `GET /export`
 	- Exports current save data as a minified base64url payload.
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): disabled.
 	- Response data: `{ "save": "<base64url>" }`
 - `POST /import`
 	- Replaces all stored data from an exported payload.
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): disabled.
 	- Request: `{ "save": "<base64url>" }`
 	- Response: standard envelope with narrative success message
 - `POST /new`
 	- Starts a new game with an initial player name and reset tick.
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): disabled; use onboarding endpoints.
 	- Request: `{ "name": "PlayerName" }`
 	- Response: standard envelope with narrative success message
 - `GET /status`
 	- Returns world/runtime-oriented status and save payload.
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): requires bearer access token, resolves account character context (optional `?characterId=<id>` selector), and omits legacy global save export payload.
 	- Response data includes version metadata, players, inventory, stats (including stamina-related values), simulation tick, world age (minutes/hours/days), timing config, and persisted pending-behavior metadata.
 - `GET /version`
 	- Returns version metadata for API/backend/frontend builds.
 - `POST /behaviors/start`
 	- Queues a player behavior by key.
 	- Request: `{ "behaviorKey": "player_scavenge_scrap" }`
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): requires bearer access token and queues for authenticated account character (optional `?characterId=<id>` selector).
 	- For market-open-required behaviors, optional `marketWait` controls timeout before giving up: `{ "behaviorKey": "player_sell_scrap", "marketWait": "12h" }`
 	- Market-open-required behaviors queued overnight now wait for market open instead of failing immediately.
 	- Intended starter progression from poverty: `player_scavenge_scrap` then `player_sell_scrap`.
 - `GET /behaviors/catalog`
 	- Lists player-accessible behavior definitions only (world/AI behaviors are excluded).
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): requires bearer access token and evaluates availability for the authenticated account character (optional `?characterId=<id>` selector).
 	- Includes duration, stamina cost, requirements, costs, outputs, output expressions, output chances, unlock grants, market-open requirements, and availability hints.
 	- `queueVisible` indicates the behavior should appear in queue selection (for example path-discovered), while `available` indicates all current requirements are met.
 	- This supports natural progression: players can see/discover path options while still being gated by resources/items/currency/special unlocks.
@@ -234,10 +245,44 @@ Base path: `/v1/system`
 	- Returns market history entries (tick, price, delta, source, session state) like a stock-market API feed.
 - `POST /ascend`
 	- Resets run-state and grants permanent meta bonuses.
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): currently disabled until realm-scoped ascension is implemented (legacy ascension reset is global).
 	- Optional request: `{ "name": "NextRunName" }`
 	- Meta progression includes ascension count and wealth bonus percentage.
 	- Ascension is gated by wealth progression with a scaling requirement per ascension (`250`, then increasing by factor).
 	- Each ascension also grants a starting coin stipend on the next run, making early progression faster.
+
+### Auth (MMO Foundation)
+
+Base path: `/v1/auth` (available when `LIVED_MMO_AUTH_ENABLED=true`)
+
+- `POST /register`
+	- Creates an account with username/password and returns access+refresh tokens.
+	- Request: `{ "username": "player1", "password": "strongpassword" }`
+- `POST /login`
+	- Authenticates an existing account and returns access+refresh tokens.
+	- Request: `{ "username": "player1", "password": "strongpassword" }`
+- `POST /refresh`
+	- Rotates refresh session and returns a new access+refresh pair.
+	- Request: `{ "refreshToken": "<token>" }`
+- `POST /logout`
+	- Revokes current authenticated session.
+	- Requires bearer access token.
+- `GET /me`
+	- Returns authenticated account identity/roles plus linked characters.
+	- Requires bearer access token.
+
+### Onboarding (MMO Foundation)
+
+Base path: `/v1/onboarding` (available when `LIVED_MMO_AUTH_ENABLED=true`)
+
+- `POST /start`
+	- Creates first character for the authenticated account in the selected realm.
+	- Request: `{ "name": "Aeris", "realmId": 1 }` (`realmId` optional, defaults to `1`).
+	- Idempotent per account+realm (returns existing realm character when already onboarded).
+	- Requires bearer access token.
+- `GET /status`
+	- Returns onboarding status and all characters for the authenticated account.
+	- Requires bearer access token.
 
 ### Player
 
@@ -246,12 +291,15 @@ Base path: `/v1/player`
 - `GET /status`
 	- Returns player/save-oriented status for client HUDs and save panels.
 	- Response data includes version metadata, encoded save blob, primary player presence/name, inventory, stats, player behavior history/queue view, simulation tick/world age, ascension meta progression, and ascension eligibility state (`available`, `requirementCoins`, `currentCoins`, `reason`).
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): requires bearer access token and resolves status by authenticated account character (optional `?characterId=<id>` selector).
 - `GET /inventory`
 	- Returns inventory-only player status for lightweight HUD refreshes.
 	- Response data includes primary player presence/name, simulation tick, and inventory map.
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): requires bearer access token and resolves inventory by authenticated account character (optional `?characterId=<id>` selector).
 - `GET /behaviors`
 	- Returns behavior queue/history view for the primary player only.
 	- Response data includes primary player presence/name, simulation tick, and filtered player behavior items.
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): requires bearer access token and resolves behaviors by authenticated account character (optional `?characterId=<id>` selector).
 
 ### Stream
 

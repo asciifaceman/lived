@@ -37,6 +37,37 @@ Convert Lived from single-save/single-primary-player architecture into a multipl
 	- `mmo_otel_enabled`
 - Prefer dark-launch + internal accounts before public rollout.
 
+## Current Progress Snapshot (2026-02-28)
+
+### Completed (implemented)
+
+- MMO auth foundation behind `LIVED_MMO_AUTH_ENABLED` with register/login/refresh/logout/me.
+- Account/session/role models and dedicated `characters` ownership table are in place.
+- Onboarding endpoints are implemented (`/v1/onboarding/start`, `/v1/onboarding/status`).
+- Player endpoints are migrated to authenticated account-character resolution:
+	- `/v1/player/status`,
+	- `/v1/player/inventory`,
+	- `/v1/player/behaviors`.
+- System write/read surfaces migrated or gated for MMO safety:
+	- `/v1/system/behaviors/start` migrated to authenticated character queueing,
+	- `/v1/system/behaviors/catalog` migrated to authenticated character availability,
+	- `/v1/system/status` migrated to authenticated character context (legacy save payload suppressed in MMO),
+	- `/v1/system/export`, `/v1/system/import`, `/v1/system/new` disabled in MMO mode,
+	- `/v1/system/ascend` routed through MMO auth and intentionally disabled pending realm-scoped ascension.
+
+### In Progress / Not Yet Implemented
+
+- Realm/data partitioning (`realm_id` expansion and scoped queries) is not implemented yet.
+- Realm-safe ascension implementation is not available yet.
+- Chat/feed/admin/MMO stats endpoints are not implemented yet.
+- OTel runtime integration (collector export, trace/metric/log correlation wiring) is not implemented yet.
+
+### Documentation Status
+
+- `README.md` and this migration plan reflect current implemented MMO endpoint behavior.
+- `src/server/swagger.go` has been synchronized with current MMO auth/onboarding and endpoint gating semantics.
+- Keep OpenAPI synced as new realm-scoped/chat/admin/stats endpoints are added.
+
 ## OpenTelemetry Decisions (Settled)
 
 - Backend: OTel Collector + Jaeger + Prometheus/Grafana.
@@ -104,7 +135,7 @@ Ownership and realm checks are mandatory on all non-public endpoints.
 - `accounts` (username, password hash, status).
 - `account_sessions` or refresh token table.
 - `account_roles` (admin/moderator/player).
-- Associate player entity with `account_id` (one-to-many to support multiple characters per account).
+- `characters` ownership table (`account_id`, `player_id`, `realm_id`, metadata) to support multiple characters per account without coupling identity to runtime player rows.
 
 ### API
 
@@ -390,3 +421,14 @@ Add `realm_id` (or `world_id`) to realm-sensitive entities:
 
 - 2026-02-28: Initial MMO auth excludes email dependency (no email verification/reset requirement at launch).
 - 2026-02-28: Accounts may own multiple player characters.
+- 2026-02-28: Character ownership uses a dedicated `characters` table linked to runtime `players` rows.
+- 2026-02-28: Added authenticated `/v1/onboarding/start` and `/v1/onboarding/status` baseline endpoints with transactional character creation.
+- 2026-02-28: Migrated `/v1/player/status` to authenticated account-character resolution in MMO mode (supports optional `characterId` selector).
+- 2026-02-28: Migrated `/v1/player/inventory` and `/v1/player/behaviors` to authenticated account-character resolution in MMO mode (supports optional `characterId` selector).
+- 2026-02-28: Migrated `POST /v1/system/behaviors/start` to authenticated account-character queueing in MMO mode (supports optional `characterId` selector).
+- 2026-02-28: Migrated `POST /v1/system/ascend` routing to MMO auth-aware flow and temporarily disabled MMO execution to prevent global-reset corruption until realm-scoped ascension is implemented.
+- 2026-02-28: Disabled legacy `/v1/system/export`, `/v1/system/import`, and `/v1/system/new` in MMO mode to prevent global save lifecycle operations.
+- 2026-02-28: Migrated `/v1/system/behaviors/catalog` to authenticated account-character availability evaluation in MMO mode (supports optional `characterId` selector).
+- 2026-02-28: Migrated `/v1/system/status` to authenticated account-character context in MMO mode (supports optional `characterId` selector) and removed MMO exposure of legacy global save payload.
+- 2026-02-28: Product policy affirmed that market monitor endpoints (ticker/history) may remain public for third-party monitoring unless they begin exposing account-private state.
+- 2026-02-28: Updated OpenAPI/Swagger spec to include MMO auth/onboarding endpoints and current auth/gating semantics, while keeping market ticker/history endpoints publicly accessible.
