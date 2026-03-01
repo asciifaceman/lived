@@ -1,0 +1,33 @@
+package mmo
+
+import "testing"
+
+func TestParseRealmID_Default(t *testing.T) {
+	realmID, err := parseRealmID("")
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if realmID != 1 {
+		t.Fatalf("expected default realm 1, got %d", realmID)
+	}
+}
+
+func TestParseRealmID_Valid(t *testing.T) {
+	realmID, err := parseRealmID("42")
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if realmID != 42 {
+		t.Fatalf("expected realm 42, got %d", realmID)
+	}
+}
+
+func TestParseRealmID_Invalid(t *testing.T) {
+	if _, err := parseRealmID("0"); err == nil {
+		t.Fatal("expected error for zero realm")
+	}
+
+	if _, err := parseRealmID("abc"); err == nil {
+		t.Fatal("expected error for non-numeric realm")
+	}
+}

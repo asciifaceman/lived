@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/asciifaceman/lived/pkg/config"
@@ -14,23 +15,13 @@ import (
 const (
 	worldRuntimeStateKey = "world"
 	tickDBTimeout        = 10 * time.Second
+	defaultRealmID       = uint(1)
 )
 
 func runWorldLoop(ctx context.Context, cfg config.Config, database *gorm.DB) error {
-	runtimeState, err := loadOrInitRuntimeState(ctx, database)
-	if err != nil {
-		return err
-	}
-
-	if runtimeState.LastProcessedTickAt.IsZero() {
-		runtimeState.LastProcessedTickAt = time.Now().UTC()
-	}
-
 	startupTime := time.Now().UTC()
-	if startupTime.After(runtimeState.LastProcessedTickAt) {
-		if err := runTickAt(database, cfg, runtimeState, startupTime); err != nil {
-			return err
-		}
+	if err := runTickAtForKnownRealms(database, cfg, startupTime); err != nil {
+		return err
 	}
 
 	ticker := time.NewTicker(cfg.TickInterval)
@@ -40,24 +31,49 @@ func runWorldLoop(ctx context.Context, cfg config.Config, database *gorm.DB) err
 		select {
 		case <-ctx.Done():
 			shutdownTime := time.Now().UTC()
-			if shutdownTime.After(runtimeState.LastProcessedTickAt) {
-				if err := runTickAt(database, cfg, runtimeState, shutdownTime); err != nil {
-					return err
-				}
+			if err := runTickAtForKnownRealms(database, cfg, shutdownTime); err != nil {
+				return err
 			}
-
-			flushCtx, cancel := context.WithTimeout(context.Background(), tickDBTimeout)
-			defer cancel()
-			return persistRuntimeState(flushCtx, database, runtimeState)
+			return nil
 		case tickTime := <-ticker.C:
-			if err := runTickAt(database, cfg, runtimeState, tickTime.UTC()); err != nil {
+			if err := runTickAtForKnownRealms(database, cfg, tickTime.UTC()); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func runTickAt(database *gorm.DB, cfg config.Config, runtimeState *dal.WorldRuntimeState, tickTime time.Time) error {
+func runTickAtForKnownRealms(database *gorm.DB, cfg config.Config, tickTime time.Time) error {
+	discoveryCtx, cancel := context.WithTimeout(context.Background(), tickDBTimeout)
+	defer cancel()
+
+	realmIDs, err := listKnownRealmIDs(discoveryCtx, database)
+	if err != nil {
+		return opCtxErrGuard(err)
+	}
+
+	for _, realmID := range realmIDs {
+		if err := runTickAt(database, cfg, tickTime, realmID); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func runTickAt(database *gorm.DB, cfg config.Config, tickTime time.Time, realmID uint) error {
+	opCtx, cancel := context.WithTimeout(context.Background(), tickDBTimeout)
+	defer cancel()
+
+	runtimeState, err := loadOrInitRuntimeState(opCtx, database, realmID)
+	if err != nil {
+		return opCtxErrGuard(err)
+	}
+
+	if runtimeState.LastProcessedTickAt.IsZero() {
+		runtimeState.LastProcessedTickAt = tickTime
+	}
+
 	elapsed := tickTime.Sub(runtimeState.LastProcessedTickAt)
 	if elapsed < 0 {
 		elapsed = 0
@@ -68,38 +84,91 @@ func runTickAt(database *gorm.DB, cfg config.Config, runtimeState *dal.WorldRunt
 	runtimeState.CarryGameMinutes = gameMinutesFloat - float64(advanceByMinutes)
 	runtimeState.LastProcessedTickAt = tickTime
 
-	opCtx, cancel := context.WithTimeout(context.Background(), tickDBTimeout)
-	defer cancel()
-
-	currentTick, err := advanceWorldAndPersistRuntime(opCtx, database, advanceByMinutes, runtimeState)
+	currentTick, err := advanceWorldAndPersistRuntime(opCtx, database, advanceByMinutes, runtimeState, realmID)
 	if err != nil {
 		return opCtxErrGuard(err)
 	}
 
-	if err := gameplay.ProcessWorldTick(opCtx, database, currentTick); err != nil {
+	if err := gameplay.ProcessWorldTickForRealm(opCtx, database, currentTick, realmID); err != nil {
 		return opCtxErrGuard(err)
 	}
 
-	pendingSummary, err := gameplay.BuildPendingBehaviorSummaryJSON(opCtx, database)
+	pendingSummary, err := gameplay.BuildPendingBehaviorSummaryJSONForRealm(opCtx, database, realmID)
 	if err != nil {
 		return opCtxErrGuard(err)
 	}
 	runtimeState.PendingBehaviorsJSON = pendingSummary
 
-	return opCtxErrGuard(persistRuntimeState(opCtx, database, runtimeState))
+	return opCtxErrGuard(persistRuntimeState(opCtx, database, runtimeState, realmID))
 }
 
-func advanceWorldAndPersistRuntime(ctx context.Context, database *gorm.DB, advanceByMinutes int64, runtimeState *dal.WorldRuntimeState) (int64, error) {
+func listKnownRealmIDs(ctx context.Context, database *gorm.DB) ([]uint, error) {
+	realmSet := map[uint]struct{}{defaultRealmID: {}}
+
+	characterRows := make([]struct {
+		RealmID uint
+	}, 0)
+	if err := database.WithContext(ctx).
+		Model(&dal.Character{}).
+		Distinct("realm_id").
+		Where("realm_id > 0").
+		Find(&characterRows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range characterRows {
+		realmSet[row.RealmID] = struct{}{}
+	}
+
+	worldRows := make([]struct {
+		RealmID uint
+	}, 0)
+	if err := database.WithContext(ctx).
+		Model(&dal.WorldState{}).
+		Distinct("realm_id").
+		Where("realm_id > 0").
+		Find(&worldRows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range worldRows {
+		realmSet[row.RealmID] = struct{}{}
+	}
+
+	runtimeRows := make([]struct {
+		RealmID uint
+	}, 0)
+	if err := database.WithContext(ctx).
+		Model(&dal.WorldRuntimeState{}).
+		Distinct("realm_id").
+		Where("realm_id > 0").
+		Find(&runtimeRows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range runtimeRows {
+		realmSet[row.RealmID] = struct{}{}
+	}
+
+	realmIDs := make([]uint, 0, len(realmSet))
+	for realmID := range realmSet {
+		realmIDs = append(realmIDs, realmID)
+	}
+	sort.Slice(realmIDs, func(i, j int) bool { return realmIDs[i] < realmIDs[j] })
+
+	return realmIDs, nil
+}
+
+func advanceWorldAndPersistRuntime(ctx context.Context, database *gorm.DB, advanceByMinutes int64, runtimeState *dal.WorldRuntimeState, realmID uint) (int64, error) {
 	currentTick := int64(0)
 	err := database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if advanceByMinutes > 0 {
-			update := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Model(&dal.WorldState{}).Update("simulation_tick", gorm.Expr("simulation_tick + ?", advanceByMinutes))
+			update := tx.Model(&dal.WorldState{}).
+				Where("realm_id = ?", realmID).
+				Update("simulation_tick", gorm.Expr("simulation_tick + ?", advanceByMinutes))
 			if update.Error != nil {
 				return update.Error
 			}
 
 			if update.RowsAffected == 0 {
-				world := dal.WorldState{SimulationTick: advanceByMinutes}
+				world := dal.WorldState{RealmID: realmID, SimulationTick: advanceByMinutes}
 				if err := tx.Create(&world).Error; err != nil {
 					return err
 				}
@@ -107,7 +176,7 @@ func advanceWorldAndPersistRuntime(ctx context.Context, database *gorm.DB, advan
 		}
 
 		if err := tx.Model(&dal.WorldRuntimeState{}).
-			Where("key = ?", worldRuntimeStateKey).
+			Where("realm_id = ? AND key = ?", realmID, worldRuntimeStateKey).
 			Updates(map[string]any{
 				"last_processed_tick_at": runtimeState.LastProcessedTickAt,
 				"carry_game_minutes":     runtimeState.CarryGameMinutes,
@@ -117,7 +186,7 @@ func advanceWorldAndPersistRuntime(ctx context.Context, database *gorm.DB, advan
 		}
 
 		worldState := dal.WorldState{}
-		result := tx.Order("id ASC").First(&worldState)
+		result := tx.Where("realm_id = ?", realmID).Order("id ASC").First(&worldState)
 		if result.Error != nil {
 			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 				currentTick = 0
@@ -137,9 +206,9 @@ func advanceWorldAndPersistRuntime(ctx context.Context, database *gorm.DB, advan
 	return currentTick, nil
 }
 
-func loadOrInitRuntimeState(ctx context.Context, database *gorm.DB) (*dal.WorldRuntimeState, error) {
+func loadOrInitRuntimeState(ctx context.Context, database *gorm.DB, realmID uint) (*dal.WorldRuntimeState, error) {
 	runtimeState := &dal.WorldRuntimeState{}
-	result := database.WithContext(ctx).Where("key = ?", worldRuntimeStateKey).Limit(1).Find(runtimeState)
+	result := database.WithContext(ctx).Where("realm_id = ? AND key = ?", realmID, worldRuntimeStateKey).Limit(1).Find(runtimeState)
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -152,6 +221,7 @@ func loadOrInitRuntimeState(ctx context.Context, database *gorm.DB) (*dal.WorldR
 	}
 
 	initialState := &dal.WorldRuntimeState{
+		RealmID:              realmID,
 		Key:                  worldRuntimeStateKey,
 		LastProcessedTickAt:  time.Now().UTC(),
 		CarryGameMinutes:     0,
@@ -165,9 +235,9 @@ func loadOrInitRuntimeState(ctx context.Context, database *gorm.DB) (*dal.WorldR
 	return initialState, nil
 }
 
-func persistRuntimeState(ctx context.Context, database *gorm.DB, runtimeState *dal.WorldRuntimeState) error {
+func persistRuntimeState(ctx context.Context, database *gorm.DB, runtimeState *dal.WorldRuntimeState, realmID uint) error {
 	return database.WithContext(ctx).Model(&dal.WorldRuntimeState{}).
-		Where("key = ?", worldRuntimeStateKey).
+		Where("realm_id = ? AND key = ?", realmID, worldRuntimeStateKey).
 		Updates(map[string]any{
 			"last_processed_tick_at": runtimeState.LastProcessedTickAt,
 			"carry_game_minutes":     runtimeState.CarryGameMinutes,

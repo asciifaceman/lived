@@ -115,6 +115,7 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 
 		resolvedPlayer := (*dal.Player)(nil)
 		resolvedName := ""
+		resolvedRealmID := uint(1)
 
 		if cfg.MMOAuthEnabled {
 			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
@@ -157,6 +158,7 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 
 			resolvedPlayer = player
 			resolvedName = character.Name
+			resolvedRealmID = character.RealmID
 			data.Save = ""
 			data.Players = []string{character.Name}
 		} else {
@@ -173,9 +175,19 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 			resolvedName = primaryPlayer.Name
 		}
 
-		snapshot, err := loadPrimaryPlayerSnapshot(c.Request().Context(), database, resolvedPlayer)
+		snapshot, err := loadPrimaryPlayerSnapshot(c.Request().Context(), database, resolvedPlayer, resolvedRealmID)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load player snapshot")
+		}
+		if cfg.MMOAuthEnabled {
+			realmTick, tickErr := gameplay.CurrentWorldTickForRealm(c.Request().Context(), database, resolvedRealmID)
+			if tickErr != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+			}
+			data.SimulationTick = realmTick
+			data.WorldAgeMinutes = realmTick
+			data.WorldAgeHours = realmTick / 60
+			data.WorldAgeDays = realmTick / (60 * 24)
 		}
 
 		data.HasPrimaryPlayer = true
@@ -247,6 +259,7 @@ func makeInventoryHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc
 
 		resolvedPlayer := (*dal.Player)(nil)
 		resolvedName := ""
+		resolvedRealmID := uint(1)
 
 		if cfg.MMOAuthEnabled {
 			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
@@ -286,6 +299,7 @@ func makeInventoryHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc
 
 			resolvedPlayer = player
 			resolvedName = character.Name
+			resolvedRealmID = character.RealmID
 		} else {
 			primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
 			if err != nil {
@@ -300,9 +314,16 @@ func makeInventoryHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc
 			resolvedName = primaryPlayer.Name
 		}
 
-		snapshot, err := loadPrimaryPlayerSnapshot(c.Request().Context(), database, resolvedPlayer)
+		snapshot, err := loadPrimaryPlayerSnapshot(c.Request().Context(), database, resolvedPlayer, resolvedRealmID)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load player snapshot")
+		}
+		if cfg.MMOAuthEnabled {
+			realmTick, tickErr := gameplay.CurrentWorldTickForRealm(c.Request().Context(), database, resolvedRealmID)
+			if tickErr != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+			}
+			data.SimulationTick = realmTick
 		}
 
 		data.HasPrimaryPlayer = true
@@ -328,6 +349,7 @@ func makeBehaviorsHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc
 
 		resolvedPlayer := (*dal.Player)(nil)
 		resolvedName := ""
+		resolvedRealmID := uint(1)
 
 		if cfg.MMOAuthEnabled {
 			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
@@ -367,6 +389,7 @@ func makeBehaviorsHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc
 
 			resolvedPlayer = player
 			resolvedName = character.Name
+			resolvedRealmID = character.RealmID
 		} else {
 			primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
 			if err != nil {
@@ -381,9 +404,16 @@ func makeBehaviorsHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc
 			resolvedName = primaryPlayer.Name
 		}
 
-		snapshot, err := loadPrimaryPlayerSnapshot(c.Request().Context(), database, resolvedPlayer)
+		snapshot, err := loadPrimaryPlayerSnapshot(c.Request().Context(), database, resolvedPlayer, resolvedRealmID)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load player snapshot")
+		}
+		if cfg.MMOAuthEnabled {
+			realmTick, tickErr := gameplay.CurrentWorldTickForRealm(c.Request().Context(), database, resolvedRealmID)
+			if tickErr != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+			}
+			data.SimulationTick = realmTick
 		}
 
 		data.HasPrimaryPlayer = true
@@ -394,8 +424,8 @@ func makeBehaviorsHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc
 	}
 }
 
-func loadPrimaryPlayerSnapshot(ctx context.Context, database *gorm.DB, primaryPlayer *dal.Player) (gameplay.WorldSnapshot, error) {
-	return gameplay.LoadWorldSnapshot(ctx, database, primaryPlayer.ID)
+func loadPrimaryPlayerSnapshot(ctx context.Context, database *gorm.DB, primaryPlayer *dal.Player, realmID uint) (gameplay.WorldSnapshot, error) {
+	return gameplay.LoadWorldSnapshot(ctx, database, primaryPlayer.ID, realmID)
 }
 
 func filterPlayerBehaviors(behaviors []gameplay.BehaviorView, playerID uint) []gameplay.BehaviorView {

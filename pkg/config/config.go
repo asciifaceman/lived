@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -33,19 +34,34 @@ func (cfg PostgresConfig) DSN() string {
 }
 
 type Config struct {
-	HTTPAddr            string
-	DatabaseURL         string
-	Postgres            PostgresConfig
-	PostgresAdminDB     string
-	AutoMigrate         bool
-	TickInterval        time.Duration
-	GameMinutesRate     float64
-	FrontendDevProxyURL string
-	MMOAuthEnabled      bool
-	MMOJWTIssuer        string
-	MMOJWTSecret        string
-	MMOAccessTokenTTL   time.Duration
-	MMORefreshTokenTTL  time.Duration
+	HTTPAddr                 string
+	DatabaseURL              string
+	Postgres                 PostgresConfig
+	PostgresAdminDB          string
+	AutoMigrate              bool
+	TickInterval             time.Duration
+	GameMinutesRate          float64
+	FrontendDevProxyURL      string
+	MMOAuthEnabled           bool
+	MMORealmScopingEnabled   bool
+	MMOChatEnabled           bool
+	MMOAdminEnabled          bool
+	MMOOTelEnabled           bool
+	MMOJWTIssuer             string
+	MMOJWTSecret             string
+	MMOAccessTokenTTL        time.Duration
+	MMORefreshTokenTTL       time.Duration
+	RateLimitEnabled         bool
+	RateLimitWindow          time.Duration
+	RateLimitAuthMax         int
+	RateLimitChatMax         int
+	RateLimitBehaviorMax     int
+	RateLimitOnboardMax      int
+	RateLimitIdentity        string
+	IdempotencyEnabled       bool
+	IdempotencyTTL           time.Duration
+	StreamMaxConnsPerAccount int
+	StreamMaxConnsPerSession int
 }
 
 func LoadFromEnv() Config {
@@ -71,6 +87,10 @@ func LoadFromEnv() Config {
 	gameMinutesRate := getFloatOrDefault("LIVED_GAME_MINUTES_PER_REAL_MINUTE", 60)
 	frontendDevProxyURL := getEnvOrDefault("LIVED_WEB_DEV_PROXY_URL", "")
 	mmoAuthEnabled := getBoolOrDefault("LIVED_MMO_AUTH_ENABLED", false)
+	mmoRealmScopingEnabled := getBoolOrDefault("LIVED_MMO_REALM_SCOPING_ENABLED", true)
+	mmoChatEnabled := getBoolOrDefault("LIVED_MMO_CHAT_ENABLED", true)
+	mmoAdminEnabled := getBoolOrDefault("LIVED_MMO_ADMIN_ENABLED", true)
+	mmoOTelEnabled := getBoolOrDefault("LIVED_MMO_OTEL_ENABLED", false)
 	mmoJWTIssuer := getEnvOrDefault("LIVED_MMO_JWT_ISSUER", "lived")
 	mmoJWTSecret := getEnvOrDefault("LIVED_MMO_JWT_SECRET", "")
 	if mmoAuthEnabled && mmoJWTSecret == "" {
@@ -78,6 +98,17 @@ func LoadFromEnv() Config {
 	}
 	mmoAccessTokenTTL := getDurationOrDefault("LIVED_MMO_ACCESS_TOKEN_TTL", 15*time.Minute)
 	mmoRefreshTokenTTL := getDurationOrDefault("LIVED_MMO_REFRESH_TOKEN_TTL", 30*24*time.Hour)
+	rateLimitEnabled := getBoolOrDefault("LIVED_RATE_LIMIT_ENABLED", false)
+	rateLimitWindow := getDurationOrDefault("LIVED_RATE_LIMIT_WINDOW", time.Minute)
+	rateLimitAuthMax := getIntOrDefault("LIVED_RATE_LIMIT_AUTH_MAX", 20)
+	rateLimitChatMax := getIntOrDefault("LIVED_RATE_LIMIT_CHAT_MAX", 30)
+	rateLimitBehaviorMax := getIntOrDefault("LIVED_RATE_LIMIT_BEHAVIOR_MAX", 30)
+	rateLimitOnboardMax := getIntOrDefault("LIVED_RATE_LIMIT_ONBOARD_MAX", 10)
+	rateLimitIdentity := getRateLimitIdentityOrDefault("LIVED_RATE_LIMIT_IDENTITY", "ip")
+	idempotencyEnabled := getBoolOrDefault("LIVED_IDEMPOTENCY_ENABLED", false)
+	idempotencyTTL := getDurationOrDefault("LIVED_IDEMPOTENCY_TTL", 10*time.Minute)
+	streamMaxConnsPerAccount := getIntOrDefault("LIVED_STREAM_MAX_CONNS_PER_ACCOUNT", 5)
+	streamMaxConnsPerSession := getIntOrDefault("LIVED_STREAM_MAX_CONNS_PER_SESSION", 2)
 
 	databaseURL := os.Getenv("LIVED_DATABASE_URL")
 	if databaseURL == "" {
@@ -87,36 +118,66 @@ func LoadFromEnv() Config {
 	autoMigrate := os.Getenv("LIVED_AUTO_MIGRATE")
 	if autoMigrate == "false" || autoMigrate == "0" {
 		return Config{
-			HTTPAddr:            httpAddr,
-			DatabaseURL:         databaseURL,
-			Postgres:            postgresCfg,
-			PostgresAdminDB:     postgresAdminDB,
-			AutoMigrate:         false,
-			TickInterval:        tickInterval,
-			GameMinutesRate:     gameMinutesRate,
-			FrontendDevProxyURL: frontendDevProxyURL,
-			MMOAuthEnabled:      mmoAuthEnabled,
-			MMOJWTIssuer:        mmoJWTIssuer,
-			MMOJWTSecret:        mmoJWTSecret,
-			MMOAccessTokenTTL:   mmoAccessTokenTTL,
-			MMORefreshTokenTTL:  mmoRefreshTokenTTL,
+			HTTPAddr:                 httpAddr,
+			DatabaseURL:              databaseURL,
+			Postgres:                 postgresCfg,
+			PostgresAdminDB:          postgresAdminDB,
+			AutoMigrate:              false,
+			TickInterval:             tickInterval,
+			GameMinutesRate:          gameMinutesRate,
+			FrontendDevProxyURL:      frontendDevProxyURL,
+			MMOAuthEnabled:           mmoAuthEnabled,
+			MMORealmScopingEnabled:   mmoRealmScopingEnabled,
+			MMOChatEnabled:           mmoChatEnabled,
+			MMOAdminEnabled:          mmoAdminEnabled,
+			MMOOTelEnabled:           mmoOTelEnabled,
+			MMOJWTIssuer:             mmoJWTIssuer,
+			MMOJWTSecret:             mmoJWTSecret,
+			MMOAccessTokenTTL:        mmoAccessTokenTTL,
+			MMORefreshTokenTTL:       mmoRefreshTokenTTL,
+			RateLimitEnabled:         rateLimitEnabled,
+			RateLimitWindow:          rateLimitWindow,
+			RateLimitAuthMax:         rateLimitAuthMax,
+			RateLimitChatMax:         rateLimitChatMax,
+			RateLimitBehaviorMax:     rateLimitBehaviorMax,
+			RateLimitOnboardMax:      rateLimitOnboardMax,
+			RateLimitIdentity:        rateLimitIdentity,
+			IdempotencyEnabled:       idempotencyEnabled,
+			IdempotencyTTL:           idempotencyTTL,
+			StreamMaxConnsPerAccount: streamMaxConnsPerAccount,
+			StreamMaxConnsPerSession: streamMaxConnsPerSession,
 		}
 	}
 
 	return Config{
-		HTTPAddr:            httpAddr,
-		DatabaseURL:         databaseURL,
-		Postgres:            postgresCfg,
-		PostgresAdminDB:     postgresAdminDB,
-		AutoMigrate:         true,
-		TickInterval:        tickInterval,
-		GameMinutesRate:     gameMinutesRate,
-		FrontendDevProxyURL: frontendDevProxyURL,
-		MMOAuthEnabled:      mmoAuthEnabled,
-		MMOJWTIssuer:        mmoJWTIssuer,
-		MMOJWTSecret:        mmoJWTSecret,
-		MMOAccessTokenTTL:   mmoAccessTokenTTL,
-		MMORefreshTokenTTL:  mmoRefreshTokenTTL,
+		HTTPAddr:                 httpAddr,
+		DatabaseURL:              databaseURL,
+		Postgres:                 postgresCfg,
+		PostgresAdminDB:          postgresAdminDB,
+		AutoMigrate:              true,
+		TickInterval:             tickInterval,
+		GameMinutesRate:          gameMinutesRate,
+		FrontendDevProxyURL:      frontendDevProxyURL,
+		MMOAuthEnabled:           mmoAuthEnabled,
+		MMORealmScopingEnabled:   mmoRealmScopingEnabled,
+		MMOChatEnabled:           mmoChatEnabled,
+		MMOAdminEnabled:          mmoAdminEnabled,
+		MMOOTelEnabled:           mmoOTelEnabled,
+		MMOJWTIssuer:             mmoJWTIssuer,
+		MMOJWTSecret:             mmoJWTSecret,
+		MMOAccessTokenTTL:        mmoAccessTokenTTL,
+		MMORefreshTokenTTL:       mmoRefreshTokenTTL,
+		RateLimitEnabled:         rateLimitEnabled,
+		RateLimitWindow:          rateLimitWindow,
+		RateLimitAuthMax:         rateLimitAuthMax,
+		RateLimitChatMax:         rateLimitChatMax,
+		RateLimitBehaviorMax:     rateLimitBehaviorMax,
+		RateLimitOnboardMax:      rateLimitOnboardMax,
+		RateLimitIdentity:        rateLimitIdentity,
+		IdempotencyEnabled:       idempotencyEnabled,
+		IdempotencyTTL:           idempotencyTTL,
+		StreamMaxConnsPerAccount: streamMaxConnsPerAccount,
+		StreamMaxConnsPerSession: streamMaxConnsPerSession,
 	}
 }
 
@@ -163,7 +224,7 @@ func getBoolOrDefault(key string, fallback bool) bool {
 		return fallback
 	}
 
-	lower := value
+	lower := strings.ToLower(strings.TrimSpace(value))
 	if lower == "true" || lower == "1" || lower == "yes" || lower == "on" {
 		return true
 	}
@@ -172,4 +233,32 @@ func getBoolOrDefault(key string, fallback bool) bool {
 	}
 
 	return fallback
+}
+
+func getIntOrDefault(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+
+	return parsed
+}
+
+func getRateLimitIdentityOrDefault(key string, fallback string) string {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+
+	switch value {
+	case "ip", "account_or_ip":
+		return value
+	default:
+		return fallback
+	}
 }

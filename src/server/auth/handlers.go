@@ -13,6 +13,7 @@ import (
 
 	"github.com/asciifaceman/lived/pkg/config"
 	"github.com/asciifaceman/lived/pkg/dal"
+	"github.com/asciifaceman/lived/pkg/ratelimit"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/crypto/bcrypt"
@@ -99,9 +100,17 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 		return
 	}
 
-	group.POST("/register", makeRegisterHandler(database, cfg))
-	group.POST("/login", makeLoginHandler(database, cfg))
-	group.POST("/refresh", makeRefreshHandler(database, cfg))
+	limiter := ratelimit.NewFixedWindowLimiter(cfg.RateLimitWindow, ratelimit.ClientIPIdentifier)
+
+	if cfg.RateLimitEnabled {
+		group.POST("/register", makeRegisterHandler(database, cfg), limiter.Middleware("auth_register", cfg.RateLimitAuthMax))
+		group.POST("/login", makeLoginHandler(database, cfg), limiter.Middleware("auth_login", cfg.RateLimitAuthMax))
+		group.POST("/refresh", makeRefreshHandler(database, cfg), limiter.Middleware("auth_refresh", cfg.RateLimitAuthMax))
+	} else {
+		group.POST("/register", makeRegisterHandler(database, cfg))
+		group.POST("/login", makeLoginHandler(database, cfg))
+		group.POST("/refresh", makeRefreshHandler(database, cfg))
+	}
 	group.POST("/logout", makeLogoutHandler(database, cfg), makeAuthMiddleware(database, cfg))
 	group.GET("/me", makeMeHandler(database), makeAuthMiddleware(database, cfg))
 }

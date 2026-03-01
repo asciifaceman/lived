@@ -2,14 +2,17 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/asciifaceman/lived/pkg/config"
 	"github.com/asciifaceman/lived/pkg/dal"
 	"github.com/asciifaceman/lived/src/gameplay"
+	serverAuth "github.com/asciifaceman/lived/src/server/auth"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
@@ -46,12 +49,59 @@ type playerStreamStatus struct {
 	AscensionReason string  `json:"ascensionReason"`
 }
 
-func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
-	group.GET("/world", makeWorldStreamHandler(database, cfg))
+type streamViewer struct {
+	PlayerID uint
+	RealmID  uint
+	Name     string
 }
 
-func makeWorldStreamHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
+func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
+	var limiter *streamConnectionLimiter
+	if cfg.MMOAuthEnabled {
+		limiter = newStreamConnectionLimiter(cfg.StreamMaxConnsPerAccount, cfg.StreamMaxConnsPerSession)
+	}
+
+	handler := makeWorldStreamHandler(database, cfg, limiter)
+	if cfg.MMOAuthEnabled {
+		group.GET("/world", handler, serverAuth.RequireAuth(database, cfg))
+		return
+	}
+	group.GET("/world", handler)
+}
+
+func makeWorldStreamHandler(database *gorm.DB, cfg config.Config, limiter *streamConnectionLimiter) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		viewer := (*streamViewer)(nil)
+		accountID := uint(0)
+		sessionID := uint(0)
+		if cfg.MMOAuthEnabled {
+			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+			}
+			accountID = actor.AccountID
+			sessionID = actor.SessionID
+			if limiter != nil {
+				if acquired := limiter.tryAcquire(accountID, sessionID); !acquired {
+					return echo.NewHTTPError(http.StatusTooManyRequests, "stream connection limit reached for this account/session")
+				}
+				defer limiter.release(accountID, sessionID)
+			}
+
+			resolvedViewer, err := resolveStreamViewer(c.Request().Context(), c.QueryParam("characterId"), database)
+			if err != nil {
+				var httpErr *echo.HTTPError
+				if errors.As(err, &httpErr) {
+					return httpErr
+				}
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return echo.NewHTTPError(http.StatusBadRequest, "complete onboarding first")
+				}
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to resolve stream character")
+			}
+			viewer = resolvedViewer
+		}
+
 		conn, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
 		if err != nil {
 			return err
@@ -80,7 +130,7 @@ func makeWorldStreamHandler(database *gorm.DB, cfg config.Config) echo.HandlerFu
 		ticker := time.NewTicker(tickEvery)
 		defer ticker.Stop()
 
-		if writeErr := writeWorldSnapshot(ctx, conn, database); writeErr != nil {
+		if writeErr := writeWorldSnapshot(ctx, conn, database, viewer); writeErr != nil {
 			return nil
 		}
 
@@ -91,7 +141,7 @@ func makeWorldStreamHandler(database *gorm.DB, cfg config.Config) echo.HandlerFu
 			case <-readDone:
 				return nil
 			case <-ticker.C:
-				if writeErr := writeWorldSnapshot(ctx, conn, database); writeErr != nil {
+				if writeErr := writeWorldSnapshot(ctx, conn, database, viewer); writeErr != nil {
 					return nil
 				}
 			}
@@ -99,13 +149,18 @@ func makeWorldStreamHandler(database *gorm.DB, cfg config.Config) echo.HandlerFu
 	}
 }
 
-func writeWorldSnapshot(ctx context.Context, conn *websocket.Conn, database *gorm.DB) error {
-	tick, err := gameplay.CurrentWorldTick(ctx, database)
+func writeWorldSnapshot(ctx context.Context, conn *websocket.Conn, database *gorm.DB, viewer *streamViewer) error {
+	realmID := uint(1)
+	if viewer != nil && viewer.RealmID != 0 {
+		realmID = viewer.RealmID
+	}
+
+	tick, err := gameplay.CurrentWorldTickForRealm(ctx, database, realmID)
 	if err != nil {
 		return err
 	}
 
-	market, err := gameplay.GetMarketStatus(ctx, database, tick)
+	market, err := gameplay.GetMarketStatus(ctx, database, tick, realmID)
 	if err != nil {
 		return err
 	}
@@ -122,19 +177,15 @@ func writeWorldSnapshot(ctx context.Context, conn *websocket.Conn, database *gor
 		MarketState: market.SessionState,
 	}
 
-	primaryPlayer, err := loadPrimaryPlayer(ctx, database)
-	if err != nil {
-		return err
-	}
-	if primaryPlayer != nil {
-		snapshot, err := gameplay.LoadWorldSnapshot(ctx, database, primaryPlayer.ID)
+	if viewer != nil {
+		snapshot, err := gameplay.LoadWorldSnapshot(ctx, database, viewer.PlayerID, realmID)
 		if err != nil {
 			return err
 		}
 
 		queuedOrActive := 0
 		for _, behavior := range snapshot.Behaviors {
-			if behavior.ActorType != gameplay.ActorPlayer || behavior.ActorID != primaryPlayer.ID {
+			if behavior.ActorType != gameplay.ActorPlayer || behavior.ActorID != viewer.PlayerID {
 				continue
 			}
 			if behavior.State == "queued" || behavior.State == "active" {
@@ -143,7 +194,7 @@ func writeWorldSnapshot(ctx context.Context, conn *websocket.Conn, database *gor
 		}
 
 		event.Player = &playerStreamStatus{
-			Name:            primaryPlayer.Name,
+			Name:            viewer.Name,
 			Coins:           snapshot.Inventory["coins"],
 			AscensionCount:  snapshot.AscensionCount,
 			WealthBonusPct:  snapshot.WealthBonusPct,
@@ -151,10 +202,70 @@ func writeWorldSnapshot(ctx context.Context, conn *websocket.Conn, database *gor
 			AscensionReady:  snapshot.Ascension.Available,
 			AscensionReason: snapshot.Ascension.Reason,
 		}
+	} else {
+		primaryPlayer, err := loadPrimaryPlayer(ctx, database)
+		if err != nil {
+			return err
+		}
+		if primaryPlayer != nil {
+			snapshot, err := gameplay.LoadWorldSnapshot(ctx, database, primaryPlayer.ID, realmID)
+			if err != nil {
+				return err
+			}
+
+			queuedOrActive := 0
+			for _, behavior := range snapshot.Behaviors {
+				if behavior.ActorType != gameplay.ActorPlayer || behavior.ActorID != primaryPlayer.ID {
+					continue
+				}
+				if behavior.State == "queued" || behavior.State == "active" {
+					queuedOrActive++
+				}
+			}
+
+			event.Player = &playerStreamStatus{
+				Name:            primaryPlayer.Name,
+				Coins:           snapshot.Inventory["coins"],
+				AscensionCount:  snapshot.AscensionCount,
+				WealthBonusPct:  snapshot.WealthBonusPct,
+				QueuedOrActive:  queuedOrActive,
+				AscensionReady:  snapshot.Ascension.Available,
+				AscensionReason: snapshot.Ascension.Reason,
+			}
+		}
 	}
 
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	return conn.WriteJSON(event)
+}
+
+func resolveStreamViewer(ctx context.Context, rawCharacterID string, database *gorm.DB) (*streamViewer, error) {
+	actor, ok := serverAuth.ActorFromContext(ctx)
+	if !ok {
+		return nil, echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+	}
+
+	query := database.WithContext(ctx).
+		Where("account_id = ? AND status = ?", actor.AccountID, "active")
+
+	if strings.TrimSpace(rawCharacterID) != "" {
+		parsed, err := strconv.ParseUint(strings.TrimSpace(rawCharacterID), 10, 64)
+		if err != nil || parsed == 0 {
+			return nil, echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+		}
+		query = query.Where("id = ?", uint(parsed))
+	}
+
+	character := dal.Character{}
+	result := query.Order("is_primary DESC, id ASC").Limit(1).Find(&character)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
+
+	return &streamViewer{PlayerID: character.PlayerID, RealmID: character.RealmID, Name: character.Name}, nil
 }
 
 func loadPrimaryPlayer(ctx context.Context, database *gorm.DB) (*dal.Player, error) {

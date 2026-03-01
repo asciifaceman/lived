@@ -75,10 +75,25 @@ Environment variables used by the app:
 - `LIVED_POSTGRES_TIMEZONE` (default `UTC`)
 - `LIVED_DATABASE_URL` (optional DSN override; bypasses split Postgres fields)
 - `LIVED_MMO_AUTH_ENABLED` (default `false`; enables `/v1/auth/*` routes)
+- `LIVED_MMO_REALM_SCOPING_ENABLED` (default `true`; gates `/v1/mmo/*` stats endpoints)
+- `LIVED_MMO_CHAT_ENABLED` (default `true`; gates `/v1/chat/*` and `/v1/feed/*` routes)
+- `LIVED_MMO_ADMIN_ENABLED` (default `true`; gates `/v1/admin/*` routes)
+- `LIVED_MMO_OTEL_ENABLED` (default `false`; reserved flag for OTel rollout wiring)
 - `LIVED_MMO_JWT_ISSUER` (default `lived`)
 - `LIVED_MMO_JWT_SECRET` (required in real deployments when MMO auth is enabled)
 - `LIVED_MMO_ACCESS_TOKEN_TTL` (default `15m`)
 - `LIVED_MMO_REFRESH_TOKEN_TTL` (default `720h`)
+- `LIVED_RATE_LIMIT_ENABLED` (default `false`; enables server-side write route throttling)
+- `LIVED_RATE_LIMIT_WINDOW` (default `1m`; fixed window duration)
+- `LIVED_RATE_LIMIT_AUTH_MAX` (default `20`; max requests per window for `/v1/auth/register|login|refresh`)
+- `LIVED_RATE_LIMIT_CHAT_MAX` (default `30`; max requests per window for `POST /v1/chat/messages`)
+- `LIVED_RATE_LIMIT_BEHAVIOR_MAX` (default `30`; max requests per window for `POST /v1/system/behaviors/start`)
+- `LIVED_RATE_LIMIT_ONBOARD_MAX` (default `10`; max requests per window for `POST /v1/onboarding/start`)
+- `LIVED_RATE_LIMIT_IDENTITY` (default `ip`; `ip` uses client IP only, `account_or_ip` uses authenticated account ID with IP fallback)
+- `LIVED_IDEMPOTENCY_ENABLED` (default `false`; enables idempotency replay for selected write endpoints)
+- `LIVED_IDEMPOTENCY_TTL` (default `10m`; retention window for idempotency records)
+- `LIVED_STREAM_MAX_CONNS_PER_ACCOUNT` (default `5`; max concurrent MMO stream sockets per account)
+- `LIVED_STREAM_MAX_CONNS_PER_SESSION` (default `2`; max concurrent MMO stream sockets per auth session)
 
 ### 2) Create or recreate the development database
 
@@ -92,6 +107,18 @@ Drop and recreate the configured DB:
 
 ```bash
 go run . db setup --recreate
+```
+
+Run database migrations explicitly:
+
+```bash
+go run . db migrate
+```
+
+Verify realm-scoped migration/index health (recommended after schema updates on existing databases):
+
+```bash
+go run . db verify
 ```
 
 The command connects to `LIVED_POSTGRES_ADMIN_DB` and creates `LIVED_POSTGRES_DBNAME` with owner `LIVED_POSTGRES_USER`.
@@ -228,6 +255,8 @@ Base path: `/v1/system`
 	- Queues a player behavior by key.
 	- Request: `{ "behaviorKey": "player_scavenge_scrap" }`
 	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): requires bearer access token and queues for authenticated account character (optional `?characterId=<id>` selector).
+	- When idempotency is enabled, optional `Idempotency-Key` request header prevents duplicate queueing on retries.
+	- Idempotent responses include `Idempotency-Status: stored|replayed`.
 	- For market-open-required behaviors, optional `marketWait` controls timeout before giving up: `{ "behaviorKey": "player_sell_scrap", "marketWait": "12h" }`
 	- Market-open-required behaviors queued overnight now wait for market open instead of failing immediately.
 	- Intended starter progression from poverty: `player_scavenge_scrap` then `player_sell_scrap`.
@@ -240,12 +269,16 @@ Base path: `/v1/system`
 	- Progression identity is emergent from play patterns (behavior choices/stat investment), not an explicit class picker.
 - `GET /market/status`
 	- Returns ticker-style market snapshot (symbols, prices, deltas, session status, and time to open/close).
+	- Optional `?realmId=<id>` selects a specific realm ticker (defaults to `1`).
 	- Market closes overnight and reopens based on in-game clock.
-- `GET /market/history?symbol=scrap&limit=100`
+	- Endpoint is intentionally public for market-monitor tooling.
+- `GET /market/history?symbol=scrap&limit=100&realmId=1`
 	- Returns market history entries (tick, price, delta, source, session state) like a stock-market API feed.
+	- Optional `realmId` selects a specific realm history stream (defaults to `1`).
+	- Endpoint is intentionally public for market-monitor tooling.
 - `POST /ascend`
 	- Resets run-state and grants permanent meta bonuses.
-	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): currently disabled until realm-scoped ascension is implemented (legacy ascension reset is global).
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): requires bearer access token and applies character-scoped ascension in the selected character realm (optional `?characterId=<id>` selector).
 	- Optional request: `{ "name": "NextRunName" }`
 	- Meta progression includes ascension count and wealth bonus percentage.
 	- Ascension is gated by wealth progression with a scaling requirement per ascension (`250`, then increasing by factor).
@@ -301,13 +334,85 @@ Base path: `/v1/player`
 	- Response data includes primary player presence/name, simulation tick, and filtered player behavior items.
 	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): requires bearer access token and resolves behaviors by authenticated account character (optional `?characterId=<id>` selector).
 
+### Feed
+
+Base path: `/v1/feed`
+
+- `GET /public?realmId=1&limit=50`
+	- Returns realm-scoped public world activity entries (latest first).
+	- Includes event tick/day/clock metadata for UI timeline rendering.
+	- Intended to be public for spectator dashboards and tooling.
+
+### Chat
+
+Base path: `/v1/chat`
+
+- `GET /channels`
+	- Returns available chat channels.
+	- Current baseline channel set includes `global`.
+- `GET /messages?realmId=1&channel=global&limit=100`
+	- Returns realm/channel chat messages with in-world tick/day/clock metadata.
+	- Public read endpoint for feed/chat clients.
+- `POST /messages`
+	- Posts a public chat message (`message`, optional `channel`).
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): requires bearer access token and posts as the authenticated account character (optional `?characterId=<id>` selector).
+	- When idempotency is enabled, optional `Idempotency-Key` request header prevents duplicate posts on retries.
+	- Idempotent responses include `Idempotency-Status: stored|replayed`.
+	- Message length is capped at 280 characters.
+
+### Admin
+
+Base path: `/v1/admin` (available when `LIVED_MMO_AUTH_ENABLED=true`)
+
+- `GET /realms`
+	- Returns discovered realm IDs and active-character counts.
+	- Requires bearer access token with `admin` role.
+- `GET /stats`
+	- Returns operational counters (active accounts/characters/sessions, queued-or-active behaviors, public event count).
+	- Includes admin audit aggregates (`total`, `windowTotal`, by-action, by-realm) over a configurable tick window.
+	- Optional `windowTicks` query controls aggregate window size (default `1440`, max `43200`).
+	- Requires bearer access token with `admin` role.
+
+- `GET /audit?realmId=1&actorAccountId=12&actionKey=account_lock&beforeId=500&limit=100`
+	- Returns immutable admin audit entries with optional filters.
+	- Supports cursor paging via `beforeId` (fetch entries where `id < beforeId`).
+	- Optional `includeRawJson=true` includes decoded `before`/`after` payload fields; default is compact metadata-only rows.
+	- Requires bearer access token with `admin` role.
+- `GET /audit/:id`
+	- Returns a single immutable admin audit entry by id with decoded `before`/`after` payloads.
+	- Optional `includeRawJson=true` includes decoded `before`/`after`; default is compact metadata-only response.
+	- Requires bearer access token with `admin` role.
+- `GET /audit/export?realmId=1&actionKey=account_lock&beforeId=500&limit=100`
+	- Exports immutable admin audit entries as CSV.
+	- Supports the same optional filters/cursor as `GET /audit`.
+	- Requires bearer access token with `admin` role.
+- `POST /realms/:id/actions`
+	- Applies a realm admin action and records an immutable audit event.
+	- Requires bearer access token with `admin` role.
+	- Current actions:
+		- `market_reset_defaults` (reset key market symbols to default baseline values)
+		- `market_set_price` (set a specific symbol price using `itemKey` + positive `price`)
+	- Request requires `reasonCode` (optional `note`) for auditability.
+- `POST /moderation/accounts/:id/lock`
+	- Locks account `:id` and revokes currently active sessions.
+	- Requires `reasonCode` (optional `note`) and `admin` role.
+- `POST /moderation/accounts/:id/unlock`
+	- Unlocks account `:id`.
+	- Requires `reasonCode` (optional `note`) and `admin` role.
+- `POST /moderation/accounts/:id/roles`
+	- Grants/revokes account roles.
+	- Request: `{ "roleKey": "moderator", "action": "grant|revoke", "reasonCode": "...", "note": "optional" }`.
+	- Requires `admin` role.
+
 ### Stream
 
 Base path: `/v1/stream`
 
 - `GET /world` (WebSocket)
 	- UI-focused continuous stream for world/player runtime updates.
-	- Emits snapshots including tick, day, minuteOfDay, clock, dayPart, market open/closed state, and primary-player summary.
+	- Emits snapshots including tick, day, minuteOfDay, clock, dayPart, market open/closed state, and player summary.
+	- MMO mode (`LIVED_MMO_AUTH_ENABLED=true`): requires bearer access token and resolves stream player/realm by authenticated account character (optional `?characterId=<id>` selector).
+	- MMO mode enforces configurable concurrent-connection caps per account/session.
 	- Intended for responsive UI rendering (no polling delay).
 	- Frontend uses this stream when available and falls back to REST polling if disconnected.
 	- UI world feed entries include in-world timestamps and can be opened for additional event meaning/context.
@@ -430,6 +535,8 @@ mage run
 mage dev
 mage dbSetup
 mage dbRecreate
+mage dbMigrate
+mage dbVerify
 mage frontendInstall
 mage frontendDev
 mage frontendBuild
@@ -443,6 +550,8 @@ make build
 make run
 make dev
 make db-setup
+make db-migrate
+make db-verify
 make frontend-dev
 make build-embed
 ```
@@ -452,6 +561,8 @@ make build-embed
 - `go run . run` — start API server
 - `go run . db setup` — create dev database if missing
 - `go run . db setup --recreate` — recreate dev database
+- `go run . db migrate` — run database migrations
+- `go run . db verify` — run realm-scoping migration health checks and print a verification report
 
 ## Notes
 

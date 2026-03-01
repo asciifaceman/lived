@@ -36,6 +36,22 @@ const openAPISpecJSON = `{
     {
       "name": "Stream",
       "description": "UI-oriented live stream endpoints."
+    },
+    {
+      "name": "Feed",
+      "description": "Realm-scoped public world activity feed endpoints."
+    },
+    {
+      "name": "Chat",
+      "description": "Realm chat channels and messages."
+    },
+    {
+      "name": "Admin",
+      "description": "Admin control-plane and operational telemetry endpoints."
+    },
+    {
+      "name": "MMO",
+      "description": "Realm-scoped MMO telemetry and aggregate stats."
     }
   ],
   "paths": {
@@ -462,6 +478,13 @@ const openAPISpecJSON = `{
             "required": false,
             "schema": { "type": "integer", "minimum": 1 },
             "description": "Optional character selector in MMO mode."
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string", "maxLength": 128 },
+            "description": "Optional idempotency key for safe retries when idempotency middleware is enabled."
           }
         ],
         "security": [
@@ -485,6 +508,9 @@ const openAPISpecJSON = `{
             "$ref": "#/components/responses/ErrorResponse"
           },
           "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "409": {
             "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {
@@ -589,12 +615,27 @@ const openAPISpecJSON = `{
           "Stream"
         ],
         "summary": "Stream world snapshots",
-        "description": "WebSocket endpoint for UI live updates. Clients should upgrade the connection and receive continuous world/player snapshots including tick, clock, dayPart, market session, and player summary.",
+        "description": "WebSocket endpoint for UI live updates. Clients should upgrade the connection and receive continuous world/player snapshots including tick, clock, dayPart, market session, and player summary. In MMO mode this route requires bearer auth, resolves stream context by authenticated account character (optional characterId selector), and enforces configured concurrent connection limits per account/session.",
+        "parameters": [
+          {
+            "name": "characterId",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1 },
+            "description": "Optional character selector in MMO mode."
+          }
+        ],
+        "security": [
+          { "BearerAuth": [] }
+        ],
         "responses": {
           "101": {
             "description": "Switching Protocols (WebSocket upgrade successful)"
           },
           "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
             "$ref": "#/components/responses/ErrorResponse"
           }
         }
@@ -606,7 +647,7 @@ const openAPISpecJSON = `{
           "System"
         ],
         "summary": "Queue player behavior",
-        "description": "Queues a player behavior to be processed by the world loop. In MMO mode this requires bearer auth and resolves the authenticated account character (optional characterId selector). For market-open-required behaviors, optional marketWait (e.g. 12h, 2d) controls how long it waits for market open before failing.",
+        "description": "Queues a player behavior to be processed by the world loop. In MMO mode this requires bearer auth and resolves the authenticated account character (optional characterId selector). For market-open-required behaviors, optional marketWait (e.g. 12h, 2d) controls how long it waits for market open before failing. When idempotency is enabled and Idempotency-Key is provided, responses include Idempotency-Status: stored|replayed.",
         "parameters": [
           {
             "name": "characterId",
@@ -701,7 +742,19 @@ const openAPISpecJSON = `{
       "get": {
         "tags": ["System"],
         "summary": "Get market ticker status",
-        "description": "Returns ticker-style market data including session open/close state. Intentionally public for market-monitor tooling.",
+        "description": "Returns ticker-style market data including session open/close state. Intentionally public for market-monitor tooling. Optional realmId selects a specific realm ticker.",
+        "parameters": [
+          {
+            "name": "realmId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Market ticker snapshot",
@@ -723,7 +776,7 @@ const openAPISpecJSON = `{
       "get": {
         "tags": ["System"],
         "summary": "Get market history",
-        "description": "Returns market history entries with tick/price/delta/source. Intentionally public for market-monitor tooling.",
+        "description": "Returns market history entries with tick/price/delta/source. Intentionally public for market-monitor tooling. Optional realmId selects a specific realm history.",
         "parameters": [
           {
             "name": "symbol",
@@ -742,6 +795,16 @@ const openAPISpecJSON = `{
               "minimum": 1,
               "maximum": 500,
               "default": 100
+            }
+          },
+          {
+            "name": "realmId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
             }
           }
         ],
@@ -768,7 +831,29 @@ const openAPISpecJSON = `{
           "System"
         ],
         "summary": "Ascend to next run",
-        "description": "Resets run-state and grants permanent meta bonuses. In MMO mode this endpoint is authenticated but currently disabled pending realm-scoped ascension implementation.",
+        "description": "Resets run-state and grants permanent meta bonuses. In MMO mode this endpoint is authenticated and applies character-scoped ascension reset within the selected character realm.",
+        "parameters": [
+          {
+            "name": "characterId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Optional character selector in MMO mode."
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "Optional idempotency key for safe retries when idempotency middleware is enabled."
+          }
+        ],
         "security": [
           { "BearerAuth": [] }
         ],
@@ -800,6 +885,882 @@ const openAPISpecJSON = `{
             "$ref": "#/components/responses/ErrorResponse"
           },
           "409": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/mmo/stats/system": {
+      "get": {
+        "tags": ["MMO"],
+        "summary": "Get realm system stats",
+        "description": "Returns realm-scoped world tick and behavior/event aggregates.",
+        "parameters": [
+          {
+            "name": "realmId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "MMO system stats",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/mmo/stats/players": {
+      "get": {
+        "tags": ["MMO"],
+        "summary": "Get realm player stats",
+        "description": "Returns realm-scoped active character/account/player and currency aggregates.",
+        "parameters": [
+          {
+            "name": "realmId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "MMO player stats",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/mmo/stats/economy": {
+      "get": {
+        "tags": ["MMO"],
+        "summary": "Get realm economy stats",
+        "description": "Returns realm-scoped market ticker rows and aggregated player inventory quantities.",
+        "parameters": [
+          {
+            "name": "realmId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "MMO economy stats",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/feed/public": {
+      "get": {
+        "tags": ["Feed"],
+        "summary": "Get public world feed",
+        "description": "Returns realm-scoped public world events in reverse chronological order.",
+        "parameters": [
+          {
+            "name": "realmId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Public feed events",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/chat/channels": {
+      "get": {
+        "tags": ["Chat"],
+        "summary": "Get chat channels",
+        "description": "Returns available chat channels.",
+        "responses": {
+          "200": {
+            "description": "Chat channels",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/messages": {
+      "get": {
+        "tags": ["Chat"],
+        "summary": "Get chat messages",
+        "description": "Returns realm/channel chat messages.",
+        "parameters": [
+          {
+            "name": "realmId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "channel",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "global"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Chat messages",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      },
+      "post": {
+        "tags": ["Chat"],
+        "summary": "Post chat message",
+        "description": "Posts a public chat message. In MMO mode this endpoint requires bearer auth and posts in the selected character realm. When idempotency is enabled and Idempotency-Key is provided, responses include Idempotency-Status: stored|replayed.",
+        "parameters": [
+          {
+            "name": "characterId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Optional character selector in MMO mode."
+          }
+        ],
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["message"],
+                "properties": {
+                  "message": { "type": "string", "maxLength": 280 },
+                  "channel": { "type": "string", "default": "global" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Chat message posted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/realms": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List known realms",
+        "description": "Returns discovered realm IDs and active character counts. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "responses": {
+          "200": {
+            "description": "Realm list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/audit": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List admin audit entries",
+        "description": "Returns immutable admin audit entries with optional filters. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "realmId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "actorAccountId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "actionKey",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 64
+            }
+          },
+          {
+            "name": "beforeId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Cursor for older entries (returns entries with id < beforeId)."
+          },
+          {
+            "name": "includeRawJson",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "When true, includes decoded before/after payloads for each row."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit entries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/audit/{id}": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get admin audit entry",
+        "description": "Returns a single admin audit entry by ID with decoded before/after payloads. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Admin audit entry ID"
+          },
+          {
+            "name": "includeRawJson",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "When true, includes decoded before/after payloads."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/audit/export": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Export admin audit entries as CSV",
+        "description": "Exports immutable admin audit entries as CSV with optional filters. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "realmId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "actorAccountId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "actionKey",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 64
+            }
+          },
+          {
+            "name": "beforeId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit CSV export",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/stats": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get admin stats",
+        "description": "Returns global MMO operational counters and recent admin-audit aggregates. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "windowTicks",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 43200,
+              "default": 1440
+            },
+            "description": "Tick window used for admin audit by-action/by-realm aggregates."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Admin stats",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/realms/{id}/actions": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Apply realm admin action",
+        "description": "Applies an admin action to the selected realm and records an immutable audit event. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Realm ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["action", "reasonCode"],
+                "properties": {
+                  "action": {
+                    "type": "string",
+                    "enum": ["market_reset_defaults", "market_set_price"]
+                  },
+                  "reasonCode": {
+                    "type": "string",
+                    "maxLength": 64
+                  },
+                  "note": {
+                    "type": "string",
+                    "maxLength": 500
+                  },
+                  "itemKey": {
+                    "type": "string"
+                  },
+                  "price": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Action applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/moderation/accounts/{id}/lock": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Lock account",
+        "description": "Locks an account and revokes active sessions. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Account ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["reasonCode"],
+                "properties": {
+                  "reasonCode": { "type": "string", "maxLength": 64 },
+                  "note": { "type": "string", "maxLength": 500 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Account locked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/moderation/accounts/{id}/unlock": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Unlock account",
+        "description": "Unlocks an account. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Account ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["reasonCode"],
+                "properties": {
+                  "reasonCode": { "type": "string", "maxLength": 64 },
+                  "note": { "type": "string", "maxLength": 500 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Account unlocked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/moderation/accounts/{id}/roles": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Grant or revoke account role",
+        "description": "Grants or revokes a role for an account. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Account ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["roleKey", "action", "reasonCode"],
+                "properties": {
+                  "roleKey": { "type": "string", "maxLength": 32 },
+                  "action": { "type": "string", "enum": ["grant", "revoke"] },
+                  "reasonCode": { "type": "string", "maxLength": 64 },
+                  "note": { "type": "string", "maxLength": 500 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Role moderation applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
             "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {

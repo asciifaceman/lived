@@ -102,6 +102,14 @@ func DbRecreate() error {
 	return run("go", "run", ".", "db", "setup", "--recreate")
 }
 
+func DbMigrate() error {
+	return run("go", "run", ".", "db", "migrate")
+}
+
+func DbVerify() error {
+	return run("go", "run", ".", "db", "verify")
+}
+
 func FrontendInstall() error {
 	return runInDir("web", npmBin(), "install")
 }
@@ -127,6 +135,8 @@ func printTargets() {
 	fmt.Println("  mage test                 Run Go tests")
 	fmt.Println("  mage dbSetup              Create DB if needed")
 	fmt.Println("  mage dbRecreate           Drop and recreate DB")
+	fmt.Println("  mage dbMigrate            Run DB migrations")
+	fmt.Println("  mage dbVerify             Verify realm-scoped migration/index health")
 	fmt.Println("  mage frontendInstall      Install frontend deps")
 	fmt.Println("  mage frontendDev          Run Vite dev server")
 	fmt.Println("  mage frontendBuild        Build frontend to web/dist")

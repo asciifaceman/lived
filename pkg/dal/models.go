@@ -53,12 +53,14 @@ type AccountSession struct {
 
 type WorldState struct {
 	BaseModel
+	RealmID        uint  `gorm:"not null;default:1;uniqueIndex:idx_world_state_realm"`
 	SimulationTick int64 `gorm:"not null;default:0"`
 }
 
 type WorldRuntimeState struct {
 	BaseModel
-	Key                  string    `gorm:"size:64;not null;uniqueIndex"`
+	RealmID              uint      `gorm:"not null;default:1;uniqueIndex:idx_world_runtime_realm_key,priority:1"`
+	Key                  string    `gorm:"size:64;not null;uniqueIndex:idx_world_runtime_realm_key,priority:2"`
 	LastProcessedTickAt  time.Time `gorm:"not null"`
 	CarryGameMinutes     float64   `gorm:"not null;default:0"`
 	PendingBehaviorsJSON string    `gorm:"type:text;not null;default:'[]'"`
@@ -66,6 +68,7 @@ type WorldRuntimeState struct {
 
 type InventoryEntry struct {
 	BaseModel
+	RealmID   uint   `gorm:"not null;default:1;index"`
 	OwnerType string `gorm:"size:32;not null;index:idx_inventory_owner_item,priority:1"`
 	OwnerID   uint   `gorm:"not null;index:idx_inventory_owner_item,priority:2"`
 	ItemKey   string `gorm:"size:64;not null;index:idx_inventory_owner_item,priority:3"`
@@ -74,12 +77,14 @@ type InventoryEntry struct {
 
 type PlayerUnlock struct {
 	BaseModel
+	RealmID   uint   `gorm:"not null;default:1;index"`
 	PlayerID  uint   `gorm:"not null;index:idx_player_unlock,priority:1"`
 	UnlockKey string `gorm:"size:64;not null;index:idx_player_unlock,priority:2"`
 }
 
 type PlayerStat struct {
 	BaseModel
+	RealmID  uint   `gorm:"not null;default:1;index"`
 	PlayerID uint   `gorm:"not null;index:idx_player_stat,priority:1"`
 	StatKey  string `gorm:"size:64;not null;index:idx_player_stat,priority:2"`
 	Value    int64  `gorm:"not null;default:0"`
@@ -87,6 +92,7 @@ type PlayerStat struct {
 
 type BehaviorInstance struct {
 	BaseModel
+	RealmID           uint   `gorm:"not null;default:1;index"`
 	Key               string `gorm:"size:64;not null;index"`
 	ActorType         string `gorm:"size:32;not null;index"`
 	ActorID           uint   `gorm:"not null;index"`
@@ -103,6 +109,7 @@ type BehaviorInstance struct {
 
 type WorldEvent struct {
 	BaseModel
+	RealmID     uint   `gorm:"not null;default:1;index"`
 	Tick        int64  `gorm:"not null;index"`
 	EventType   string `gorm:"size:64;not null;index"`
 	Message     string `gorm:"type:text;not null"`
@@ -113,7 +120,8 @@ type WorldEvent struct {
 
 type MarketPrice struct {
 	BaseModel
-	ItemKey     string `gorm:"size:64;not null;uniqueIndex"`
+	RealmID     uint   `gorm:"not null;default:1;uniqueIndex:idx_market_price_realm_item,priority:1"`
+	ItemKey     string `gorm:"size:64;not null;uniqueIndex:idx_market_price_realm_item,priority:2"`
 	Price       int64  `gorm:"not null;default:1"`
 	LastDelta   int64  `gorm:"not null;default:0"`
 	LastSource  string `gorm:"size:64;not null;default:''"`
@@ -122,6 +130,7 @@ type MarketPrice struct {
 
 type MarketHistory struct {
 	BaseModel
+	RealmID      uint   `gorm:"not null;default:1;index"`
 	ItemKey      string `gorm:"size:64;not null;index"`
 	Tick         int64  `gorm:"not null;index"`
 	Price        int64  `gorm:"not null"`
@@ -132,9 +141,22 @@ type MarketHistory struct {
 
 type AscensionState struct {
 	BaseModel
-	Key            string  `gorm:"size:64;not null;uniqueIndex"`
+	RealmID        uint    `gorm:"not null;default:1;uniqueIndex:idx_ascension_realm_key,priority:1"`
+	Key            string  `gorm:"size:64;not null;uniqueIndex:idx_ascension_realm_key,priority:2"`
 	Count          int64   `gorm:"not null;default:0"`
 	WealthBonusPct float64 `gorm:"not null;default:0"`
+}
+
+type AdminAuditEvent struct {
+	BaseModel
+	RealmID        uint   `gorm:"not null;default:1;index"`
+	ActorAccountID uint   `gorm:"not null;index"`
+	ActionKey      string `gorm:"size:64;not null;index"`
+	ReasonCode     string `gorm:"size:64;not null;index"`
+	Note           string `gorm:"size:500;not null;default:''"`
+	BeforeJSON     string `gorm:"type:text;not null;default:'{}'"`
+	AfterJSON      string `gorm:"type:text;not null;default:'{}'"`
+	OccurredTick   int64  `gorm:"not null;default:0;index"`
 }
 
 func Models() []any {
@@ -154,5 +176,6 @@ func Models() []any {
 		&MarketPrice{},
 		&MarketHistory{},
 		&AscensionState{},
+		&AdminAuditEvent{},
 	}
 }

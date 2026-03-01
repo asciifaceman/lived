@@ -1,0 +1,49 @@
+name: db-verify
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: lived
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d lived"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      LIVED_DATABASE_URL: host=localhost user=postgres password=postgres dbname=lived port=5432 sslmode=disable TimeZone=UTC
+      LIVED_POSTGRES_HOST: localhost
+      LIVED_POSTGRES_PORT: "5432"
+      LIVED_POSTGRES_USER: postgres
+      LIVED_POSTGRES_PASSWORD: postgres
+      LIVED_POSTGRES_DBNAME: lived
+      LIVED_POSTGRES_ADMIN_DB: postgres
+      LIVED_POSTGRES_SSLMODE: disable
+      LIVED_POSTGRES_TIMEZONE: UTC
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup DB
+        run: go run . db setup
+
+      - name: Run Migrations
+        run: go run . db migrate
+
+      - name: Verify Realm Migration Health
+        run: go run . db verify

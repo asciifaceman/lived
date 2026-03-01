@@ -12,6 +12,8 @@ import (
 
 	"github.com/asciifaceman/lived/pkg/config"
 	"github.com/asciifaceman/lived/pkg/dal"
+	"github.com/asciifaceman/lived/pkg/idempotency"
+	"github.com/asciifaceman/lived/pkg/ratelimit"
 	"github.com/asciifaceman/lived/pkg/version"
 	"github.com/asciifaceman/lived/src/gameplay"
 	serverAuth "github.com/asciifaceman/lived/src/server/auth"
@@ -51,6 +53,7 @@ type ascendRequest struct {
 type marketHistoryQuery struct {
 	Symbol string `query:"symbol"`
 	Limit  int    `query:"limit"`
+	Realm  uint   `query:"realmId"`
 }
 
 type systemStatusData struct {
@@ -93,6 +96,30 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 	group.POST("/import", makeImportHandler(database, cfg))
 	group.POST("/new", makeNewGameHandler(database, cfg))
 	statusHandler := makeStatusHandler(database, cfg)
+	idempotencyScope := idempotency.ClientIPScope
+	if cfg.RateLimitIdentity == "account_or_ip" {
+		idempotencyScope = idempotency.AccountOrIPScope(func(ctx context.Context) (uint, bool) {
+			actor, ok := serverAuth.ActorFromContext(ctx)
+			if !ok || actor.AccountID == 0 {
+				return 0, false
+			}
+			return actor.AccountID, true
+		})
+	}
+	idempotencyStore := idempotency.NewStore(cfg.IdempotencyTTL, idempotencyScope)
+	idempotencyMW := idempotencyStore.Middleware()
+
+	behaviorIdentifier := ratelimit.ClientIPIdentifier
+	if cfg.RateLimitIdentity == "account_or_ip" {
+		behaviorIdentifier = ratelimit.AccountOrIPIdentifier(func(ctx context.Context) (uint, bool) {
+			actor, ok := serverAuth.ActorFromContext(ctx)
+			if !ok || actor.AccountID == 0 {
+				return 0, false
+			}
+			return actor.AccountID, true
+		})
+	}
+	behaviorLimiter := ratelimit.NewFixedWindowLimiter(cfg.RateLimitWindow, behaviorIdentifier)
 	if cfg.MMOAuthEnabled {
 		group.GET("/status", statusHandler, serverAuth.RequireAuth(database, cfg))
 	} else {
@@ -101,9 +128,33 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 	group.GET("/version", makeVersionHandler())
 	startBehaviorHandler := makeStartBehaviorHandler(database, cfg)
 	if cfg.MMOAuthEnabled {
-		group.POST("/behaviors/start", startBehaviorHandler, serverAuth.RequireAuth(database, cfg))
+		if cfg.RateLimitEnabled {
+			if cfg.IdempotencyEnabled {
+				group.POST("/behaviors/start", startBehaviorHandler, serverAuth.RequireAuth(database, cfg), idempotencyMW, behaviorLimiter.Middleware("behavior_start", cfg.RateLimitBehaviorMax))
+			} else {
+				group.POST("/behaviors/start", startBehaviorHandler, serverAuth.RequireAuth(database, cfg), behaviorLimiter.Middleware("behavior_start", cfg.RateLimitBehaviorMax))
+			}
+		} else {
+			if cfg.IdempotencyEnabled {
+				group.POST("/behaviors/start", startBehaviorHandler, serverAuth.RequireAuth(database, cfg), idempotencyMW)
+			} else {
+				group.POST("/behaviors/start", startBehaviorHandler, serverAuth.RequireAuth(database, cfg))
+			}
+		}
 	} else {
-		group.POST("/behaviors/start", startBehaviorHandler)
+		if cfg.RateLimitEnabled {
+			if cfg.IdempotencyEnabled {
+				group.POST("/behaviors/start", startBehaviorHandler, idempotencyMW, behaviorLimiter.Middleware("behavior_start", cfg.RateLimitBehaviorMax))
+			} else {
+				group.POST("/behaviors/start", startBehaviorHandler, behaviorLimiter.Middleware("behavior_start", cfg.RateLimitBehaviorMax))
+			}
+		} else {
+			if cfg.IdempotencyEnabled {
+				group.POST("/behaviors/start", startBehaviorHandler, idempotencyMW)
+			} else {
+				group.POST("/behaviors/start", startBehaviorHandler)
+			}
+		}
 	}
 	catalogHandler := makeBehaviorCatalogHandler(database, cfg)
 	if cfg.MMOAuthEnabled {
@@ -229,7 +280,7 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 			}
 		}
 
-		runtimeState, err := loadOrInitRuntimeState(c.Request().Context(), database)
+		runtimeState, err := loadOrInitRuntimeState(c.Request().Context(), database, 1)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world runtime state")
 		}
@@ -256,6 +307,7 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 
 		resolvedPlayer := (*dal.Player)(nil)
 		resolvedPlayerName := ""
+		resolvedRealmID := uint(1)
 		if cfg.MMOAuthEnabled {
 			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
 			if !ok {
@@ -294,6 +346,7 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 
 			resolvedPlayer = player
 			resolvedPlayerName = character.Name
+			resolvedRealmID = character.RealmID
 			data.Players = []string{character.Name}
 			data.Save = ""
 		} else {
@@ -308,7 +361,24 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 		}
 
 		if resolvedPlayer != nil {
-			snapshot, err := gameplay.LoadWorldSnapshot(c.Request().Context(), database, resolvedPlayer.ID)
+			if cfg.MMOAuthEnabled {
+				runtimeForRealm, runtimeErr := loadOrInitRuntimeState(c.Request().Context(), database, resolvedRealmID)
+				if runtimeErr != nil {
+					return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world runtime state")
+				}
+				data.PendingBehaviorsRaw = runtimeForRealm.PendingBehaviorsJSON
+
+				realmTick, tickErr := gameplay.CurrentWorldTickForRealm(c.Request().Context(), database, resolvedRealmID)
+				if tickErr != nil {
+					return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+				}
+				data.SimulationTick = realmTick
+				data.WorldAgeMinutes = realmTick
+				data.WorldAgeHours = realmTick / 60
+				data.WorldAgeDays = realmTick / (60 * 24)
+			}
+
+			snapshot, err := gameplay.LoadWorldSnapshot(c.Request().Context(), database, resolvedPlayer.ID, resolvedRealmID)
 			if err != nil {
 				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load gameplay snapshot")
 			}
@@ -374,6 +444,7 @@ func makeStartBehaviorHandler(database *gorm.DB, cfg config.Config) echo.Handler
 
 		resolvedPlayer := (*dal.Player)(nil)
 		resolvedName := ""
+		resolvedRealmID := uint(1)
 
 		if cfg.MMOAuthEnabled {
 			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
@@ -413,6 +484,9 @@ func makeStartBehaviorHandler(database *gorm.DB, cfg config.Config) echo.Handler
 
 			resolvedPlayer = player
 			resolvedName = character.Name
+			if character.RealmID != 0 {
+				resolvedRealmID = character.RealmID
+			}
 		} else {
 			player, err := loadPrimaryPlayer(c.Request().Context(), database)
 			if err != nil {
@@ -426,7 +500,7 @@ func makeStartBehaviorHandler(database *gorm.DB, cfg config.Config) echo.Handler
 			resolvedName = player.Name
 		}
 
-		currentTick, err := gameplay.CurrentWorldTick(c.Request().Context(), database)
+		currentTick, err := gameplay.CurrentWorldTickForRealm(c.Request().Context(), database, resolvedRealmID)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
 		}
@@ -437,7 +511,7 @@ func makeStartBehaviorHandler(database *gorm.DB, cfg config.Config) echo.Handler
 			resolvedPlayer.ID,
 			key,
 			currentTick,
-			gameplay.QueueBehaviorOptions{MarketWaitDurationMinutes: marketWaitMinutes},
+			gameplay.QueueBehaviorOptions{MarketWaitDurationMinutes: marketWaitMinutes, RealmID: resolvedRealmID},
 		); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
@@ -492,6 +566,7 @@ func makeBehaviorCatalogHandler(database *gorm.DB, cfg config.Config) echo.Handl
 		hasPrimaryPlayer := false
 
 		resolvedPlayer := (*dal.Player)(nil)
+		resolvedRealmID := uint(1)
 		if cfg.MMOAuthEnabled {
 			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
 			if !ok {
@@ -512,6 +587,7 @@ func makeBehaviorCatalogHandler(database *gorm.DB, cfg config.Config) echo.Handl
 				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
 			}
 			if character != nil {
+				resolvedRealmID = character.RealmID
 				player, err := loadPlayerByID(c.Request().Context(), database, character.PlayerID)
 				if err != nil {
 					return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character player state")
@@ -531,7 +607,7 @@ func makeBehaviorCatalogHandler(database *gorm.DB, cfg config.Config) echo.Handl
 		if resolvedPlayer != nil {
 			hasPrimaryPlayer = true
 
-			snapshot, err := gameplay.LoadWorldSnapshot(c.Request().Context(), database, resolvedPlayer.ID)
+			snapshot, err := gameplay.LoadWorldSnapshot(c.Request().Context(), database, resolvedPlayer.ID, resolvedRealmID)
 			if err != nil {
 				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load gameplay snapshot")
 			}
@@ -540,7 +616,7 @@ func makeBehaviorCatalogHandler(database *gorm.DB, cfg config.Config) echo.Handl
 
 			unlocks := make([]dal.PlayerUnlock, 0)
 			if err := database.WithContext(c.Request().Context()).
-				Where("player_id = ?", resolvedPlayer.ID).
+				Where("realm_id = ? AND player_id = ?", resolvedRealmID, resolvedPlayer.ID).
 				Find(&unlocks).Error; err != nil {
 				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load player unlocks")
 			}
@@ -624,12 +700,21 @@ func evaluateBehaviorAvailability(
 
 func makeMarketStatusHandler(database *gorm.DB) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		currentTick, err := gameplay.CurrentWorldTick(c.Request().Context(), database)
+		realmID := uint(1)
+		if rawRealmID := strings.TrimSpace(c.QueryParam("realmId")); rawRealmID != "" {
+			parsedID, parseErr := strconv.ParseUint(rawRealmID, 10, 64)
+			if parseErr != nil || parsedID == 0 {
+				return echo.NewHTTPError(http.StatusBadRequest, "realmId must be a positive integer")
+			}
+			realmID = uint(parsedID)
+		}
+
+		currentTick, err := gameplay.CurrentWorldTickForRealm(c.Request().Context(), database, realmID)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
 		}
 
-		status, err := gameplay.GetMarketStatus(c.Request().Context(), database, currentTick)
+		status, err := gameplay.GetMarketStatus(c.Request().Context(), database, currentTick, realmID)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load market status")
 		}
@@ -649,8 +734,11 @@ func makeMarketHistoryHandler(database *gorm.DB) echo.HandlerFunc {
 		if err := c.Bind(&query); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, "invalid market history query")
 		}
+		if query.Realm == 0 {
+			query.Realm = 1
+		}
 
-		history, err := gameplay.GetMarketHistory(c.Request().Context(), database, query.Symbol, query.Limit)
+		history, err := gameplay.GetMarketHistory(c.Request().Context(), database, query.Symbol, query.Limit, query.Realm)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load market history")
 		}
@@ -658,6 +746,7 @@ func makeMarketHistoryHandler(database *gorm.DB) echo.HandlerFunc {
 		return respondSuccess(c, http.StatusOK, "Market history loaded.", map[string]any{
 			"symbol":  strings.TrimSpace(query.Symbol),
 			"limit":   query.Limit,
+			"realmId": query.Realm,
 			"history": history,
 		})
 	}
@@ -666,10 +755,74 @@ func makeMarketHistoryHandler(database *gorm.DB) echo.HandlerFunc {
 func makeAscendHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		if cfg.MMOAuthEnabled {
-			if _, ok := serverAuth.ActorFromContext(c.Request().Context()); !ok {
+			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+			if !ok {
 				return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
 			}
-			return echo.NewHTTPError(http.StatusConflict, "ascension is temporarily disabled in MMO mode until realm-scoped ascension is implemented")
+
+			requestedCharacterID := uint(0)
+			hasRequestedCharacter := false
+			if rawCharacterID := c.QueryParam("characterId"); rawCharacterID != "" {
+				parsedID, parseErr := strconv.ParseUint(rawCharacterID, 10, 64)
+				if parseErr != nil || parsedID == 0 {
+					return echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+				}
+				hasRequestedCharacter = true
+				requestedCharacterID = uint(parsedID)
+			}
+
+			character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, requestedCharacterID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+			}
+			if character == nil {
+				if hasRequestedCharacter {
+					return echo.NewHTTPError(http.StatusNotFound, "character not found for account")
+				}
+				return echo.NewHTTPError(http.StatusBadRequest, "complete onboarding first")
+			}
+
+			player, err := loadPlayerByID(c.Request().Context(), database, character.PlayerID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character player state")
+			}
+			if player == nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "character player state is missing")
+			}
+
+			var req ascendRequest
+			if err := c.Bind(&req); err != nil {
+				return echo.NewHTTPError(http.StatusBadRequest, "invalid ascension payload")
+			}
+
+			name := strings.TrimSpace(req.Name)
+			if name == "" {
+				name = player.Name
+			}
+			if name == "" {
+				name = character.Name
+			}
+			if name == "" {
+				name = "Wanderer"
+			}
+
+			eligibility, err := gameplay.GetAscensionEligibilityForPlayer(c.Request().Context(), database, player.ID, character.RealmID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to evaluate ascension eligibility")
+			}
+			if !eligibility.Available {
+				return echo.NewHTTPError(http.StatusBadRequest, eligibility.Reason)
+			}
+
+			count, bonus, err := gameplay.AscendForPlayerRealm(c.Request().Context(), database, player.ID, character.RealmID, name)
+			if err != nil {
+				if errors.Is(err, gameplay.ErrAscensionNotEligible) {
+					return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+				}
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to ascend")
+			}
+
+			return respondSuccess(c, http.StatusOK, "A new cycle begins for your character, tempered by prior echoes.", map[string]any{"ascensionCount": count, "wealthBonusPct": bonus, "realmId": character.RealmID, "characterId": character.ID})
 		}
 
 		var req ascendRequest
@@ -853,7 +1006,7 @@ func replaceGameState(ctx context.Context, database *gorm.DB, save saveGame) err
 			return err
 		}
 
-		runtimeState, err := loadOrInitRuntimeState(ctx, tx)
+		runtimeState, err := loadOrInitRuntimeState(ctx, tx, 1)
 		if err != nil {
 			return err
 		}
@@ -872,9 +1025,12 @@ func replaceGameState(ctx context.Context, database *gorm.DB, save saveGame) err
 	})
 }
 
-func loadOrInitRuntimeState(ctx context.Context, database *gorm.DB) (*dal.WorldRuntimeState, error) {
+func loadOrInitRuntimeState(ctx context.Context, database *gorm.DB, realmID uint) (*dal.WorldRuntimeState, error) {
+	if realmID == 0 {
+		realmID = 1
+	}
 	runtimeState := &dal.WorldRuntimeState{}
-	result := database.WithContext(ctx).Where("key = ?", "world").Limit(1).Find(runtimeState)
+	result := database.WithContext(ctx).Where("realm_id = ? AND key = ?", realmID, "world").Limit(1).Find(runtimeState)
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -887,6 +1043,7 @@ func loadOrInitRuntimeState(ctx context.Context, database *gorm.DB) (*dal.WorldR
 	}
 
 	initialState := &dal.WorldRuntimeState{
+		RealmID:              realmID,
 		Key:                  "world",
 		LastProcessedTickAt:  time.Now().UTC(),
 		CarryGameMinutes:     0,

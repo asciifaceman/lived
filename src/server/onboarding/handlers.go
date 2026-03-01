@@ -1,11 +1,13 @@
 package onboarding
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
 	"github.com/asciifaceman/lived/pkg/config"
 	"github.com/asciifaceman/lived/pkg/dal"
+	"github.com/asciifaceman/lived/pkg/ratelimit"
 	serverAuth "github.com/asciifaceman/lived/src/server/auth"
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
@@ -51,7 +53,22 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 	}
 
 	authMW := serverAuth.RequireAuth(database, cfg)
-	group.POST("/start", makeStartHandler(database), authMW)
+	if cfg.RateLimitEnabled {
+		identifier := ratelimit.ClientIPIdentifier
+		if cfg.RateLimitIdentity == "account_or_ip" {
+			identifier = ratelimit.AccountOrIPIdentifier(func(ctx context.Context) (uint, bool) {
+				actor, ok := serverAuth.ActorFromContext(ctx)
+				if !ok || actor.AccountID == 0 {
+					return 0, false
+				}
+				return actor.AccountID, true
+			})
+		}
+		limiter := ratelimit.NewFixedWindowLimiter(cfg.RateLimitWindow, identifier)
+		group.POST("/start", makeStartHandler(database), authMW, limiter.Middleware("onboarding_start", cfg.RateLimitOnboardMax))
+	} else {
+		group.POST("/start", makeStartHandler(database), authMW)
+	}
 	group.GET("/status", makeStatusHandler(database), authMW)
 }
 
