@@ -17,6 +17,14 @@ func EnsureDatabase(ctx context.Context, postgresCfg config.PostgresConfig, admi
 		return "", err
 	}
 
+	adminSQL, err := adminConn.DB()
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = adminSQL.Close()
+	}()
+
 	var exists bool
 	err = adminConn.WithContext(ctx).
 		Raw("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = ?)", postgresCfg.DBName).
@@ -36,9 +44,19 @@ func EnsureDatabase(ctx context.Context, postgresCfg config.PostgresConfig, admi
 			return "", err
 		}
 
-		dropSQL := fmt.Sprintf("DROP DATABASE %s", quoteIdentifier(postgresCfg.DBName))
+		dropSQL := fmt.Sprintf("DROP DATABASE IF EXISTS %s", quoteIdentifier(postgresCfg.DBName))
 		if err := adminConn.WithContext(ctx).Exec(dropSQL).Error; err != nil {
 			return "", err
+		}
+
+		var stillExists bool
+		if err := adminConn.WithContext(ctx).
+			Raw("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = ?)", postgresCfg.DBName).
+			Scan(&stillExists).Error; err != nil {
+			return "", err
+		}
+		if stillExists {
+			return "", fmt.Errorf("database %q still exists after recreate drop", postgresCfg.DBName)
 		}
 	}
 

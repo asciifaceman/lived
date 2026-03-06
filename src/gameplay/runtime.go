@@ -17,10 +17,13 @@ import (
 )
 
 const (
-	behaviorQueued    = "queued"
-	behaviorActive    = "active"
-	behaviorCompleted = "completed"
-	behaviorFailed    = "failed"
+	behaviorQueued          = "queued"
+	behaviorActive          = "active"
+	behaviorCompleted       = "completed"
+	behaviorFailed          = "failed"
+	behaviorModeOnce        = "once"
+	behaviorModeRepeat      = "repeat"
+	behaviorModeRepeatUntil = "repeat-until"
 
 	worldRuntimeStateKey = "world"
 	ascensionKey         = "global"
@@ -36,21 +39,28 @@ const (
 	defaultMarketWaitDurationMinutes int64 = 24 * 60
 	maxMarketWaitDurationMinutes     int64 = 14 * 24 * 60
 
-	statStrength = "strength"
-	statSocial   = "social"
+	statStrength  = "strength"
+	statSocial    = "social"
+	statEndurance = "endurance"
 
 	statStamina              = "stamina"
 	statMaxStamina           = "max_stamina"
 	statStaminaRecoveryRate  = "stamina_recovery_rate"
 	statStaminaRecoveryCarry = "stamina_recovery_carry"
-	statStaminaTrainingXP    = "stamina_training_xp"
 
 	defaultMaxStamina          int64 = 100
 	defaultStaminaRecoveryRate int64 = 8
-	recoveryXPPerRatePoint     int64 = 120
+
+	maxStaminaPerEndurancePoint     int64 = 3
+	recoveryRatePerEnduranceDivisor int64 = 4
+
+	restBehaviorKey                 = "player_rest"
+	restRecoveryMultiplier    int64 = 4
+	restMinimumRecoveryPoints int64 = 6
 )
 
 var ErrAscensionNotEligible = errors.New("ascension is not yet available")
+var ErrBehaviorConflict = errors.New("behavior queue conflict")
 
 type BehaviorView struct {
 	ID                        uint   `json:"id"`
@@ -58,6 +68,9 @@ type BehaviorView struct {
 	ActorType                 string `json:"actorType"`
 	ActorID                   uint   `json:"actorId"`
 	State                     string `json:"state"`
+	Mode                      string `json:"mode,omitempty"`
+	RepeatIntervalMinutes     int64  `json:"repeatIntervalMinutes,omitempty"`
+	RepeatUntilTick           int64  `json:"repeatUntilTick,omitempty"`
 	ScheduledAt               int64  `json:"scheduledAtTick"`
 	StartedAt                 int64  `json:"startedAtTick"`
 	CompletesAt               int64  `json:"completesAtTick"`
@@ -80,6 +93,8 @@ type RecentEventView struct {
 
 type WorldSnapshot struct {
 	Inventory      map[string]int64     `json:"inventory"`
+	CoreStats      map[string]int64     `json:"coreStats"`
+	DerivedStats   map[string]int64     `json:"derivedStats"`
 	Stats          map[string]int64     `json:"stats"`
 	MarketPrices   map[string]int64     `json:"marketPrices"`
 	Behaviors      []BehaviorView       `json:"behaviors"`
@@ -127,11 +142,17 @@ type MarketHistoryEntry struct {
 
 type QueueBehaviorOptions struct {
 	MarketWaitDurationMinutes int64
+	RealmID                   uint
+	Mode                      string
+	RepeatUntilTick           int64
 }
 
 type behaviorRuntimePayload struct {
-	MarketWaitDurationMinutes int64 `json:"marketWaitDurationMinutes,omitempty"`
-	MarketWaitUntilTick       int64 `json:"marketWaitUntilTick,omitempty"`
+	MarketWaitDurationMinutes int64  `json:"marketWaitDurationMinutes,omitempty"`
+	MarketWaitUntilTick       int64  `json:"marketWaitUntilTick,omitempty"`
+	Mode                      string `json:"mode,omitempty"`
+	RepeatIntervalMinutes     int64  `json:"repeatIntervalMinutes,omitempty"`
+	RepeatUntilTick           int64  `json:"repeatUntilTick,omitempty"`
 }
 
 func QueuePlayerBehavior(ctx context.Context, database *gorm.DB, playerID uint, behaviorKey string, currentTick int64, options QueueBehaviorOptions) error {
@@ -140,8 +161,30 @@ func QueuePlayerBehavior(ctx context.Context, database *gorm.DB, playerID uint, 
 	}
 
 	definition, _ := GetBehaviorDefinition(behaviorKey)
+	mode := strings.ToLower(strings.TrimSpace(options.Mode))
+	if mode == "" {
+		mode = behaviorModeOnce
+	}
+	if mode != behaviorModeOnce && mode != behaviorModeRepeat && mode != behaviorModeRepeatUntil {
+		return fmt.Errorf("mode must be once, repeat, or repeat-until")
+	}
 
-	payload := behaviorRuntimePayload{}
+	realmID := normalizeRealmID(options.RealmID)
+	if hasConflict, err := hasActiveExclusiveConflict(ctx, database, dal.BehaviorInstance{
+		RealmID:   realmID,
+		ActorType: ActorPlayer,
+		ActorID:   playerID,
+	}, definition); err != nil {
+		return err
+	} else if hasConflict {
+		group := behaviorExclusiveGroup(definition)
+		if group == "" {
+			group = "exclusive"
+		}
+		return fmt.Errorf("%w: cannot queue %s while another %s behavior is active", ErrBehaviorConflict, behaviorKey, group)
+	}
+
+	payload := behaviorRuntimePayload{Mode: mode}
 	if definition.RequiresMarketOpen {
 		waitDuration := options.MarketWaitDurationMinutes
 		if waitDuration <= 0 {
@@ -155,21 +198,37 @@ func QueuePlayerBehavior(ctx context.Context, database *gorm.DB, playerID uint, 
 		payload.MarketWaitUntilTick = currentTick + waitDuration
 	}
 
+	if mode == behaviorModeRepeat || mode == behaviorModeRepeatUntil {
+		repeatIntervalMinutes := definition.DurationMinutes
+		if repeatIntervalMinutes <= 0 {
+			return fmt.Errorf("behavior duration must be positive for repeat mode")
+		}
+		payload.RepeatIntervalMinutes = repeatIntervalMinutes
+	}
+
+	if mode == behaviorModeRepeatUntil {
+		if options.RepeatUntilTick <= currentTick {
+			return fmt.Errorf("repeatUntil must resolve to a future tick")
+		}
+		payload.RepeatUntilTick = options.RepeatUntilTick
+	}
+
 	payloadJSON, err := marshalBehaviorRuntimePayload(payload)
 	if err != nil {
 		return err
 	}
 
 	instance := dal.BehaviorInstance{
-		Key:             behaviorKey,
-		ActorType:       ActorPlayer,
-		ActorID:         playerID,
-		State:           behaviorQueued,
-		ScheduledAtTick: currentTick,
-		DurationMinutes: definition.DurationMinutes,
-		PayloadJSON:     payloadJSON,
+		RealmID:           realmID,
+		Key:               behaviorKey,
+		ActorType:         ActorPlayer,
+		ActorID:           playerID,
+		State:             behaviorQueued,
+		ScheduledAtTick:   currentTick,
+		DurationMinutes:   definition.DurationMinutes,
+		RepeatIntervalMin: payload.RepeatIntervalMinutes,
+		PayloadJSON:       payloadJSON,
 	}
-
 	return database.WithContext(ctx).Create(&instance).Error
 }
 
@@ -181,7 +240,15 @@ func MaxMarketWaitDurationMinutes() int64 {
 	return maxMarketWaitDurationMinutes
 }
 
-func EnsureRecurringWorldBehavior(ctx context.Context, database *gorm.DB, currentTick int64) error {
+func normalizeRealmID(realmID uint) uint {
+	if realmID == 0 {
+		return 1
+	}
+	return realmID
+}
+
+func EnsureRecurringWorldBehavior(ctx context.Context, database *gorm.DB, currentTick int64, realmID uint) error {
+	realmID = normalizeRealmID(realmID)
 	for key, definition := range worldBehaviorDefinitions {
 		if definition.RepeatIntervalMin <= 0 {
 			continue
@@ -190,7 +257,7 @@ func EnsureRecurringWorldBehavior(ctx context.Context, database *gorm.DB, curren
 		var count int64
 		err := database.WithContext(ctx).
 			Model(&dal.BehaviorInstance{}).
-			Where("key = ? AND actor_type = ? AND state IN ?", key, ActorWorld, []string{behaviorQueued, behaviorActive}).
+			Where("realm_id = ? AND key = ? AND actor_type = ? AND state IN ?", realmID, key, ActorWorld, []string{behaviorQueued, behaviorActive}).
 			Count(&count).Error
 		if err != nil {
 			return err
@@ -201,6 +268,7 @@ func EnsureRecurringWorldBehavior(ctx context.Context, database *gorm.DB, curren
 		}
 
 		instance := dal.BehaviorInstance{
+			RealmID:           realmID,
 			Key:               key,
 			ActorType:         ActorWorld,
 			ActorID:           0,
@@ -220,29 +288,39 @@ func EnsureRecurringWorldBehavior(ctx context.Context, database *gorm.DB, curren
 }
 
 func ProcessWorldTick(ctx context.Context, database *gorm.DB, currentTick int64) error {
+	return ProcessWorldTickForRealm(ctx, database, currentTick, 1)
+}
+
+func ProcessWorldTickForRealm(ctx context.Context, database *gorm.DB, currentTick int64, realmID uint) error {
+	realmID = normalizeRealmID(realmID)
 	return database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := ensureMarketDefaults(ctx, tx, currentTick); err != nil {
+		if err := ensureMarketDefaults(ctx, tx, currentTick, realmID); err != nil {
 			return err
 		}
 
-		if err := recoverPlayerStaminaTick(ctx, tx); err != nil {
+		if err := recoverPlayerStaminaTick(ctx, tx, realmID); err != nil {
 			return err
 		}
 
-		if err := processActivations(ctx, tx, currentTick); err != nil {
+		if err := processActivations(ctx, tx, currentTick, realmID); err != nil {
 			return err
 		}
-		if err := processCompletions(ctx, tx, currentTick); err != nil {
+		if err := processCompletions(ctx, tx, currentTick, realmID); err != nil {
 			return err
 		}
-		return EnsureRecurringWorldBehavior(ctx, tx, currentTick)
+		return EnsureRecurringWorldBehavior(ctx, tx, currentTick, realmID)
 	})
 }
 
 func BuildPendingBehaviorSummaryJSON(ctx context.Context, database *gorm.DB) (string, error) {
+	return BuildPendingBehaviorSummaryJSONForRealm(ctx, database, 1)
+}
+
+func BuildPendingBehaviorSummaryJSONForRealm(ctx context.Context, database *gorm.DB, realmID uint) (string, error) {
+	realmID = normalizeRealmID(realmID)
 	behaviors := make([]dal.BehaviorInstance, 0)
 	err := database.WithContext(ctx).
-		Where("state IN ?", []string{behaviorQueued, behaviorActive}).
+		Where("realm_id = ? AND state IN ?", realmID, []string{behaviorQueued, behaviorActive}).
 		Order("scheduled_at_tick ASC, id ASC").
 		Find(&behaviors).Error
 	if err != nil {
@@ -280,8 +358,13 @@ func BuildPendingBehaviorSummaryJSON(ctx context.Context, database *gorm.DB) (st
 }
 
 func CurrentWorldTick(ctx context.Context, database *gorm.DB) (int64, error) {
+	return CurrentWorldTickForRealm(ctx, database, 1)
+}
+
+func CurrentWorldTickForRealm(ctx context.Context, database *gorm.DB, realmID uint) (int64, error) {
+	realmID = normalizeRealmID(realmID)
 	state := dal.WorldState{}
-	result := database.WithContext(ctx).Order("id ASC").First(&state)
+	result := database.WithContext(ctx).Where("realm_id = ?", realmID).Order("id ASC").First(&state)
 	if result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 			return 0, nil
@@ -291,10 +374,11 @@ func CurrentWorldTick(ctx context.Context, database *gorm.DB) (int64, error) {
 	return state.SimulationTick, nil
 }
 
-func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint) (WorldSnapshot, error) {
+func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint, realmID uint) (WorldSnapshot, error) {
+	realmID = normalizeRealmID(realmID)
 	inventoryEntries := make([]dal.InventoryEntry, 0)
 	if err := database.WithContext(ctx).
-		Where("owner_type = ? AND owner_id = ?", ActorPlayer, playerID).
+		Where("realm_id = ? AND owner_type = ? AND owner_id = ?", realmID, ActorPlayer, playerID).
 		Find(&inventoryEntries).Error; err != nil {
 		return WorldSnapshot{}, err
 	}
@@ -304,13 +388,14 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint) (W
 		inventory[entry.ItemKey] = entry.Quantity
 	}
 
-	stats, err := loadPlayerStats(ctx, database, playerID)
+	stats, err := loadPlayerStats(ctx, database, playerID, realmID)
 	if err != nil {
 		return WorldSnapshot{}, err
 	}
+	coreStats, derivedStats := splitCoreAndDerivedStats(stats)
 
 	marketRows := make([]dal.MarketPrice, 0)
-	if err := database.WithContext(ctx).Order("item_key ASC").Find(&marketRows).Error; err != nil {
+	if err := database.WithContext(ctx).Where("realm_id = ?", realmID).Order("item_key ASC").Find(&marketRows).Error; err != nil {
 		return WorldSnapshot{}, err
 	}
 	marketPrices := map[string]int64{}
@@ -320,7 +405,7 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint) (W
 
 	behaviors := make([]dal.BehaviorInstance, 0)
 	if err := database.WithContext(ctx).
-		Where("state IN ?", []string{behaviorQueued, behaviorActive, behaviorCompleted, behaviorFailed}).
+		Where("realm_id = ? AND state IN ?", realmID, []string{behaviorQueued, behaviorActive, behaviorCompleted, behaviorFailed}).
 		Order("id DESC").
 		Limit(20).
 		Find(&behaviors).Error; err != nil {
@@ -337,6 +422,9 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint) (W
 			ActorType:                 behavior.ActorType,
 			ActorID:                   behavior.ActorID,
 			State:                     behavior.State,
+			Mode:                      payload.Mode,
+			RepeatIntervalMinutes:     maxInt64(behavior.RepeatIntervalMin, payload.RepeatIntervalMinutes),
+			RepeatUntilTick:           payload.RepeatUntilTick,
 			ScheduledAt:               behavior.ScheduledAtTick,
 			StartedAt:                 behavior.StartedAtTick,
 			CompletesAt:               behavior.CompletesAtTick,
@@ -350,6 +438,7 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint) (W
 
 	events := make([]dal.WorldEvent, 0)
 	if err := database.WithContext(ctx).
+		Where("realm_id = ?", realmID).
 		Order("tick DESC, id DESC").
 		Limit(10).
 		Find(&events).Error; err != nil {
@@ -369,7 +458,7 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint) (W
 		})
 	}
 
-	ascension, err := loadOrInitAscension(ctx, database)
+	ascension, err := loadOrInitAscensionForRealm(ctx, database, realmID)
 	if err != nil {
 		return WorldSnapshot{}, err
 	}
@@ -378,6 +467,8 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint) (W
 
 	return WorldSnapshot{
 		Inventory:      inventory,
+		CoreStats:      coreStats,
+		DerivedStats:   derivedStats,
 		Stats:          stats,
 		MarketPrices:   marketPrices,
 		Behaviors:      views,
@@ -386,6 +477,61 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint) (W
 		WealthBonusPct: ascension.WealthBonusPct,
 		Ascension:      ascensionEligibility,
 	}, nil
+}
+
+func splitCoreAndDerivedStats(stats map[string]int64) (map[string]int64, map[string]int64) {
+	core := map[string]int64{
+		statStrength:  stats[statStrength],
+		statSocial:    stats[statSocial],
+		statEndurance: stats[statEndurance],
+	}
+
+	derived := map[string]int64{
+		statStamina:             stats[statStamina],
+		statMaxStamina:          stats[statMaxStamina],
+		statStaminaRecoveryRate: stats[statStaminaRecoveryRate],
+	}
+
+	return core, derived
+}
+
+func deriveStaminaByEndurance(endurance int64) (int64, int64) {
+	if endurance < 0 {
+		endurance = 0
+	}
+
+	maxStamina := defaultMaxStamina + (endurance * maxStaminaPerEndurancePoint)
+	if maxStamina < defaultMaxStamina {
+		maxStamina = defaultMaxStamina
+	}
+
+	recoveryRate := defaultStaminaRecoveryRate + (endurance / recoveryRatePerEnduranceDivisor)
+	if recoveryRate < defaultStaminaRecoveryRate {
+		recoveryRate = defaultStaminaRecoveryRate
+	}
+
+	return maxStamina, recoveryRate
+}
+
+func inferEnduranceFromLegacyStats(rawStats map[string]int64) int64 {
+	legacyMax := rawStats[statMaxStamina]
+	legacyRecovery := rawStats[statStaminaRecoveryRate]
+
+	fromMax := int64(0)
+	if legacyMax > defaultMaxStamina {
+		fromMax = (legacyMax - defaultMaxStamina) / maxStaminaPerEndurancePoint
+	}
+
+	fromRecovery := int64(0)
+	if legacyRecovery > defaultStaminaRecoveryRate {
+		fromRecovery = (legacyRecovery - defaultStaminaRecoveryRate) * recoveryRatePerEnduranceDivisor
+	}
+
+	if fromRecovery > fromMax {
+		return fromRecovery
+	}
+
+	return fromMax
 }
 
 func positiveMinuteOfDay(tick int64) int64 {
@@ -397,11 +543,28 @@ func positiveMinuteOfDay(tick int64) int64 {
 }
 
 func GetAscensionEligibility(ctx context.Context, database *gorm.DB) (AscensionEligibility, error) {
-	coins, err := loadGlobalPlayerCoins(ctx, database)
+	return GetAscensionEligibilityForRealm(ctx, database, 1)
+}
+
+func GetAscensionEligibilityForRealm(ctx context.Context, database *gorm.DB, realmID uint) (AscensionEligibility, error) {
+	coins, err := loadPlayerCoinsForRealm(ctx, database, realmID)
 	if err != nil {
 		return AscensionEligibility{}, err
 	}
-	ascension, err := loadOrInitAscension(ctx, database)
+	ascension, err := loadOrInitAscensionForRealm(ctx, database, realmID)
+	if err != nil {
+		return AscensionEligibility{}, err
+	}
+
+	return ascensionEligibilityForState(coins, ascension.Count), nil
+}
+
+func GetAscensionEligibilityForPlayer(ctx context.Context, database *gorm.DB, playerID uint, realmID uint) (AscensionEligibility, error) {
+	coins, err := loadPlayerCoinsForPlayer(ctx, database, playerID, realmID)
+	if err != nil {
+		return AscensionEligibility{}, err
+	}
+	ascension, err := loadOrInitAscensionForRealm(ctx, database, realmID)
 	if err != nil {
 		return AscensionEligibility{}, err
 	}
@@ -421,7 +584,7 @@ func Ascend(ctx context.Context, database *gorm.DB, playerName string) (int64, f
 			return fmt.Errorf("%w: %s", ErrAscensionNotEligible, eligibility.Reason)
 		}
 
-		ascension, err := loadOrInitAscension(ctx, tx)
+		ascension, err := loadOrInitAscensionForRealm(ctx, tx, 1)
 		if err != nil {
 			return err
 		}
@@ -475,7 +638,7 @@ func Ascend(ctx context.Context, database *gorm.DB, playerName string) (int64, f
 			}
 		}
 
-		if err := ensureMarketDefaults(ctx, tx, 0); err != nil {
+		if err := ensureMarketDefaults(ctx, tx, 0, 1); err != nil {
 			return err
 		}
 
@@ -504,11 +667,88 @@ func Ascend(ctx context.Context, database *gorm.DB, playerName string) (int64, f
 	return count, bonus, nil
 }
 
+func AscendForPlayerRealm(ctx context.Context, database *gorm.DB, playerID uint, realmID uint, playerName string) (int64, float64, error) {
+	realmID = normalizeRealmID(realmID)
+
+	var count int64
+	var bonus float64
+	err := database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		eligibility, eligibilityErr := GetAscensionEligibilityForPlayer(ctx, tx, playerID, realmID)
+		if eligibilityErr != nil {
+			return eligibilityErr
+		}
+		if !eligibility.Available {
+			return fmt.Errorf("%w: %s", ErrAscensionNotEligible, eligibility.Reason)
+		}
+
+		ascension, err := loadOrInitAscensionForRealm(ctx, tx, realmID)
+		if err != nil {
+			return err
+		}
+
+		ascension.Count++
+		ascension.WealthBonusPct += 10
+		if err := tx.Model(&dal.AscensionState{}).
+			Where("id = ?", ascension.ID).
+			Updates(map[string]any{"count": ascension.Count, "wealth_bonus_pct": ascension.WealthBonusPct}).Error; err != nil {
+			return err
+		}
+
+		if strings.TrimSpace(playerName) != "" {
+			if err := tx.Model(&dal.Player{}).Where("id = ?", playerID).Update("name", strings.TrimSpace(playerName)).Error; err != nil {
+				return err
+			}
+		}
+
+		if err := tx.WithContext(ctx).
+			Where("realm_id = ? AND owner_type = ? AND owner_id = ?", realmID, ActorPlayer, playerID).
+			Delete(&dal.InventoryEntry{}).Error; err != nil {
+			return err
+		}
+		if err := tx.WithContext(ctx).
+			Where("realm_id = ? AND actor_type = ? AND actor_id = ?", realmID, ActorPlayer, playerID).
+			Delete(&dal.BehaviorInstance{}).Error; err != nil {
+			return err
+		}
+		if err := tx.WithContext(ctx).
+			Where("realm_id = ? AND player_id = ?", realmID, playerID).
+			Delete(&dal.PlayerUnlock{}).Error; err != nil {
+			return err
+		}
+		if err := tx.WithContext(ctx).
+			Where("realm_id = ? AND player_id = ?", realmID, playerID).
+			Delete(&dal.PlayerStat{}).Error; err != nil {
+			return err
+		}
+
+		startingCoins := ascensionStartingCoins(ascension.Count)
+		if startingCoins > 0 {
+			if err := tx.Create(&dal.InventoryEntry{RealmID: realmID, OwnerType: ActorPlayer, OwnerID: playerID, ItemKey: "coins", Quantity: startingCoins}).Error; err != nil {
+				return err
+			}
+		}
+
+		count = ascension.Count
+		bonus = ascension.WealthBonusPct
+		return nil
+	})
+
+	if err != nil {
+		return 0, 0, err
+	}
+	return count, bonus, nil
+}
+
 func loadGlobalPlayerCoins(ctx context.Context, database *gorm.DB) (int64, error) {
+	return loadPlayerCoinsForRealm(ctx, database, 1)
+}
+
+func loadPlayerCoinsForRealm(ctx context.Context, database *gorm.DB, realmID uint) (int64, error) {
+	realmID = normalizeRealmID(realmID)
 	var total int64
 	if err := database.WithContext(ctx).
 		Model(&dal.InventoryEntry{}).
-		Where("owner_type = ? AND item_key = ?", ActorPlayer, "coins").
+		Where("realm_id = ? AND owner_type = ? AND item_key = ?", realmID, ActorPlayer, "coins").
 		Select("COALESCE(SUM(quantity), 0)").
 		Scan(&total).Error; err != nil {
 		return 0, err
@@ -517,44 +757,85 @@ func loadGlobalPlayerCoins(ctx context.Context, database *gorm.DB) (int64, error
 	return total, nil
 }
 
-func loadPlayerStats(ctx context.Context, database *gorm.DB, playerID uint) (map[string]int64, error) {
-	stats := map[string]int64{
-		statStrength:             0,
-		statSocial:               0,
-		statMaxStamina:           defaultMaxStamina,
-		statStaminaRecoveryRate:  defaultStaminaRecoveryRate,
-		statStaminaRecoveryCarry: 0,
-		statStaminaTrainingXP:    0,
-		statStamina:              defaultMaxStamina,
+func loadPlayerCoinsForPlayer(ctx context.Context, database *gorm.DB, playerID uint, realmID uint) (int64, error) {
+	realmID = normalizeRealmID(realmID)
+	var total int64
+	if err := database.WithContext(ctx).
+		Model(&dal.InventoryEntry{}).
+		Where("realm_id = ? AND owner_type = ? AND owner_id = ? AND item_key = ?", realmID, ActorPlayer, playerID, "coins").
+		Select("COALESCE(SUM(quantity), 0)").
+		Scan(&total).Error; err != nil {
+		return 0, err
 	}
+
+	return total, nil
+}
+
+func loadPlayerStats(ctx context.Context, database *gorm.DB, playerID uint, realmID uint) (map[string]int64, error) {
+	realmID = normalizeRealmID(realmID)
+	rawStats := map[string]int64{}
 	rows := make([]dal.PlayerStat, 0)
 	if err := database.WithContext(ctx).
-		Where("player_id = ?", playerID).
+		Where("realm_id = ? AND player_id = ?", realmID, playerID).
 		Find(&rows).Error; err != nil {
 		return nil, err
 	}
 
 	for _, row := range rows {
-		stats[row.StatKey] = row.Value
+		rawStats[row.StatKey] = row.Value
 	}
 
-	if stats[statMaxStamina] <= 0 {
-		stats[statMaxStamina] = defaultMaxStamina
+	strength := rawStats[statStrength]
+	if strength < 0 {
+		strength = 0
 	}
-	if stats[statStaminaRecoveryRate] <= 0 {
-		stats[statStaminaRecoveryRate] = defaultStaminaRecoveryRate
+
+	social := rawStats[statSocial]
+	if social < 0 {
+		social = 0
 	}
-	if stats[statStamina] <= 0 {
-		stats[statStamina] = stats[statMaxStamina]
+
+	endurance, foundEndurance := rawStats[statEndurance]
+	if !foundEndurance {
+		endurance = inferEnduranceFromLegacyStats(rawStats)
 	}
-	if stats[statStamina] > stats[statMaxStamina] {
-		stats[statStamina] = stats[statMaxStamina]
+	if endurance < 0 {
+		endurance = 0
+	}
+
+	maxStamina, recoveryRate := deriveStaminaByEndurance(endurance)
+
+	stamina, foundStamina := rawStats[statStamina]
+	if !foundStamina {
+		stamina = maxStamina
+	}
+	if stamina < 0 {
+		stamina = 0
+	}
+	if stamina > maxStamina {
+		stamina = maxStamina
+	}
+
+	recoveryCarry := rawStats[statStaminaRecoveryCarry]
+	if recoveryCarry < 0 {
+		recoveryCarry = 0
+	}
+
+	stats := map[string]int64{
+		statStrength:             strength,
+		statSocial:               social,
+		statEndurance:            endurance,
+		statStamina:              stamina,
+		statMaxStamina:           maxStamina,
+		statStaminaRecoveryRate:  recoveryRate,
+		statStaminaRecoveryCarry: recoveryCarry,
 	}
 
 	return stats, nil
 }
 
-func applyStatDelta(ctx context.Context, tx *gorm.DB, playerID uint, delta map[string]int64) error {
+func applyStatDelta(ctx context.Context, tx *gorm.DB, playerID uint, realmID uint, delta map[string]int64) error {
+	realmID = normalizeRealmID(realmID)
 	if playerID == 0 || len(delta) == 0 {
 		return nil
 	}
@@ -566,7 +847,7 @@ func applyStatDelta(ctx context.Context, tx *gorm.DB, playerID uint, delta map[s
 
 		entry := dal.PlayerStat{}
 		result := tx.WithContext(ctx).
-			Where("player_id = ? AND stat_key = ?", playerID, statKey).
+			Where("realm_id = ? AND player_id = ? AND stat_key = ?", realmID, playerID, statKey).
 			Limit(1).
 			Find(&entry)
 		if result.Error != nil {
@@ -574,7 +855,7 @@ func applyStatDelta(ctx context.Context, tx *gorm.DB, playerID uint, delta map[s
 		}
 
 		if result.RowsAffected == 0 {
-			entry = dal.PlayerStat{PlayerID: playerID, StatKey: statKey, Value: 0}
+			entry = dal.PlayerStat{RealmID: realmID, PlayerID: playerID, StatKey: statKey, Value: 0}
 		}
 
 		next := entry.Value + change
@@ -598,12 +879,12 @@ func applyStatDelta(ctx context.Context, tx *gorm.DB, playerID uint, delta map[s
 	return nil
 }
 
-func getPlayerStatValue(ctx context.Context, tx *gorm.DB, playerID uint, statKey string) (int64, error) {
+func getPlayerStatValue(ctx context.Context, tx *gorm.DB, playerID uint, statKey string, realmID uint) (int64, error) {
 	if playerID == 0 {
 		return 0, nil
 	}
 
-	value, _, err := getPlayerStatValueWithPresence(ctx, tx, playerID, statKey)
+	value, _, err := getPlayerStatValueWithPresence(ctx, tx, playerID, statKey, realmID)
 	if err != nil {
 		return 0, err
 	}
@@ -611,14 +892,15 @@ func getPlayerStatValue(ctx context.Context, tx *gorm.DB, playerID uint, statKey
 	return value, nil
 }
 
-func getPlayerStatValueWithPresence(ctx context.Context, tx *gorm.DB, playerID uint, statKey string) (int64, bool, error) {
+func getPlayerStatValueWithPresence(ctx context.Context, tx *gorm.DB, playerID uint, statKey string, realmID uint) (int64, bool, error) {
+	realmID = normalizeRealmID(realmID)
 	if playerID == 0 {
 		return 0, false, nil
 	}
 
 	row := dal.PlayerStat{}
 	result := tx.WithContext(ctx).
-		Where("player_id = ? AND stat_key = ?", playerID, statKey).
+		Where("realm_id = ? AND player_id = ? AND stat_key = ?", realmID, playerID, statKey).
 		Limit(1).
 		Find(&row)
 	if result.Error != nil {
@@ -631,8 +913,8 @@ func getPlayerStatValueWithPresence(ctx context.Context, tx *gorm.DB, playerID u
 	return row.Value, true, nil
 }
 
-func getPlayerStatValueOrDefault(ctx context.Context, tx *gorm.DB, playerID uint, statKey string, defaultValue int64) (int64, error) {
-	value, found, err := getPlayerStatValueWithPresence(ctx, tx, playerID, statKey)
+func getPlayerStatValueOrDefault(ctx context.Context, tx *gorm.DB, playerID uint, statKey string, defaultValue int64, realmID uint) (int64, error) {
+	value, found, err := getPlayerStatValueWithPresence(ctx, tx, playerID, statKey, realmID)
 	if err != nil {
 		return 0, err
 	}
@@ -642,7 +924,8 @@ func getPlayerStatValueOrDefault(ctx context.Context, tx *gorm.DB, playerID uint
 	return value, nil
 }
 
-func setPlayerStatValue(ctx context.Context, tx *gorm.DB, playerID uint, statKey string, value int64) error {
+func setPlayerStatValue(ctx context.Context, tx *gorm.DB, playerID uint, statKey string, value int64, realmID uint) error {
+	realmID = normalizeRealmID(realmID)
 	if playerID == 0 {
 		return nil
 	}
@@ -653,7 +936,7 @@ func setPlayerStatValue(ctx context.Context, tx *gorm.DB, playerID uint, statKey
 
 	entry := dal.PlayerStat{}
 	result := tx.WithContext(ctx).
-		Where("player_id = ? AND stat_key = ?", playerID, statKey).
+		Where("realm_id = ? AND player_id = ? AND stat_key = ?", realmID, playerID, statKey).
 		Limit(1).
 		Find(&entry)
 	if result.Error != nil {
@@ -661,7 +944,7 @@ func setPlayerStatValue(ctx context.Context, tx *gorm.DB, playerID uint, statKey
 	}
 
 	if result.RowsAffected == 0 {
-		entry = dal.PlayerStat{PlayerID: playerID, StatKey: statKey, Value: value}
+		entry = dal.PlayerStat{RealmID: realmID, PlayerID: playerID, StatKey: statKey, Value: value}
 		return tx.WithContext(ctx).Create(&entry).Error
 	}
 
@@ -674,7 +957,13 @@ func consumeBehaviorStamina(ctx context.Context, tx *gorm.DB, behavior dal.Behav
 		return nil
 	}
 
-	current, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statStamina, defaultMaxStamina)
+	endurance, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statEndurance, 0, behavior.RealmID)
+	if err != nil {
+		return err
+	}
+	maxStamina, _ := deriveStaminaByEndurance(endurance)
+
+	current, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statStamina, maxStamina, behavior.RealmID)
 	if err != nil {
 		return err
 	}
@@ -682,71 +971,41 @@ func consumeBehaviorStamina(ctx context.Context, tx *gorm.DB, behavior dal.Behav
 		return fmt.Errorf("insufficient stamina (need %d)", definition.StaminaCost)
 	}
 
-	if err := setPlayerStatValue(ctx, tx, behavior.ActorID, statStamina, current-definition.StaminaCost); err != nil {
+	if err := setPlayerStatValue(ctx, tx, behavior.ActorID, statStamina, current-definition.StaminaCost, behavior.RealmID); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func awardStaminaRecoveryProgress(ctx context.Context, tx *gorm.DB, behavior dal.BehaviorInstance, definition BehaviorDefinition) error {
-	if behavior.ActorType != ActorPlayer || behavior.ActorID == 0 || definition.StaminaCost <= 0 {
-		return nil
-	}
-
-	if err := applyStatDelta(ctx, tx, behavior.ActorID, map[string]int64{statStaminaTrainingXP: definition.StaminaCost}); err != nil {
+func recoverPlayerStaminaTick(ctx context.Context, tx *gorm.DB, realmID uint) error {
+	realmID = normalizeRealmID(realmID)
+	characterPlayers := make([]struct {
+		PlayerID uint
+	}, 0)
+	if err := tx.WithContext(ctx).
+		Model(&dal.Character{}).
+		Distinct("player_id").
+		Where("realm_id = ? AND status = ?", realmID, "active").
+		Find(&characterPlayers).Error; err != nil {
 		return err
 	}
 
-	xp, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statStaminaTrainingXP, 0)
-	if err != nil {
-		return err
-	}
-	if xp < recoveryXPPerRatePoint {
-		return nil
-	}
-
-	gain := xp / recoveryXPPerRatePoint
-	remainingXP := xp % recoveryXPPerRatePoint
-
-	rate, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statStaminaRecoveryRate, defaultStaminaRecoveryRate)
-	if err != nil {
-		return err
-	}
-
-	if err := setPlayerStatValue(ctx, tx, behavior.ActorID, statStaminaRecoveryRate, rate+gain); err != nil {
-		return err
-	}
-
-	return setPlayerStatValue(ctx, tx, behavior.ActorID, statStaminaTrainingXP, remainingXP)
-}
-
-func recoverPlayerStaminaTick(ctx context.Context, tx *gorm.DB) error {
-	players := make([]dal.Player, 0)
-	if err := tx.WithContext(ctx).Find(&players).Error; err != nil {
-		return err
-	}
-
-	for _, player := range players {
-		maxStamina, err := getPlayerStatValueOrDefault(ctx, tx, player.ID, statMaxStamina, defaultMaxStamina)
+	for _, characterPlayer := range characterPlayers {
+		endurance, err := getPlayerStatValueOrDefault(ctx, tx, characterPlayer.PlayerID, statEndurance, 0, realmID)
 		if err != nil {
 			return err
 		}
-		if maxStamina <= 0 {
-			maxStamina = defaultMaxStamina
-		}
-		recoveryRate, err := getPlayerStatValueOrDefault(ctx, tx, player.ID, statStaminaRecoveryRate, defaultStaminaRecoveryRate)
+		maxStamina, recoveryRate := deriveStaminaByEndurance(endurance)
+
+		currentStamina, err := getPlayerStatValueOrDefault(ctx, tx, characterPlayer.PlayerID, statStamina, maxStamina, realmID)
 		if err != nil {
 			return err
 		}
-		if recoveryRate <= 0 {
-			recoveryRate = defaultStaminaRecoveryRate
+		if currentStamina < 0 {
+			currentStamina = 0
 		}
-		currentStamina, err := getPlayerStatValueOrDefault(ctx, tx, player.ID, statStamina, maxStamina)
-		if err != nil {
-			return err
-		}
-		recoveryCarry, err := getPlayerStatValueOrDefault(ctx, tx, player.ID, statStaminaRecoveryCarry, 0)
+		recoveryCarry, err := getPlayerStatValueOrDefault(ctx, tx, characterPlayer.PlayerID, statStaminaRecoveryCarry, 0, realmID)
 		if err != nil {
 			return err
 		}
@@ -760,16 +1019,10 @@ func recoverPlayerStaminaTick(ctx context.Context, tx *gorm.DB) error {
 			next = maxStamina
 		}
 
-		if err := setPlayerStatValue(ctx, tx, player.ID, statMaxStamina, maxStamina); err != nil {
+		if err := setPlayerStatValue(ctx, tx, characterPlayer.PlayerID, statStaminaRecoveryCarry, nextCarry, realmID); err != nil {
 			return err
 		}
-		if err := setPlayerStatValue(ctx, tx, player.ID, statStaminaRecoveryRate, recoveryRate); err != nil {
-			return err
-		}
-		if err := setPlayerStatValue(ctx, tx, player.ID, statStaminaRecoveryCarry, nextCarry); err != nil {
-			return err
-		}
-		if err := setPlayerStatValue(ctx, tx, player.ID, statStamina, next); err != nil {
+		if err := setPlayerStatValue(ctx, tx, characterPlayer.PlayerID, statStamina, next, realmID); err != nil {
 			return err
 		}
 	}
@@ -784,7 +1037,7 @@ func adjustedDurationMinutes(ctx context.Context, tx *gorm.DB, behavior dal.Beha
 	}
 
 	if behavior.ActorType == ActorPlayer && behavior.Key == "player_chop_wood" {
-		strength, err := getPlayerStatValue(ctx, tx, behavior.ActorID, statStrength)
+		strength, err := getPlayerStatValue(ctx, tx, behavior.ActorID, statStrength, behavior.RealmID)
 		if err == nil && strength > 0 {
 			reduction := strength / 8
 			if reduction > 0 {
@@ -840,10 +1093,11 @@ func ascensionStartingCoins(ascensionCount int64) int64 {
 	return ascensionStartCoinsPerRun * ascensionCount
 }
 
-func processActivations(ctx context.Context, tx *gorm.DB, currentTick int64) error {
+func processActivations(ctx context.Context, tx *gorm.DB, currentTick int64, realmID uint) error {
+	realmID = normalizeRealmID(realmID)
 	queued := make([]dal.BehaviorInstance, 0)
 	if err := tx.WithContext(ctx).
-		Where("state = ? AND scheduled_at_tick <= ?", behaviorQueued, currentTick).
+		Where("realm_id = ? AND state = ? AND scheduled_at_tick <= ?", realmID, behaviorQueued, currentTick).
 		Order("scheduled_at_tick ASC, id ASC").
 		Find(&queued).Error; err != nil {
 		return err
@@ -860,6 +1114,14 @@ func processActivations(ctx context.Context, tx *gorm.DB, currentTick int64) err
 
 		payload := parseBehaviorRuntimePayload(behavior.PayloadJSON)
 
+		hasConflict, err := hasActiveExclusiveConflict(ctx, tx, behavior, definition)
+		if err != nil {
+			return err
+		}
+		if hasConflict {
+			continue
+		}
+
 		if definition.RequiresMarketOpen && !IsMarketOpen(currentTick) {
 			if payload.MarketWaitUntilTick > 0 && currentTick >= payload.MarketWaitUntilTick {
 				reason := fmt.Sprintf("market did not open before timeout (waited %d minutes)", payload.MarketWaitDurationMinutes)
@@ -870,14 +1132,14 @@ func processActivations(ctx context.Context, tx *gorm.DB, currentTick int64) err
 			continue
 		}
 
-		if err := validateRequirements(ctx, tx, behavior.ActorID, definition.Requirements); err != nil {
+		if err := validateRequirements(ctx, tx, behavior.ActorID, definition.Requirements, behavior.RealmID); err != nil {
 			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
 				return err
 			}
 			continue
 		}
 
-		if err := applyItemDelta(ctx, tx, behavior.ActorID, negateMap(definition.Costs)); err != nil {
+		if err := applyItemDelta(ctx, tx, behavior.ActorID, behavior.RealmID, negateMap(definition.Costs)); err != nil {
 			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
 				return err
 			}
@@ -906,7 +1168,7 @@ func processActivations(ctx context.Context, tx *gorm.DB, currentTick int64) err
 		}
 
 		if definition.StartMessage != "" {
-			if err := createWorldEvent(ctx, tx, currentTick, "behavior_started", definition.StartMessage, behavior.ActorType, behavior.ID); err != nil {
+			if err := createWorldEvent(ctx, tx, currentTick, "behavior_started", definition.StartMessage, behavior.ActorType, behavior.ID, behavior.RealmID); err != nil {
 				return err
 			}
 		}
@@ -915,16 +1177,17 @@ func processActivations(ctx context.Context, tx *gorm.DB, currentTick int64) err
 	return nil
 }
 
-func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64) error {
+func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, realmID uint) error {
+	realmID = normalizeRealmID(realmID)
 	active := make([]dal.BehaviorInstance, 0)
 	if err := tx.WithContext(ctx).
-		Where("state = ? AND completes_at_tick <= ?", behaviorActive, currentTick).
+		Where("realm_id = ? AND state = ? AND completes_at_tick <= ?", realmID, behaviorActive, currentTick).
 		Order("completes_at_tick ASC, id ASC").
 		Find(&active).Error; err != nil {
 		return err
 	}
 
-	ascension, err := loadOrInitAscension(ctx, tx)
+	ascension, err := loadOrInitAscensionForRealm(ctx, tx, realmID)
 	if err != nil {
 		return err
 	}
@@ -967,28 +1230,29 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64) err
 		}
 
 		outputs = applyAscensionBonus(outputs, ascension.WealthBonusPct)
-		if err := applyItemDelta(ctx, tx, behavior.ActorID, outputs); err != nil {
+		if err := applyItemDelta(ctx, tx, behavior.ActorID, behavior.RealmID, outputs); err != nil {
 			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
 				return err
 			}
 			continue
 		}
 
-		if err := grantUnlocks(ctx, tx, behavior.ActorID, definition.GrantsUnlocks); err != nil {
+		if err := grantUnlocks(ctx, tx, behavior.ActorID, definition.GrantsUnlocks, behavior.RealmID); err != nil {
 			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
 				return err
 			}
 			continue
 		}
 
-		if err := applyStatDelta(ctx, tx, behavior.ActorID, definition.StatDeltas); err != nil {
+		if err := applyStatDelta(ctx, tx, behavior.ActorID, behavior.RealmID, definition.StatDeltas); err != nil {
 			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
 				return err
 			}
 			continue
 		}
 
-		if err := awardStaminaRecoveryProgress(ctx, tx, behavior, definition); err != nil {
+		restMessage, err := applyRestRecoveryOnCompletion(ctx, tx, behavior, definition)
+		if err != nil {
 			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
 				return err
 			}
@@ -1010,6 +1274,9 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64) err
 		if dynamicMessage != "" {
 			message = strings.TrimSpace(message + " " + dynamicMessage)
 		}
+		if restMessage != "" {
+			message = strings.TrimSpace(message + " " + restMessage)
+		}
 		if marketMessage != "" {
 			message = strings.TrimSpace(message + " " + marketMessage)
 		}
@@ -1024,20 +1291,60 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64) err
 			return err
 		}
 
-		if err := createWorldEvent(ctx, tx, currentTick, "behavior_completed", message, behavior.ActorType, behavior.ID); err != nil {
+		if err := createWorldEvent(ctx, tx, currentTick, "behavior_completed", message, behavior.ActorType, behavior.ID, behavior.RealmID); err != nil {
 			return err
 		}
 
-		if definition.RepeatIntervalMin > 0 {
+		repeatIntervalMinutes := behavior.RepeatIntervalMin
+		if repeatIntervalMinutes <= 0 {
+			repeatIntervalMinutes = payload.RepeatIntervalMinutes
+		}
+		if repeatIntervalMinutes <= 0 {
+			repeatIntervalMinutes = definition.RepeatIntervalMin
+		}
+
+		shouldQueueNext := false
+		switch payload.Mode {
+		case behaviorModeOnce:
+			shouldQueueNext = false
+		case behaviorModeRepeat:
+			shouldQueueNext = repeatIntervalMinutes > 0
+		case behaviorModeRepeatUntil:
+			shouldQueueNext = repeatIntervalMinutes > 0 && (payload.RepeatUntilTick == 0 || currentTick < payload.RepeatUntilTick)
+		default:
+			shouldQueueNext = repeatIntervalMinutes > 0
+		}
+
+		if shouldQueueNext {
+			nextPayload := payload
+			if definition.RequiresMarketOpen {
+				waitDuration := payload.MarketWaitDurationMinutes
+				if waitDuration <= 0 {
+					waitDuration = defaultMarketWaitDurationMinutes
+				}
+				if waitDuration > maxMarketWaitDurationMinutes {
+					waitDuration = maxMarketWaitDurationMinutes
+				}
+
+				nextPayload.MarketWaitDurationMinutes = waitDuration
+				nextPayload.MarketWaitUntilTick = currentTick + waitDuration
+			}
+
+			nextPayloadJSON, err := marshalBehaviorRuntimePayload(nextPayload)
+			if err != nil {
+				return err
+			}
+
 			next := dal.BehaviorInstance{
+				RealmID:           behavior.RealmID,
 				Key:               behavior.Key,
 				ActorType:         behavior.ActorType,
 				ActorID:           behavior.ActorID,
 				State:             behaviorQueued,
-				ScheduledAtTick:   currentTick + definition.RepeatIntervalMin,
+				ScheduledAtTick:   currentTick + repeatIntervalMinutes,
 				DurationMinutes:   definition.DurationMinutes,
-				PayloadJSON:       "{}",
-				RepeatIntervalMin: definition.RepeatIntervalMin,
+				PayloadJSON:       nextPayloadJSON,
+				RepeatIntervalMin: repeatIntervalMinutes,
 			}
 			if err := tx.WithContext(ctx).Create(&next).Error; err != nil {
 				return err
@@ -1048,12 +1355,112 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64) err
 	return nil
 }
 
-func validateRequirements(ctx context.Context, tx *gorm.DB, playerID uint, requirements Requirement) error {
+func applyRestRecoveryOnCompletion(ctx context.Context, tx *gorm.DB, behavior dal.BehaviorInstance, definition BehaviorDefinition) (string, error) {
+	if behavior.ActorType != ActorPlayer || behavior.ActorID == 0 || behavior.Key != restBehaviorKey {
+		return "", nil
+	}
+
+	endurance, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statEndurance, 0, behavior.RealmID)
+	if err != nil {
+		return "", err
+	}
+	maxStamina, recoveryRate := deriveStaminaByEndurance(endurance)
+	currentStamina, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statStamina, maxStamina, behavior.RealmID)
+	if err != nil {
+		return "", err
+	}
+
+	recovered := computeRestRecoveryPoints(recoveryRate, definition.DurationMinutes)
+	if recovered <= 0 {
+		return "", nil
+	}
+
+	nextStamina := currentStamina + recovered
+	if nextStamina > maxStamina {
+		nextStamina = maxStamina
+	}
+
+	actualRecovered := nextStamina - currentStamina
+	if actualRecovered <= 0 {
+		return "Stamina is already full.", nil
+	}
+
+	if err := setPlayerStatValue(ctx, tx, behavior.ActorID, statStamina, nextStamina, behavior.RealmID); err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("Rest recovery restored %d stamina.", actualRecovered), nil
+}
+
+func computeRestRecoveryPoints(recoveryRate int64, durationMinutes int64) int64 {
+	if durationMinutes <= 0 {
+		durationMinutes = 1
+	}
+	if recoveryRate < 0 {
+		recoveryRate = 0
+	}
+
+	recovered := (recoveryRate * durationMinutes * restRecoveryMultiplier) / 60
+	if recovered < restMinimumRecoveryPoints {
+		recovered = restMinimumRecoveryPoints
+	}
+	return recovered
+}
+
+func behaviorExclusiveGroup(definition BehaviorDefinition) string {
+	return strings.ToLower(strings.TrimSpace(definition.ExclusiveGroup))
+}
+
+func behaviorDefinitionsConflict(left BehaviorDefinition, right BehaviorDefinition) bool {
+	leftGroup := behaviorExclusiveGroup(left)
+	rightGroup := behaviorExclusiveGroup(right)
+	if leftGroup == "" || rightGroup == "" {
+		return false
+	}
+	return leftGroup == rightGroup
+}
+
+func hasActiveExclusiveConflict(ctx context.Context, tx *gorm.DB, behavior dal.BehaviorInstance, definition BehaviorDefinition) (bool, error) {
+	if behaviorExclusiveGroup(definition) == "" {
+		return false, nil
+	}
+
+	active := make([]dal.BehaviorInstance, 0)
+	if err := tx.WithContext(ctx).
+		Where("realm_id = ? AND actor_type = ? AND actor_id = ? AND state = ?", behavior.RealmID, behavior.ActorType, behavior.ActorID, behaviorActive).
+		Find(&active).Error; err != nil {
+		return false, err
+	}
+
+	return hasExclusiveConflictWithActiveBehaviorKeys(definition, behavior.ID, active), nil
+}
+
+func hasExclusiveConflictWithActiveBehaviorKeys(definition BehaviorDefinition, candidateBehaviorID uint, active []dal.BehaviorInstance) bool {
+	for _, activeBehavior := range active {
+		if activeBehavior.ID == candidateBehaviorID {
+			continue
+		}
+
+		activeDefinition, ok := GetBehaviorDefinition(activeBehavior.Key)
+		if !ok {
+			continue
+		}
+
+		if behaviorDefinitionsConflict(definition, activeDefinition) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func validateRequirements(ctx context.Context, tx *gorm.DB, playerID uint, requirements Requirement, realmID uint) error {
+	realmID = normalizeRealmID(realmID)
 	for _, unlock := range requirements.Unlocks {
 		var count int64
 		if err := tx.WithContext(ctx).
 			Model(&dal.PlayerUnlock{}).
-			Where("player_id = ? AND unlock_key = ?", playerID, unlock).
+			Where("realm_id = ? AND player_id = ? AND unlock_key = ?", realmID, playerID, unlock).
 			Count(&count).Error; err != nil {
 			return err
 		}
@@ -1066,7 +1473,7 @@ func validateRequirements(ctx context.Context, tx *gorm.DB, playerID uint, requi
 		if required <= 0 {
 			continue
 		}
-		qty, err := getInventoryQuantity(ctx, tx, playerID, item)
+		qty, err := getInventoryQuantity(ctx, tx, playerID, item, realmID)
 		if err != nil {
 			return err
 		}
@@ -1078,7 +1485,8 @@ func validateRequirements(ctx context.Context, tx *gorm.DB, playerID uint, requi
 	return nil
 }
 
-func applyItemDelta(ctx context.Context, tx *gorm.DB, playerID uint, delta map[string]int64) error {
+func applyItemDelta(ctx context.Context, tx *gorm.DB, playerID uint, realmID uint, delta map[string]int64) error {
+	realmID = normalizeRealmID(realmID)
 	for item, change := range delta {
 		if change == 0 {
 			continue
@@ -1086,7 +1494,7 @@ func applyItemDelta(ctx context.Context, tx *gorm.DB, playerID uint, delta map[s
 
 		entry := dal.InventoryEntry{}
 		result := tx.WithContext(ctx).
-			Where("owner_type = ? AND owner_id = ? AND item_key = ?", ActorPlayer, playerID, item).
+			Where("realm_id = ? AND owner_type = ? AND owner_id = ? AND item_key = ?", realmID, ActorPlayer, playerID, item).
 			Limit(1).
 			Find(&entry)
 		if result.Error != nil {
@@ -1094,7 +1502,7 @@ func applyItemDelta(ctx context.Context, tx *gorm.DB, playerID uint, delta map[s
 		}
 
 		if result.RowsAffected == 0 {
-			entry = dal.InventoryEntry{OwnerType: ActorPlayer, OwnerID: playerID, ItemKey: item, Quantity: 0}
+			entry = dal.InventoryEntry{RealmID: realmID, OwnerType: ActorPlayer, OwnerID: playerID, ItemKey: item, Quantity: 0}
 		}
 
 		nextQty := entry.Quantity + change
@@ -1116,10 +1524,11 @@ func applyItemDelta(ctx context.Context, tx *gorm.DB, playerID uint, delta map[s
 	return nil
 }
 
-func getInventoryQuantity(ctx context.Context, tx *gorm.DB, playerID uint, item string) (int64, error) {
+func getInventoryQuantity(ctx context.Context, tx *gorm.DB, playerID uint, item string, realmID uint) (int64, error) {
+	realmID = normalizeRealmID(realmID)
 	entry := dal.InventoryEntry{}
 	result := tx.WithContext(ctx).
-		Where("owner_type = ? AND owner_id = ? AND item_key = ?", ActorPlayer, playerID, item).
+		Where("realm_id = ? AND owner_type = ? AND owner_id = ? AND item_key = ?", realmID, ActorPlayer, playerID, item).
 		Limit(1).
 		Find(&entry)
 	if result.Error != nil {
@@ -1141,8 +1550,9 @@ func markBehaviorFailed(ctx context.Context, tx *gorm.DB, behaviorID uint, reaso
 		Updates(map[string]any{"state": behaviorFailed, "failure_reason": reason}).Error
 }
 
-func createWorldEvent(ctx context.Context, tx *gorm.DB, tick int64, eventType, message, source string, refID uint) error {
+func createWorldEvent(ctx context.Context, tx *gorm.DB, tick int64, eventType, message, source string, refID uint, realmID uint) error {
 	event := dal.WorldEvent{
+		RealmID:     normalizeRealmID(realmID),
 		Tick:        tick,
 		EventType:   eventType,
 		Message:     message,
@@ -1181,12 +1591,12 @@ func resolveBehaviorOutputs(ctx context.Context, tx *gorm.DB, behavior dal.Behav
 			return nil, "", fmt.Errorf("market is closed")
 		}
 
-		price, err := getMarketPrice(ctx, tx, "scrap")
+		price, err := getMarketPrice(ctx, tx, "scrap", behavior.RealmID)
 		if err != nil {
 			return nil, "", err
 		}
 
-		social, err := getPlayerStatValue(ctx, tx, behavior.ActorID, statSocial)
+		social, err := getPlayerStatValue(ctx, tx, behavior.ActorID, statSocial, behavior.RealmID)
 		if err != nil {
 			return nil, "", err
 		}
@@ -1207,12 +1617,12 @@ func resolveBehaviorOutputs(ctx context.Context, tx *gorm.DB, behavior dal.Behav
 			return nil, "", fmt.Errorf("market is closed")
 		}
 
-		price, err := getMarketPrice(ctx, tx, "wood")
+		price, err := getMarketPrice(ctx, tx, "wood", behavior.RealmID)
 		if err != nil {
 			return nil, "", err
 		}
 
-		social, err := getPlayerStatValue(ctx, tx, behavior.ActorID, statSocial)
+		social, err := getPlayerStatValue(ctx, tx, behavior.ActorID, statSocial, behavior.RealmID)
 		if err != nil {
 			return nil, "", err
 		}
@@ -1229,7 +1639,7 @@ func resolveBehaviorOutputs(ctx context.Context, tx *gorm.DB, behavior dal.Behav
 	}
 
 	if behavior.Key == "player_chop_wood" {
-		strength, err := getPlayerStatValue(ctx, tx, behavior.ActorID, statStrength)
+		strength, err := getPlayerStatValue(ctx, tx, behavior.ActorID, statStrength, behavior.RealmID)
 		if err != nil {
 			return nil, "", err
 		}
@@ -1246,12 +1656,12 @@ func resolveBehaviorOutputs(ctx context.Context, tx *gorm.DB, behavior dal.Behav
 			return outputs, "The market is closed overnight; AI desks hold positions.", nil
 		}
 
-		delta, explanation, err := decideAIMarketDelta(ctx, tx)
+		delta, explanation, err := decideAIMarketDelta(ctx, tx, behavior.RealmID)
 		if err != nil {
 			return nil, "", err
 		}
 		if delta != 0 {
-			newPrice, err := applySingleMarketDelta(ctx, tx, "scrap", delta, behavior.Key, currentTick)
+			newPrice, err := applySingleMarketDelta(ctx, tx, "scrap", delta, behavior.Key, currentTick, behavior.RealmID)
 			if err != nil {
 				return nil, "", err
 			}
@@ -1311,7 +1721,8 @@ func resolveOutputExpression(expression string, rng *rand.Rand) (int64, error) {
 	return staticValue, nil
 }
 
-func grantUnlocks(ctx context.Context, tx *gorm.DB, playerID uint, unlocks []string) error {
+func grantUnlocks(ctx context.Context, tx *gorm.DB, playerID uint, unlocks []string, realmID uint) error {
+	realmID = normalizeRealmID(realmID)
 	if playerID == 0 || len(unlocks) == 0 {
 		return nil
 	}
@@ -1325,7 +1736,7 @@ func grantUnlocks(ctx context.Context, tx *gorm.DB, playerID uint, unlocks []str
 		var count int64
 		if err := tx.WithContext(ctx).
 			Model(&dal.PlayerUnlock{}).
-			Where("player_id = ? AND unlock_key = ?", playerID, unlock).
+			Where("realm_id = ? AND player_id = ? AND unlock_key = ?", realmID, playerID, unlock).
 			Count(&count).Error; err != nil {
 			return err
 		}
@@ -1333,7 +1744,7 @@ func grantUnlocks(ctx context.Context, tx *gorm.DB, playerID uint, unlocks []str
 			continue
 		}
 
-		if err := tx.WithContext(ctx).Create(&dal.PlayerUnlock{PlayerID: playerID, UnlockKey: unlock}).Error; err != nil {
+		if err := tx.WithContext(ctx).Create(&dal.PlayerUnlock{RealmID: realmID, PlayerID: playerID, UnlockKey: unlock}).Error; err != nil {
 			return err
 		}
 	}
@@ -1356,7 +1767,7 @@ func applyMarketEffects(ctx context.Context, tx *gorm.DB, behavior dal.BehaviorI
 			continue
 		}
 
-		price, err := applySingleMarketDelta(ctx, tx, item, delta, behavior.Key, currentTick)
+		price, err := applySingleMarketDelta(ctx, tx, item, delta, behavior.Key, currentTick, behavior.RealmID)
 		if err != nil {
 			return "", err
 		}
@@ -1366,11 +1777,12 @@ func applyMarketEffects(ctx context.Context, tx *gorm.DB, behavior dal.BehaviorI
 	return strings.Join(messages, " "), nil
 }
 
-func ensureMarketDefaults(ctx context.Context, database *gorm.DB, currentTick int64) error {
+func ensureMarketDefaults(ctx context.Context, database *gorm.DB, currentTick int64, realmID uint) error {
+	realmID = normalizeRealmID(realmID)
 	defaults := map[string]int64{"scrap": 8, "wood": 5}
 	for item, price := range defaults {
 		entry := dal.MarketPrice{}
-		result := database.WithContext(ctx).Where("item_key = ?", item).Limit(1).Find(&entry)
+		result := database.WithContext(ctx).Where("realm_id = ? AND item_key = ?", realmID, item).Limit(1).Find(&entry)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -1378,29 +1790,30 @@ func ensureMarketDefaults(ctx context.Context, database *gorm.DB, currentTick in
 			continue
 		}
 
-		entry = dal.MarketPrice{ItemKey: item, Price: price, LastDelta: 0, LastSource: "bootstrap", UpdatedTick: currentTick}
+		entry = dal.MarketPrice{RealmID: realmID, ItemKey: item, Price: price, LastDelta: 0, LastSource: "bootstrap", UpdatedTick: currentTick}
 		if err := database.WithContext(ctx).Create(&entry).Error; err != nil {
 			return err
 		}
 
-		if err := appendMarketHistory(ctx, database, item, currentTick, price, 0, "bootstrap"); err != nil {
+		if err := appendMarketHistory(ctx, database, item, currentTick, price, 0, "bootstrap", realmID); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func getMarketPrice(ctx context.Context, tx *gorm.DB, item string) (int64, error) {
+func getMarketPrice(ctx context.Context, tx *gorm.DB, item string, realmID uint) (int64, error) {
+	realmID = normalizeRealmID(realmID)
 	entry := dal.MarketPrice{}
-	result := tx.WithContext(ctx).Where("item_key = ?", item).Limit(1).Find(&entry)
+	result := tx.WithContext(ctx).Where("realm_id = ? AND item_key = ?", realmID, item).Limit(1).Find(&entry)
 	if result.Error != nil {
 		return 0, result.Error
 	}
 	if result.RowsAffected == 0 {
-		if err := ensureMarketDefaults(ctx, tx, 0); err != nil {
+		if err := ensureMarketDefaults(ctx, tx, 0, realmID); err != nil {
 			return 0, err
 		}
-		result = tx.WithContext(ctx).Where("item_key = ?", item).Limit(1).Find(&entry)
+		result = tx.WithContext(ctx).Where("realm_id = ? AND item_key = ?", realmID, item).Limit(1).Find(&entry)
 		if result.Error != nil {
 			return 0, result.Error
 		}
@@ -1411,14 +1824,15 @@ func getMarketPrice(ctx context.Context, tx *gorm.DB, item string) (int64, error
 	return entry.Price, nil
 }
 
-func applySingleMarketDelta(ctx context.Context, tx *gorm.DB, item string, delta int64, source string, currentTick int64) (int64, error) {
+func applySingleMarketDelta(ctx context.Context, tx *gorm.DB, item string, delta int64, source string, currentTick int64, realmID uint) (int64, error) {
+	realmID = normalizeRealmID(realmID)
 	entry := dal.MarketPrice{}
-	result := tx.WithContext(ctx).Where("item_key = ?", item).Limit(1).Find(&entry)
+	result := tx.WithContext(ctx).Where("realm_id = ? AND item_key = ?", realmID, item).Limit(1).Find(&entry)
 	if result.Error != nil {
 		return 0, result.Error
 	}
 	if result.RowsAffected == 0 {
-		entry = dal.MarketPrice{ItemKey: item, Price: 1}
+		entry = dal.MarketPrice{RealmID: realmID, ItemKey: item, Price: 1}
 		if err := tx.WithContext(ctx).Create(&entry).Error; err != nil {
 			return 0, err
 		}
@@ -1439,15 +1853,16 @@ func applySingleMarketDelta(ctx context.Context, tx *gorm.DB, item string, delta
 		return 0, err
 	}
 
-	if err := appendMarketHistory(ctx, tx, item, currentTick, entry.Price, delta, source); err != nil {
+	if err := appendMarketHistory(ctx, tx, item, currentTick, entry.Price, delta, source, realmID); err != nil {
 		return 0, err
 	}
 
 	return entry.Price, nil
 }
 
-func appendMarketHistory(ctx context.Context, tx *gorm.DB, item string, tick, price, delta int64, source string) error {
+func appendMarketHistory(ctx context.Context, tx *gorm.DB, item string, tick, price, delta int64, source string, realmID uint) error {
 	entry := dal.MarketHistory{
+		RealmID:      normalizeRealmID(realmID),
 		ItemKey:      item,
 		Tick:         tick,
 		Price:        price,
@@ -1458,11 +1873,12 @@ func appendMarketHistory(ctx context.Context, tx *gorm.DB, item string, tick, pr
 	return tx.WithContext(ctx).Create(&entry).Error
 }
 
-func decideAIMarketDelta(ctx context.Context, tx *gorm.DB) (int64, string, error) {
+func decideAIMarketDelta(ctx context.Context, tx *gorm.DB, realmID uint) (int64, string, error) {
+	realmID = normalizeRealmID(realmID)
 	var scrapStock int64
 	if err := tx.WithContext(ctx).
 		Model(&dal.InventoryEntry{}).
-		Where("owner_type = ? AND item_key = ?", ActorPlayer, "scrap").
+		Where("realm_id = ? AND owner_type = ? AND item_key = ?", realmID, ActorPlayer, "scrap").
 		Select("COALESCE(SUM(quantity), 0)").
 		Scan(&scrapStock).Error; err != nil {
 		return 0, "", err
@@ -1478,7 +1894,7 @@ func decideAIMarketDelta(ctx context.Context, tx *gorm.DB) (int64, string, error
 	var recentSales int64
 	if err := tx.WithContext(ctx).
 		Model(&dal.BehaviorInstance{}).
-		Where("key = ? AND state = ?", "player_sell_scrap", behaviorCompleted).
+		Where("realm_id = ? AND key = ? AND state = ?", realmID, "player_sell_scrap", behaviorCompleted).
 		Count(&recentSales).Error; err != nil {
 		return 0, "", err
 	}
@@ -1520,9 +1936,10 @@ func MarketSessionState(currentTick int64) string {
 	return "closed"
 }
 
-func GetMarketStatus(ctx context.Context, database *gorm.DB, currentTick int64) (MarketStatus, error) {
+func GetMarketStatus(ctx context.Context, database *gorm.DB, currentTick int64, realmID uint) (MarketStatus, error) {
+	realmID = normalizeRealmID(realmID)
 	rows := make([]dal.MarketPrice, 0)
-	if err := database.WithContext(ctx).Order("item_key ASC").Find(&rows).Error; err != nil {
+	if err := database.WithContext(ctx).Where("realm_id = ?", realmID).Order("item_key ASC").Find(&rows).Error; err != nil {
 		return MarketStatus{}, err
 	}
 
@@ -1563,8 +1980,9 @@ func GetMarketStatus(ctx context.Context, database *gorm.DB, currentTick int64) 
 	}, nil
 }
 
-func GetMarketHistory(ctx context.Context, database *gorm.DB, symbol string, limit int) ([]MarketHistoryEntry, error) {
-	if err := ensureMarketHistorySeed(ctx, database); err != nil {
+func GetMarketHistory(ctx context.Context, database *gorm.DB, symbol string, limit int, realmID uint) ([]MarketHistoryEntry, error) {
+	realmID = normalizeRealmID(realmID)
+	if err := ensureMarketHistorySeed(ctx, database, realmID); err != nil {
 		return nil, err
 	}
 
@@ -1575,7 +1993,7 @@ func GetMarketHistory(ctx context.Context, database *gorm.DB, symbol string, lim
 		limit = 500
 	}
 
-	query := database.WithContext(ctx).Model(&dal.MarketHistory{})
+	query := database.WithContext(ctx).Model(&dal.MarketHistory{}).Where("realm_id = ?", realmID)
 	if strings.TrimSpace(symbol) != "" {
 		query = query.Where("item_key = ?", strings.TrimSpace(symbol))
 	}
@@ -1600,9 +2018,10 @@ func GetMarketHistory(ctx context.Context, database *gorm.DB, symbol string, lim
 	return history, nil
 }
 
-func ensureMarketHistorySeed(ctx context.Context, database *gorm.DB) error {
+func ensureMarketHistorySeed(ctx context.Context, database *gorm.DB, realmID uint) error {
+	realmID = normalizeRealmID(realmID)
 	var count int64
-	if err := database.WithContext(ctx).Model(&dal.MarketHistory{}).Count(&count).Error; err != nil {
+	if err := database.WithContext(ctx).Model(&dal.MarketHistory{}).Where("realm_id = ?", realmID).Count(&count).Error; err != nil {
 		return err
 	}
 	if count > 0 {
@@ -1610,12 +2029,13 @@ func ensureMarketHistorySeed(ctx context.Context, database *gorm.DB) error {
 	}
 
 	prices := make([]dal.MarketPrice, 0)
-	if err := database.WithContext(ctx).Find(&prices).Error; err != nil {
+	if err := database.WithContext(ctx).Where("realm_id = ?", realmID).Find(&prices).Error; err != nil {
 		return err
 	}
 
 	for _, row := range prices {
 		history := dal.MarketHistory{
+			RealmID:      realmID,
 			ItemKey:      row.ItemKey,
 			Tick:         row.UpdatedTick,
 			Price:        row.Price,
@@ -1659,7 +2079,24 @@ func parseBehaviorRuntimePayload(raw string) behaviorRuntimePayload {
 	if payload.MarketWaitUntilTick < 0 {
 		payload.MarketWaitUntilTick = 0
 	}
+	payload.Mode = strings.ToLower(strings.TrimSpace(payload.Mode))
+	if payload.Mode != "" && payload.Mode != behaviorModeOnce && payload.Mode != behaviorModeRepeat && payload.Mode != behaviorModeRepeatUntil {
+		payload.Mode = behaviorModeOnce
+	}
+	if payload.RepeatIntervalMinutes < 0 {
+		payload.RepeatIntervalMinutes = 0
+	}
+	if payload.RepeatUntilTick < 0 {
+		payload.RepeatUntilTick = 0
+	}
 	return payload
+}
+
+func maxInt64(left int64, right int64) int64 {
+	if left >= right {
+		return left
+	}
+	return right
 }
 
 func marshalBehaviorRuntimePayload(payload behaviorRuntimePayload) (string, error) {
@@ -1676,8 +2113,13 @@ func marshalBehaviorRuntimePayload(payload behaviorRuntimePayload) (string, erro
 }
 
 func loadOrInitAscension(ctx context.Context, database *gorm.DB) (*dal.AscensionState, error) {
+	return loadOrInitAscensionForRealm(ctx, database, 1)
+}
+
+func loadOrInitAscensionForRealm(ctx context.Context, database *gorm.DB, realmID uint) (*dal.AscensionState, error) {
+	realmID = normalizeRealmID(realmID)
 	asc := &dal.AscensionState{}
-	result := database.WithContext(ctx).Where("key = ?", ascensionKey).Limit(1).Find(asc)
+	result := database.WithContext(ctx).Where("realm_id = ? AND key = ?", realmID, ascensionKey).Limit(1).Find(asc)
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -1685,7 +2127,7 @@ func loadOrInitAscension(ctx context.Context, database *gorm.DB) (*dal.Ascension
 		return asc, nil
 	}
 
-	initial := &dal.AscensionState{Key: ascensionKey, Count: 0, WealthBonusPct: 0}
+	initial := &dal.AscensionState{RealmID: realmID, Key: ascensionKey, Count: 0, WealthBonusPct: 0}
 	if err := database.WithContext(ctx).Create(initial).Error; err != nil {
 		return nil, err
 	}
@@ -1693,8 +2135,13 @@ func loadOrInitAscension(ctx context.Context, database *gorm.DB) (*dal.Ascension
 }
 
 func loadOrInitRuntimeState(ctx context.Context, database *gorm.DB) (*dal.WorldRuntimeState, error) {
+	return loadOrInitRuntimeStateForRealm(ctx, database, 1)
+}
+
+func loadOrInitRuntimeStateForRealm(ctx context.Context, database *gorm.DB, realmID uint) (*dal.WorldRuntimeState, error) {
+	realmID = normalizeRealmID(realmID)
 	runtimeState := &dal.WorldRuntimeState{}
-	result := database.WithContext(ctx).Where("key = ?", worldRuntimeStateKey).Limit(1).Find(runtimeState)
+	result := database.WithContext(ctx).Where("realm_id = ? AND key = ?", realmID, worldRuntimeStateKey).Limit(1).Find(runtimeState)
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -1703,6 +2150,7 @@ func loadOrInitRuntimeState(ctx context.Context, database *gorm.DB) (*dal.WorldR
 	}
 
 	initial := &dal.WorldRuntimeState{
+		RealmID:              realmID,
 		Key:                  worldRuntimeStateKey,
 		LastProcessedTickAt:  time.Now().UTC(),
 		CarryGameMinutes:     0,
@@ -1748,7 +2196,12 @@ func SortBehaviorDefinitions(definitions []BehaviorDefinition) []BehaviorDefinit
 	sorted := make([]BehaviorDefinition, len(definitions))
 	copy(sorted, definitions)
 	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Key < sorted[j].Key
+		leftName := BehaviorDisplayName(sorted[i])
+		rightName := BehaviorDisplayName(sorted[j])
+		if leftName == rightName {
+			return sorted[i].Key < sorted[j].Key
+		}
+		return leftName < rightName
 	})
 	return sorted
 }

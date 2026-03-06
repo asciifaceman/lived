@@ -1,0 +1,22 @@
+services:
+  lived-db:
+    image: postgres:16-alpine
+    container_name: lived-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lived
+      POSTGRES_USER: lived
+      POSTGRES_PASSWORD: lived
+    volumes:
+      - lived-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lived -d lived"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+volumes:
+  lived-postgres-data:
+    name: lived-postgres-data

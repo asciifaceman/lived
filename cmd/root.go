@@ -4,6 +4,7 @@ Copyright © 2026 AsciiFaceman
 package cmd
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -11,9 +12,11 @@ import (
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:   "lived",
-	Short: "Lived idle game server",
-	Long:  "Lived runs the server-authoritative idle/incremental simulation and exposes an HTTP API.",
+	Use:           "lived",
+	Short:         "Lived idle game server",
+	Long:          "Lived runs the server-authoritative idle/incremental simulation and exposes an HTTP API.",
+	SilenceErrors: true,
+	SilenceUsage:  true,
 	// Uncomment the following line if your bare application
 	// has an action associated with it:
 	// Run: func(cmd *cobra.Command, args []string) { },
@@ -24,6 +27,7 @@ var rootCmd = &cobra.Command{
 func Execute() {
 	err := rootCmd.Execute()
 	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }

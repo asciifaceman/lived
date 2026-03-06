@@ -35,7 +35,33 @@
 	- `20-gameplay.instructions.md`
 	- `30-api.instructions.md`
 	- `40-persistence.instructions.md`
+	- `50-mmo-refactor.instructions.md`
+	- `60-mmo-delivery.instructions.md`
 - New sessions should treat this root file + ordered domain files as the baseline project memory.
+
+## Feature Tracker Governance
+
+- `docs/feature-tracker.md` is the canonical project tracker for bugs/features/technical work.
+- In every coding session that changes behavior, API, UX, reliability, or priorities, update tracker rows in the same pass.
+- Keep tracker entries current with:
+	- `Action State` (`todo`, `in-progress`, `blocked`, `done`),
+	- `Priority`,
+	- concise `Next Action` that reflects the immediate follow-up.
+- When work is discovered during implementation, add or refine tracker items rather than keeping ad-hoc TODOs in chat.
+- Do not maintain duplicate tracker state in migration/reference docs; those docs should point back to `docs/feature-tracker.md`.
+- If a session starts without an explicit user-selected task, prioritize `P0` then `P1` entries from `docs/feature-tracker.md`.
+
+## Release Phase Policy (Pre-Alpha)
+
+- The project is currently **pre-alpha**.
+- During pre-alpha, prioritize fast iteration over compatibility:
+	- breaking API/schema changes are acceptable,
+	- backward compatibility is not required,
+	- migration paths are optional and should not block changes,
+	- destructive schema updates are acceptable when they simplify progress.
+- Assume developers may recreate/reset databases frequently during this phase.
+- This policy remains active until explicitly removed from instructions or the user states pre-alpha has ended.
+- Once pre-alpha ends, return to conservative change management with explicit migration and compatibility planning.
 
 ## Architecture Principles
 
@@ -127,6 +153,7 @@
 - Do not write tests that primarily validate Go, OS behavior, or third-party library internals.
 - Favor deterministic tests (controllable time/state) for idle simulation logic.
 - Add regression tests when fixing bugs.
+- Never undermine, falsify, bypass, or weaken tests just to make builds pass; fix the underlying code/problem instead of rigging outcomes.
 
 ## Versioning Discipline
 

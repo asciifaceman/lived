@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/uiconfig.ts","./src/vite-env.d.ts","./src/components/adminmodal.tsx","./src/components/chatview.tsx","./src/components/playersnapshot.tsx","./src/hooks/useworldstream.ts"],"version":"5.9.3"}
