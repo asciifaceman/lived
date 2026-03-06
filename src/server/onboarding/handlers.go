@@ -2,6 +2,7 @@ package onboarding
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sort"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"github.com/asciifaceman/lived/pkg/dal"
 	"github.com/asciifaceman/lived/pkg/ratelimit"
 	serverAuth "github.com/asciifaceman/lived/src/server/auth"
+	"github.com/asciifaceman/lived/src/server/requestbind"
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
 )
@@ -24,9 +26,18 @@ type startRequest struct {
 	RealmID uint   `json:"realmId"`
 }
 
+type switchRequest struct {
+	CharacterID uint `json:"characterId"`
+}
+
 type onboardingStartData struct {
 	Character onboardingCharacter `json:"character"`
 	Created   bool                `json:"created"`
+}
+
+type onboardingSwitchData struct {
+	Character onboardingCharacter `json:"character"`
+	Changed   bool                `json:"changed"`
 }
 
 type onboardingStatusData struct {
@@ -79,8 +90,10 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 		}
 		limiter := ratelimit.NewFixedWindowLimiter(cfg.RateLimitWindow, identifier)
 		group.POST("/start", makeStartHandler(database), authMW, limiter.Middleware("onboarding_start", cfg.RateLimitOnboardMax))
+		group.POST("/switch", makeSwitchHandler(database), authMW, limiter.Middleware("onboarding_switch", cfg.RateLimitOnboardMax))
 	} else {
 		group.POST("/start", makeStartHandler(database), authMW)
+		group.POST("/switch", makeSwitchHandler(database), authMW)
 	}
 	group.GET("/status", makeStatusHandler(database), authMW)
 }
@@ -93,8 +106,8 @@ func makeStartHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req startRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid onboarding payload")
+		if err := requestbind.JSON(c, &req, "invalid onboarding payload"); err != nil {
+			return err
 		}
 
 		name := strings.TrimSpace(req.Name)
@@ -125,7 +138,7 @@ func makeStartHandler(database *gorm.DB) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load existing character")
 		}
 		if res.RowsAffected > 0 {
-			return respondSuccess(c, http.StatusOK, "Onboarding already completed for this realm.", onboardingStartData{Character: toOnboardingCharacter(existing), Created: false})
+			return echo.NewHTTPError(http.StatusConflict, "character already exists in this realm; use onboarding switch")
 		}
 
 		canCreate, whitelistOnly, err := canCreateCharacterInRealm(c.Request().Context(), database, actor.AccountID, actor.Roles, realmID)
@@ -146,6 +159,11 @@ func makeStartHandler(database *gorm.DB) echo.HandlerFunc {
 				return err
 			}
 
+			var primaryCharacterCount int64
+			if err := tx.Model(&dal.Character{}).Where("account_id = ? AND is_primary = ?", actor.AccountID, true).Count(&primaryCharacterCount).Error; err != nil {
+				return err
+			}
+
 			player := dal.Player{Name: name}
 			if err := tx.Create(&player).Error; err != nil {
 				return err
@@ -156,7 +174,7 @@ func makeStartHandler(database *gorm.DB) echo.HandlerFunc {
 				PlayerID:  player.ID,
 				RealmID:   realmID,
 				Name:      name,
-				IsPrimary: accountCharacterCount == 0,
+				IsPrimary: accountCharacterCount == 0 || primaryCharacterCount == 0,
 				Status:    "active",
 			}
 			if err := tx.Create(&newCharacter).Error; err != nil {
@@ -174,6 +192,72 @@ func makeStartHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		return respondSuccess(c, http.StatusCreated, "Onboarding completed.", onboardingStartData{Character: toOnboardingCharacter(createdCharacter), Created: true})
+	}
+}
+
+func makeSwitchHandler(database *gorm.DB) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+		if !ok {
+			return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+		}
+
+		var req switchRequest
+		if err := requestbind.JSON(c, &req, "invalid onboarding switch payload"); err != nil {
+			return err
+		}
+		if req.CharacterID == 0 {
+			return echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+		}
+
+		result := onboardingSwitchData{}
+		err := database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
+			character := dal.Character{}
+			lookup := tx.Where("id = ? AND account_id = ?", req.CharacterID, actor.AccountID).Limit(1).Find(&character)
+			if lookup.Error != nil {
+				return lookup.Error
+			}
+			if lookup.RowsAffected == 0 {
+				return gorm.ErrRecordNotFound
+			}
+			if strings.TrimSpace(strings.ToLower(character.Status)) != "active" {
+				return echo.NewHTTPError(http.StatusConflict, "character is not active and cannot be selected")
+			}
+
+			result.Character = toOnboardingCharacter(character)
+			if character.IsPrimary {
+				result.Changed = false
+				return nil
+			}
+
+			if err := tx.Model(&dal.Character{}).
+				Where("account_id = ?", actor.AccountID).
+				Update("is_primary", false).Error; err != nil {
+				return err
+			}
+
+			if err := tx.Model(&dal.Character{}).
+				Where("id = ?", character.ID).
+				Update("is_primary", true).Error; err != nil {
+				return err
+			}
+
+			character.IsPrimary = true
+			result.Character = toOnboardingCharacter(character)
+			result.Changed = true
+			return nil
+		})
+		if err != nil {
+			if httpErr, ok := err.(*echo.HTTPError); ok {
+				return httpErr
+			}
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return echo.NewHTTPError(http.StatusNotFound, "character not found")
+			}
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to switch character")
+		}
+
+		return respondSuccess(c, http.StatusOK, "Active character selected.", result)
 	}
 }
 

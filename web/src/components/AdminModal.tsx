@@ -6,15 +6,18 @@ import {
   AdminRealm,
   AdminRealmAccessEntry,
   AdminWordRule,
+  adminCreateRealm,
   adminGrantRealmAccess,
   adminChatListChannels,
   adminApplyRealmAction,
   adminAuditList,
   adminChatDisableChannel,
+  adminChatAttachChannel,
+  adminChatCreateChannel,
+  adminChatEditChannel,
   adminChatFlushChannel,
   adminChatModerateChannel,
   adminChatSystemMessage,
-  adminChatUpsertChannel,
   adminChatWordlistAdd,
   adminChatWordlistList,
   adminChatWordlistRemove,
@@ -38,6 +41,28 @@ type AdminModalProps = {
   onChanged?: () => Promise<void> | void;
 };
 
+type AdminDataSegment = "realms" | "stats" | "chatChannels" | "realmAccess" | "wordlist" | "audit" | "characters";
+
+const adminTabDataDependencies: Record<AdminTab, AdminDataSegment[]> = {
+  dashboard: ["realms", "stats"],
+  realm: ["realms", "realmAccess"],
+  accounts: [],
+  characters: ["characters"],
+  chat: ["chatChannels", "wordlist", "realms"],
+  wordlist: ["wordlist"],
+  audit: ["audit"]
+};
+
+const adminDataSegmentLabels: Record<AdminDataSegment, string> = {
+  realms: "realms",
+  stats: "stats",
+  chatChannels: "chat channels",
+  realmAccess: "realm access",
+  wordlist: "wordlist",
+  audit: "audit",
+  characters: "characters"
+};
+
 function parseNumber(value: string): number | undefined {
   const trimmed = value.trim();
   if (!trimmed) {
@@ -48,34 +73,6 @@ function parseNumber(value: string): number | undefined {
     return undefined;
   }
   return parsed;
-}
-
-function parseRealmList(value: string): { realmIds: number[]; allRealms: boolean } {
-  const tokens = value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
-
-  if (tokens.length === 0) {
-    return { realmIds: [], allRealms: false };
-  }
-
-  const ids = new Set<number>();
-  let allRealms = false;
-  for (const token of tokens) {
-    if (token === "*") {
-      allRealms = true;
-      continue;
-    }
-
-    const parsed = Number(token);
-    if (!Number.isInteger(parsed) || parsed <= 0) {
-      throw new Error(`invalid realm id in list: ${token}`);
-    }
-    ids.add(parsed);
-  }
-
-  return { realmIds: Array.from(ids.values()).sort((left, right) => left - right), allRealms };
 }
 
 type RealmActionSummary = {
@@ -108,7 +105,8 @@ const dashboardSummaryKeys = new Set([
   "activeCharacters",
   "activeSessions",
   "queuedOrActive",
-  "publicWorldEvents"
+  "publicWorldEvents",
+  "tickBudget"
 ]);
 
 type AuditSlice = {
@@ -121,6 +119,84 @@ type CountRow = {
   label: string;
   count: number;
 };
+
+type TickBudgetSummary = {
+  targetTickMs: number;
+  avgTickMs: number;
+  budgetDeltaMs: number;
+  budgetRatio: number;
+  totalRuns: number;
+  totalFailures: number;
+  failureRate: number;
+  avgAdvanceMinutes: number;
+  lastTickMs: number;
+  lastAdvanceMinutes: number;
+};
+
+function asFiniteNumber(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  return value;
+}
+
+function parseTickBudgetSummary(stats: Record<string, unknown> | null): TickBudgetSummary | null {
+  if (!stats) {
+    return null;
+  }
+
+  const raw = stats["tickBudget"];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+
+  const tickBudget = raw as Record<string, unknown>;
+  const targetTickMs = asFiniteNumber(tickBudget.targetTickMs);
+  const avgTickMs = asFiniteNumber(tickBudget.avgTickMs);
+  const budgetDeltaMs = asFiniteNumber(tickBudget.budgetDeltaMs);
+  const budgetRatio = asFiniteNumber(tickBudget.budgetRatio);
+  const totalRuns = asFiniteNumber(tickBudget.totalRuns);
+  const totalFailures = asFiniteNumber(tickBudget.totalFailures);
+  const failureRate = asFiniteNumber(tickBudget.failureRate);
+  const avgAdvanceMinutes = asFiniteNumber(tickBudget.avgAdvanceMinutes);
+  const lastTickMs = asFiniteNumber(tickBudget.lastTickMs);
+  const lastAdvanceMinutes = asFiniteNumber(tickBudget.lastAdvanceMinutes);
+
+  if (
+    targetTickMs === null ||
+    avgTickMs === null ||
+    budgetDeltaMs === null ||
+    budgetRatio === null ||
+    totalRuns === null ||
+    totalFailures === null ||
+    failureRate === null ||
+    avgAdvanceMinutes === null ||
+    lastTickMs === null ||
+    lastAdvanceMinutes === null
+  ) {
+    return null;
+  }
+
+  return {
+    targetTickMs,
+    avgTickMs,
+    budgetDeltaMs,
+    budgetRatio,
+    totalRuns,
+    totalFailures,
+    failureRate,
+    avgAdvanceMinutes,
+    lastTickMs,
+    lastAdvanceMinutes
+  };
+}
+
+function formatNumber(value: number, decimals: number = 2): string {
+  return value.toLocaleString(undefined, {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals
+  });
+}
 
 const auditChartColors = [
   "#4aa8ff",
@@ -306,7 +382,6 @@ function hasUnrenderedComplexDashboardStats(stats: Record<string, unknown> | nul
 }
 
 export function AdminModal(props: AdminModalProps) {
-	const [chatRealmTargetMode, setChatRealmTargetMode] = useState<"all" | "single" | "list">("single");
   const [adminTab, setAdminTab] = useState<AdminTab>("dashboard");
   const [actionBusy, setActionBusy] = useState(false);
   const [loadBusy, setLoadBusy] = useState(false);
@@ -320,13 +395,19 @@ export function AdminModal(props: AdminModalProps) {
   const [adminCharacters, setAdminCharacters] = useState<AdminCharacterEntry[]>([]);
   const [adminChatChannels, setAdminChatChannels] = useState<AdminChatChannelEntry[]>([]);
   const [realmAccessEntries, setRealmAccessEntries] = useState<AdminRealmAccessEntry[]>([]);
+  const [adminSegmentErrors, setAdminSegmentErrors] = useState<Partial<Record<AdminDataSegment, string>>>({});
+  const [adminSegmentBusy, setAdminSegmentBusy] = useState<Partial<Record<AdminDataSegment, boolean>>>({});
 
   const [realmActionRealm, setRealmActionRealm] = useState("1");
-  const [realmActionType, setRealmActionType] = useState("realm_create");
+  const [realmActionType, setRealmActionType] = useState("realm_pause");
   const [realmActionReason, setRealmActionReason] = useState("ops");
   const [realmActionNote, setRealmActionNote] = useState("");
   const [realmActionItemKey, setRealmActionItemKey] = useState("");
   const [realmActionPrice, setRealmActionPrice] = useState("");
+  const [realmCreateName, setRealmCreateName] = useState("");
+  const [realmCreateWhitelistOnly, setRealmCreateWhitelistOnly] = useState(false);
+  const [realmCreateReason, setRealmCreateReason] = useState("realm_create");
+  const [realmCreateNote, setRealmCreateNote] = useState("");
   const [realmConfigName, setRealmConfigName] = useState("Realm 1");
   const [realmConfigWhitelistOnly, setRealmConfigWhitelistOnly] = useState(false);
   const [realmAccessAccountId, setRealmAccessAccountId] = useState("");
@@ -346,17 +427,18 @@ export function AdminModal(props: AdminModalProps) {
   const [characterEditPrimary, setCharacterEditPrimary] = useState(false);
   const [characterEditReason, setCharacterEditReason] = useState("moderation");
 
-  const [chatAdminChannel, setChatAdminChannel] = useState("global");
-  const [chatChannelInputMode, setChatChannelInputMode] = useState<"known" | "new">("known");
-  const [chatAdminKnownBinding, setChatAdminKnownBinding] = useState("1:global");
-  const [chatAdminKnownChannel, setChatAdminKnownChannel] = useState("global");
-  const [chatAdminNewChannel, setChatAdminNewChannel] = useState("");
-  const [chatAdminRealmId, setChatAdminRealmId] = useState("1");
+  const [chatCreateRealmId, setChatCreateRealmId] = useState("1");
+  const [chatCreateKey, setChatCreateKey] = useState("");
+  const [chatCreateName, setChatCreateName] = useState("");
+  const [chatCreateSubject, setChatCreateSubject] = useState("");
+  const [chatCreateDescription, setChatCreateDescription] = useState("");
+  const [chatEditBinding, setChatEditBinding] = useState("global");
+  const [chatEditName, setChatEditName] = useState("");
+  const [chatEditSubject, setChatEditSubject] = useState("");
+  const [chatEditDescription, setChatEditDescription] = useState("");
+  const [chatAssignmentChannelKey, setChatAssignmentChannelKey] = useState("global");
+  const [chatAssignmentRealmId, setChatAssignmentRealmId] = useState("1");
   const [chatAdminOpRealmId, setChatAdminOpRealmId] = useState("1");
-  const [chatAdminRealmList, setChatAdminRealmList] = useState("");
-  const [chatAdminName, setChatAdminName] = useState("Global");
-  const [chatAdminSubject, setChatAdminSubject] = useState("");
-  const [chatAdminDescription, setChatAdminDescription] = useState("");
   const [chatAdminAccountId, setChatAdminAccountId] = useState("");
   const [chatAdminAction, setChatAdminAction] = useState<"ban" | "unban" | "kick">("ban");
   const [chatAdminDuration, setChatAdminDuration] = useState("30");
@@ -396,58 +478,64 @@ export function AdminModal(props: AdminModalProps) {
       });
   }, [adminChatChannels, adminRealms]);
 
-  const selectedKnownBinding = useMemo(() => {
-    return knownChannelBindings.find((entry) => entry.value === chatAdminKnownBinding);
-  }, [chatAdminKnownBinding, knownChannelBindings]);
+  const knownChannelKeys = useMemo(() => {
+    const keys = new Map<string, { key: string; realmId: number }>();
+    for (const entry of knownChannelBindings) {
+      const normalized = entry.key.toLowerCase();
+      if (!keys.has(normalized)) {
+        keys.set(normalized, { key: entry.key, realmId: entry.realmId });
+      }
+    }
+    return Array.from(keys.values()).sort((left, right) => left.key.localeCompare(right.key));
+  }, [knownChannelBindings]);
 
-  const knownChannelBindingKey = selectedKnownBinding?.key || "global";
-  const knownChannelBindingRealmId = selectedKnownBinding?.realmId;
+  const selectedEditBinding = useMemo(() => {
+    const normalized = chatEditBinding.trim().toLowerCase();
+    return knownChannelBindings.find((entry) => entry.key.toLowerCase() === normalized);
+  }, [chatEditBinding, knownChannelBindings]);
+
+  const selectedAssignmentChannel = useMemo(() => {
+    const normalized = chatAssignmentChannelKey.trim().toLowerCase();
+    return adminChatChannels.find((entry) => entry.key.toLowerCase() === normalized);
+  }, [adminChatChannels, chatAssignmentChannelKey]);
+
+  const activeChannelKey = selectedEditBinding?.key || "global";
 
   useEffect(() => {
-    if (knownChannelBindings.length <= 0) {
+    if (knownChannelKeys.length <= 0) {
       return;
     }
 
-    if (!knownChannelBindings.some((entry) => entry.value === chatAdminKnownBinding)) {
-      setChatAdminKnownBinding(knownChannelBindings[0].value);
+    if (!knownChannelKeys.some((entry) => entry.key.toLowerCase() === chatEditBinding.toLowerCase())) {
+      setChatEditBinding(knownChannelKeys[0].key.toLowerCase());
     }
-  }, [chatAdminKnownBinding, knownChannelBindings]);
+  }, [chatEditBinding, knownChannelKeys]);
 
   useEffect(() => {
-    setChatAdminKnownChannel(knownChannelBindingKey);
-  }, [knownChannelBindingKey]);
-
-  useEffect(() => {
-    const selected = chatChannelInputMode === "known" ? chatAdminKnownChannel : chatAdminNewChannel;
-    setChatAdminChannel(selected.trim() || "global");
-  }, [chatAdminKnownChannel, chatAdminNewChannel, chatChannelInputMode]);
-
-  const selectedKnownChannelEntry = useMemo(() => {
-    if (chatChannelInputMode !== "known") {
-      return undefined;
-    }
-
-    const key = knownChannelBindingKey.trim().toLowerCase();
-    const realmId = knownChannelBindingRealmId;
-    if (!key || !realmId) {
-      return undefined;
-    }
-
-    return adminChatChannels.find((entry) => entry.key.toLowerCase() === key && entry.realmId === realmId);
-  }, [adminChatChannels, chatChannelInputMode, knownChannelBindingKey, knownChannelBindingRealmId]);
-
-  useEffect(() => {
-    if (!selectedKnownChannelEntry) {
+    if (knownChannelKeys.length <= 0) {
       return;
     }
 
-    setChatAdminName(selectedKnownChannelEntry.name || chatAdminKnownChannel);
-    setChatAdminSubject(selectedKnownChannelEntry.subject ?? "");
-    setChatAdminDescription(selectedKnownChannelEntry.description ?? "");
-    setChatAdminRealmId(String(selectedKnownChannelEntry.realmId));
-    setChatAdminOpRealmId(String(selectedKnownChannelEntry.realmId));
-    setChatRealmTargetMode("single");
-  }, [chatAdminKnownChannel, selectedKnownChannelEntry]);
+    if (!knownChannelKeys.some((entry) => entry.key.toLowerCase() === chatAssignmentChannelKey.toLowerCase())) {
+      setChatAssignmentChannelKey(knownChannelKeys[0].key.toLowerCase());
+    }
+  }, [chatAssignmentChannelKey, knownChannelKeys]);
+
+  useEffect(() => {
+    if (!selectedEditBinding) {
+      return;
+    }
+
+    const entry = adminChatChannels.find((channel) => channel.realmId === selectedEditBinding.realmId && channel.key.toLowerCase() === selectedEditBinding.key.toLowerCase());
+    if (!entry) {
+      return;
+    }
+
+    setChatEditName(entry.name || selectedEditBinding.key);
+    setChatEditSubject(entry.subject ?? "");
+    setChatEditDescription(entry.description ?? "");
+    setChatAdminOpRealmId(String(entry.realmId));
+  }, [adminChatChannels, selectedEditBinding]);
 
   const availableRealmIds = adminRealms
     .map((entry) => entry.realmId)
@@ -495,56 +583,8 @@ export function AdminModal(props: AdminModalProps) {
     })();
   }, [props.open, realmActionRealm]);
 
-  const resolveChatRealmTargets = useCallback((): number[] => {
-    const knownRealmIds = availableRealmIds.length > 0 ? availableRealmIds : [1];
-
-    if (chatRealmTargetMode === "all") {
-      return knownRealmIds;
-    }
-
-    if (chatRealmTargetMode === "single") {
-      const singleRealmId = parseNumber(chatAdminRealmId);
-      if (!singleRealmId || singleRealmId <= 0) {
-        throw new Error("select a valid realm");
-      }
-      return [singleRealmId];
-    }
-
-    const parsed = parseRealmList(chatAdminRealmList);
-    if (parsed.allRealms) {
-      return knownRealmIds;
-    }
-
-    if (parsed.realmIds.length === 0) {
-      throw new Error("enter at least one realm id in the realm list");
-    }
-
-    return parsed.realmIds;
-  }, [availableRealmIds, chatAdminRealmId, chatAdminRealmList, chatRealmTargetMode]);
-
-  const runChatActionAcrossRealms = useCallback(async (runner: (realmId: number) => Promise<void>): Promise<RealmActionSummary> => {
-    const targets = resolveChatRealmTargets();
-    const summary: RealmActionSummary = {
-      targetRealmIds: targets,
-      succeededRealmIds: [],
-      failed: []
-    };
-
-    for (const realmId of targets) {
-      try {
-        await runner(realmId);
-        summary.succeededRealmIds.push(realmId);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        summary.failed.push({ realmId, reason: message });
-      }
-    }
-
-    return summary;
-  }, [resolveChatRealmTargets]);
-
   const runChatActionForOperationRealm = useCallback(async (runner: (realmId: number) => Promise<void>): Promise<RealmActionSummary> => {
-    const targetRealmId = parseNumber(chatAdminOpRealmId) ?? parseNumber(chatAdminRealmId) ?? 1;
+    const targetRealmId = parseNumber(chatAdminOpRealmId) ?? 1;
     const summary: RealmActionSummary = {
       targetRealmIds: [targetRealmId],
       succeededRealmIds: [],
@@ -560,25 +600,35 @@ export function AdminModal(props: AdminModalProps) {
     }
 
     return summary;
-  }, [chatAdminOpRealmId, chatAdminRealmId]);
+  }, [chatAdminOpRealmId]);
 
   useEffect(() => {
-    if (chatRealmTargetMode !== "single") {
-      return;
-    }
-
     if (availableRealmIds.length === 0) {
-      if (chatAdminRealmId !== "1") {
-        setChatAdminRealmId("1");
+      if (chatCreateRealmId !== "1") {
+        setChatCreateRealmId("1");
       }
       return;
     }
 
-    const current = parseNumber(chatAdminRealmId);
+    const current = parseNumber(chatCreateRealmId);
     if (!current || !availableRealmIds.includes(current)) {
-      setChatAdminRealmId(String(availableRealmIds[0]));
+      setChatCreateRealmId(String(availableRealmIds[0]));
     }
-  }, [availableRealmIds, chatAdminRealmId, chatRealmTargetMode]);
+  }, [availableRealmIds, chatCreateRealmId]);
+
+  useEffect(() => {
+    if (availableRealmIds.length === 0) {
+      if (chatAssignmentRealmId !== "1") {
+        setChatAssignmentRealmId("1");
+      }
+      return;
+    }
+
+    const current = parseNumber(chatAssignmentRealmId);
+    if (!current || !availableRealmIds.includes(current)) {
+      setChatAssignmentRealmId(String(availableRealmIds[0]));
+    }
+  }, [availableRealmIds, chatAssignmentRealmId]);
 
   useEffect(() => {
     if (availableRealmIds.length === 0) {
@@ -631,71 +681,117 @@ export function AdminModal(props: AdminModalProps) {
 
   const auditRealmDistribution = auditRealmAggregate ?? distributionBy(adminAudit, (entry) => `realm ${entry.realmId}`);
   const auditRealmSourceLabel = auditRealmAggregate ? "Aggregated" : "Fallback";
+  const tickBudgetSummary = parseTickBudgetSummary(adminStats);
+  const tickBudgetUsagePercent = tickBudgetSummary
+    ? Math.max(0, Math.min(100, tickBudgetSummary.budgetRatio * 100))
+    : 0;
+  const tickBudgetDeltaLabel = tickBudgetSummary
+    ? tickBudgetSummary.budgetDeltaMs <= 0
+      ? `${formatNumber(Math.abs(tickBudgetSummary.budgetDeltaMs))} ms under budget`
+      : `${formatNumber(tickBudgetSummary.budgetDeltaMs)} ms over budget`
+    : "";
+
+  const loadAdminSegment = useCallback(async (segment: AdminDataSegment): Promise<void> => {
+    const selectedRealmID = parseNumber(realmActionRealm) ?? 1;
+    switch (segment) {
+      case "realms": {
+        const realms = await adminGetRealms();
+        setAdminRealms(realms.realms ?? []);
+        return;
+      }
+      case "stats": {
+        const stats = await adminGetStats();
+        setAdminStats(stats);
+        return;
+      }
+      case "chatChannels": {
+        const channels = await adminChatListChannels({ includeInactive: true });
+        setAdminChatChannels(channels.channels ?? []);
+        return;
+      }
+      case "realmAccess": {
+        const access = await adminListRealmAccess(selectedRealmID);
+        setRealmAccessEntries(access.entries ?? []);
+        return;
+      }
+      case "wordlist": {
+        const wordlist = await adminChatWordlistList();
+        setAdminWordRules(wordlist.rules ?? []);
+        return;
+      }
+      case "audit": {
+        const audit = await adminAuditList({ limit: 50 });
+        setAdminAudit(audit.entries ?? []);
+        return;
+      }
+      case "characters": {
+        const characters = await adminListCharacters({ limit: 50 });
+        setAdminCharacters(characters.entries ?? []);
+        return;
+      }
+      default:
+        return;
+    }
+  }, [realmActionRealm]);
 
   const loadAdmin = useCallback(async () => {
-    const selectedRealmID = parseNumber(realmActionRealm) ?? 1;
-    const results = await Promise.allSettled([
-      adminGetRealms(),
-      adminGetStats(),
-      adminChatListChannels(),
-      adminListRealmAccess(selectedRealmID),
-      adminChatWordlistList(),
-      adminAuditList({ limit: 50 }),
-      adminListCharacters({ limit: 50 })
-    ]);
+    const segments: AdminDataSegment[] = ["realms", "stats", "chatChannels", "realmAccess", "wordlist", "audit", "characters"];
+    setAdminSegmentBusy((prev) => {
+      const next = { ...prev };
+      for (const segment of segments) {
+        next[segment] = true;
+      }
+      return next;
+    });
 
-    const [realmsResult, statsResult, channelsResult, realmAccessResult, wordsResult, auditResult, characterResult] = results;
-    const failures: string[] = [];
+    const results = await Promise.allSettled(segments.map((segment) => loadAdminSegment(segment)));
 
-    if (realmsResult.status === "fulfilled") {
-      setAdminRealms(realmsResult.value.realms ?? []);
-    } else {
-      failures.push("realms");
+    const nextErrors: Partial<Record<AdminDataSegment, string>> = {};
+    for (let index = 0; index < segments.length; index++) {
+      const segment = segments[index];
+      const result = results[index];
+      if (result.status === "rejected") {
+        const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        nextErrors[segment] = message;
+      }
     }
+    setAdminSegmentErrors(nextErrors);
 
-    if (statsResult.status === "fulfilled") {
-      setAdminStats(statsResult.value);
-    } else {
-      failures.push("stats");
-    }
+    setAdminSegmentBusy((prev) => {
+      const next = { ...prev };
+      for (const segment of segments) {
+        next[segment] = false;
+      }
+      return next;
+    });
 
-    if (channelsResult.status === "fulfilled") {
-      setAdminChatChannels(channelsResult.value.channels ?? []);
-    } else {
-      failures.push("chat channels");
-    }
-
-    if (realmAccessResult.status === "fulfilled") {
-      setRealmAccessEntries(realmAccessResult.value.entries ?? []);
-    } else {
-      failures.push("realm access");
-    }
-
-    if (wordsResult.status === "fulfilled") {
-      setAdminWordRules(wordsResult.value.rules ?? []);
-    } else {
-      failures.push("wordlist");
-    }
-
-    if (auditResult.status === "fulfilled") {
-      setAdminAudit(auditResult.value.entries ?? []);
-    } else {
-      failures.push("audit");
-    }
-
-    if (characterResult.status === "fulfilled") {
-      setAdminCharacters(characterResult.value.entries ?? []);
-    } else {
-      failures.push("characters");
-    }
-
+    const failures = Object.keys(nextErrors).map((key) => adminDataSegmentLabels[key as AdminDataSegment]);
     if (failures.length > 0) {
       setError(`Some admin data failed to load: ${failures.join(", ")}. You can still use other tabs.`);
       return;
     }
 
     setError(null);
-  }, [realmActionRealm]);
+  }, [loadAdminSegment]);
+
+  const retryAdminSegment = useCallback(async (segment: AdminDataSegment) => {
+    setAdminSegmentBusy((prev) => ({ ...prev, [segment]: true }));
+    try {
+      await loadAdminSegment(segment);
+      setAdminSegmentErrors((prev) => {
+        const next = { ...prev };
+        delete next[segment];
+        return next;
+      });
+      setNotice(`Reloaded ${adminDataSegmentLabels[segment]}.`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setAdminSegmentErrors((prev) => ({ ...prev, [segment]: message }));
+      setError(`Failed to reload ${adminDataSegmentLabels[segment]}: ${message}`);
+    } finally {
+      setAdminSegmentBusy((prev) => ({ ...prev, [segment]: false }));
+    }
+  }, [loadAdminSegment]);
 
   const refreshAdmin = useCallback(async () => {
     setLoadBusy(true);
@@ -739,6 +835,49 @@ export function AdminModal(props: AdminModalProps) {
     }
   };
 
+  const renderTabDataStatus = useCallback((segments: AdminDataSegment[]) => {
+    if (segments.length <= 0) {
+      return null;
+    }
+
+    const busySegments = segments.filter((segment) => !!adminSegmentBusy[segment]);
+    const failedSegments = segments.filter((segment) => !!adminSegmentErrors[segment]);
+
+    if (busySegments.length <= 0 && failedSegments.length <= 0) {
+      return null;
+    }
+
+    return (
+      <div className="column-form">
+        <h3>Tab data status</h3>
+        {busySegments.length > 0 ? <p className="muted">Loading: {busySegments.map((segment) => adminDataSegmentLabels[segment]).join(", ")}</p> : null}
+        {failedSegments.length > 0 ? <p className="notice error">Failed: {failedSegments.map((segment) => adminDataSegmentLabels[segment]).join(", ")}</p> : null}
+        {failedSegments.length > 0 ? (
+          <div className="button-row">
+            {failedSegments.map((segment) => (
+              <button
+                key={segment}
+                type="button"
+                onClick={() => void retryAdminSegment(segment)}
+                disabled={actionBusy || !!adminSegmentBusy[segment]}
+              >
+                {adminSegmentBusy[segment] ? `Retrying ${adminDataSegmentLabels[segment]}...` : `Retry ${adminDataSegmentLabels[segment]}`}
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    );
+  }, [actionBusy, adminSegmentBusy, adminSegmentErrors, retryAdminSegment]);
+
+  const activeTabSegments = adminTabDataDependencies[adminTab];
+  const activeTabSegmentFailures = activeTabSegments.filter((segment) => !!adminSegmentErrors[segment]);
+  const activeTabStatusText = activeTabSegments.length === 0
+    ? "No tab-specific data dependencies."
+    : activeTabSegments
+        .map((segment) => `${adminDataSegmentLabels[segment]}:${adminSegmentErrors[segment] ? "error" : "ok"}`)
+        .join(" · ");
+
   if (!props.open) {
     return null;
   }
@@ -767,9 +906,26 @@ export function AdminModal(props: AdminModalProps) {
             <button className={adminTab === "wordlist" ? "active" : ""} onClick={() => setAdminTab("wordlist")} type="button">Wordlist</button>
             <button className={adminTab === "audit" ? "active" : ""} onClick={() => setAdminTab("audit")} type="button">Audit</button>
           </div>
+          <p className="muted">Tab data health: {activeTabStatusText}</p>
+          {activeTabSegmentFailures.length > 0 ? (
+            <div className="button-row">
+              {activeTabSegmentFailures.map((segment) => (
+                <button
+                  key={segment}
+                  type="button"
+                  onClick={() => void retryAdminSegment(segment)}
+                  disabled={actionBusy || !!adminSegmentBusy[segment]}
+                >
+                  {adminSegmentBusy[segment] ? `Retrying ${adminDataSegmentLabels[segment]}...` : `Retry ${adminDataSegmentLabels[segment]}`}
+                </button>
+              ))}
+            </div>
+          ) : null}
         </div>
 
         <div className="admin-body">
+          {renderTabDataStatus(activeTabSegments)}
+
           {adminTab === "dashboard" ? (
             <div className="split-grid">
               <div>
@@ -782,6 +938,35 @@ export function AdminModal(props: AdminModalProps) {
                     </div>
                   ))}
                 </div>
+                {tickBudgetSummary ? (
+                  <div className="info-card">
+                    <h4>Tick Budget</h4>
+                    <div className="stat-grid">
+                      <div className="stat-tile">
+                        <span className="stat-label">Average Tick</span>
+                        <div className="stat-values"><strong>{formatNumber(tickBudgetSummary.avgTickMs)} ms</strong></div>
+                      </div>
+                      <div className="stat-tile">
+                        <span className="stat-label">Target Tick</span>
+                        <div className="stat-values"><strong>{formatNumber(tickBudgetSummary.targetTickMs)} ms</strong></div>
+                      </div>
+                      <div className="stat-tile">
+                        <span className="stat-label">Avg Advance</span>
+                        <div className="stat-values"><strong>{formatNumber(tickBudgetSummary.avgAdvanceMinutes)} min</strong></div>
+                      </div>
+                      <div className="stat-tile">
+                        <span className="stat-label">Failure Rate</span>
+                        <div className="stat-values"><strong>{formatNumber(tickBudgetSummary.failureRate * 100)}%</strong></div>
+                      </div>
+                    </div>
+                    <div className="progress-wrap stat-progress" aria-label="tick budget usage">
+                      <div className="progress-bar" style={{ width: `${tickBudgetUsagePercent}%` }} />
+                    </div>
+                    <p className="muted">
+                      Usage {formatNumber(tickBudgetSummary.budgetRatio * 100)}% · {tickBudgetDeltaLabel} · last tick {formatNumber(tickBudgetSummary.lastTickMs)} ms · runs {formatNumber(tickBudgetSummary.totalRuns, 0)} · failures {formatNumber(tickBudgetSummary.totalFailures, 0)}
+                    </p>
+                  </div>
+                ) : null}
                 {hasUnrenderedComplexDashboardStats(adminStats) ? (
                   <p className="muted">Additional complex dashboard stats are present but not first-class rendered yet.</p>
                 ) : (
@@ -812,7 +997,7 @@ export function AdminModal(props: AdminModalProps) {
           <div className="split-grid">
             <div className="column-form">
               <label>
-                Realm
+                Existing Realm
                 <select value={realmActionRealm} onChange={(event) => setRealmActionRealm(event.target.value)}>
                   {availableRealmIds.length === 0 ? <option value="1">Realm 1</option> : null}
                   {availableRealmIds.map((realmId) => (
@@ -820,6 +1005,32 @@ export function AdminModal(props: AdminModalProps) {
                   ))}
                 </select>
               </label>
+
+              <h3>Create Realm</h3>
+              <label>Display Name<input value={realmCreateName} onChange={(event) => setRealmCreateName(event.target.value)} placeholder="Realm name (optional)" /></label>
+              <label>
+                <input type="checkbox" checked={realmCreateWhitelistOnly} onChange={(event) => setRealmCreateWhitelistOnly(event.target.checked)} />
+                Whitelist character creation
+              </label>
+              <label>Reason<input value={realmCreateReason} onChange={(event) => setRealmCreateReason(event.target.value)} /></label>
+              <label>Note<input value={realmCreateNote} onChange={(event) => setRealmCreateNote(event.target.value)} /></label>
+              <button type="button" onClick={() => {
+                let createdRealmId = 0;
+                return runAdminAction(async () => {
+                  const created = await adminCreateRealm({
+                    name: realmCreateName.trim() || undefined,
+                    whitelistOnly: realmCreateWhitelistOnly,
+                    reasonCode: realmCreateReason,
+                    note: realmCreateNote || undefined
+                  });
+                  createdRealmId = created.realmId;
+                  setRealmActionRealm(String(created.realmId));
+                }, () => createdRealmId > 0 ? `Realm ${createdRealmId} created.` : "Realm created.", () => {
+                  setRealmCreateName("");
+                  setRealmCreateWhitelistOnly(false);
+                  setRealmCreateNote("");
+                });
+              }} disabled={actionBusy}>Create realm</button>
 
               <h3>Realm Metadata</h3>
               <label>Display Name<input value={realmConfigName} onChange={(event) => setRealmConfigName(event.target.value)} /></label>
@@ -832,24 +1043,30 @@ export function AdminModal(props: AdminModalProps) {
                 if (!realmId) {
                   throw new Error("realm id is required");
                 }
-                await adminSetRealmConfig(realmId, { name: realmConfigName.trim(), whitelistOnly: realmConfigWhitelistOnly });
-              }, "Realm metadata updated.")} disabled={actionBusy}>Save metadata</button>
+                await adminSetRealmConfig(realmId, { command: "edit", name: realmConfigName.trim(), whitelistOnly: realmConfigWhitelistOnly });
+              }, "Realm metadata edited.")} disabled={actionBusy}>Edit metadata</button>
 
               <h3>Realm Actions</h3>
               <label>
                 Action
                 <select value={realmActionType} onChange={(event) => setRealmActionType(event.target.value)}>
-                  <option value="realm_create">realm_create</option>
                   <option value="realm_pause">realm_pause</option>
                   <option value="realm_resume">realm_resume</option>
+                  <option value="realm_decommission">realm_decommission</option>
+                  <option value="realm_recommission">realm_recommission</option>
+                  <option value="realm_delete">realm_delete</option>
                   <option value="market_reset_defaults">market_reset_defaults</option>
                   <option value="market_set_price">market_set_price</option>
                 </select>
               </label>
               <label>Reason<input value={realmActionReason} onChange={(event) => setRealmActionReason(event.target.value)} /></label>
               <label>Note<input value={realmActionNote} onChange={(event) => setRealmActionNote(event.target.value)} /></label>
-              <label>Item key (for market_set_price)<input value={realmActionItemKey} onChange={(event) => setRealmActionItemKey(event.target.value)} /></label>
-              <label>Price (for market_set_price)<input value={realmActionPrice} onChange={(event) => setRealmActionPrice(event.target.value)} /></label>
+              {realmActionType === "market_set_price" ? (
+                <>
+                  <label>Item key (for market_set_price)<input value={realmActionItemKey} onChange={(event) => setRealmActionItemKey(event.target.value)} /></label>
+                  <label>Price (for market_set_price)<input value={realmActionPrice} onChange={(event) => setRealmActionPrice(event.target.value)} /></label>
+                </>
+              ) : null}
               <button type="button" onClick={() => runAdminAction(async () => {
                 const realmId = parseNumber(realmActionRealm);
                 if (!realmId) {
@@ -941,12 +1158,13 @@ export function AdminModal(props: AdminModalProps) {
                 const accountId = parseNumber(accountTargetId);
                 if (!accountId) throw new Error("account id is required");
                 await adminSetAccountStatus(accountId, {
+                  command: "set_status",
                   status: accountStatus,
                   reasonCode: accountReason,
                   note: accountNote || undefined,
                   revokeSessions: accountStatus === "locked"
                 });
-              }, "Account status updated.")} disabled={actionBusy}>Set status</button>
+              }, "Account status command applied.")} disabled={actionBusy}>Apply status command</button>
             </div>
 
             <div className="column-form">
@@ -956,12 +1174,12 @@ export function AdminModal(props: AdminModalProps) {
                 <button type="button" onClick={() => runAdminAction(async () => {
                   const accountId = parseNumber(accountTargetId);
                   if (!accountId) throw new Error("account id is required");
-                  await adminSetAccountRole(accountId, { roleKey: accountRoleKey, action: "grant", reasonCode: accountReason, note: accountNote || undefined });
+                  await adminSetAccountRole(accountId, { command: "set_role", roleKey: accountRoleKey, action: "grant", reasonCode: accountReason, note: accountNote || undefined });
                 }, "Role granted.")} disabled={actionBusy}>Grant role</button>
                 <button type="button" onClick={() => runAdminAction(async () => {
                   const accountId = parseNumber(accountTargetId);
                   if (!accountId) throw new Error("account id is required");
-                  await adminSetAccountRole(accountId, { roleKey: accountRoleKey, action: "revoke", reasonCode: accountReason, note: accountNote || undefined });
+                  await adminSetAccountRole(accountId, { command: "set_role", roleKey: accountRoleKey, action: "revoke", reasonCode: accountReason, note: accountNote || undefined });
                 }, "Role revoked.")} disabled={actionBusy}>Revoke role</button>
               </div>
             </div>
@@ -1011,6 +1229,7 @@ export function AdminModal(props: AdminModalProps) {
                 const characterId = parseNumber(characterEditId);
                 if (!characterId) throw new Error("character id is required");
                 await adminModerateCharacter(characterId, {
+                  command: "edit",
                   name: characterEditName || undefined,
                   status: characterEditStatus,
                   isPrimary: characterEditPrimary,
@@ -1018,7 +1237,7 @@ export function AdminModal(props: AdminModalProps) {
                 });
                 const result = await adminListCharacters({ limit: 100 });
                 setAdminCharacters(result.entries ?? []);
-              }, "Character updated.")} disabled={actionBusy}>Apply character moderation</button>
+              }, "Character edit command applied.")} disabled={actionBusy}>Apply edit command</button>
             </div>
           </div>
         ) : null}
@@ -1026,114 +1245,175 @@ export function AdminModal(props: AdminModalProps) {
         {adminTab === "chat" ? (
           <div className="split-grid">
             <div className="column-form">
-              <h3>Channel management</h3>
+              <h3>Create channel</h3>
               <label>
-                Channel Input
-                <select value={chatChannelInputMode} onChange={(event) => setChatChannelInputMode(event.target.value as "known" | "new")}>
-                  <option value="known">Known channel</option>
-                  <option value="new">New channel key</option>
+                Realm
+                <select value={chatCreateRealmId} onChange={(event) => setChatCreateRealmId(event.target.value)}>
+                  {availableRealmIds.length === 0 ? <option value="1">Realm 1</option> : null}
+                  {availableRealmIds.map((realmId) => (
+                    <option key={realmId} value={String(realmId)}>{formatRealmOptionLabel(realmId)}</option>
+                  ))}
                 </select>
               </label>
-              {chatChannelInputMode === "known" ? (
-                <label>
-                  Known channel binding
-                  <select value={chatAdminKnownBinding} onChange={(event) => setChatAdminKnownBinding(event.target.value)}>
-                    {knownChannelBindings.map((entry) => (
-                      <option key={entry.value} value={entry.value}>{entry.label}</option>
-                    ))}
-                  </select>
-                </label>
-              ) : (
-                <label>
-                <label>
-                  Operation Realm
-                  <select value={chatAdminOpRealmId} onChange={(event) => setChatAdminOpRealmId(event.target.value)}>
-                    {availableRealmIds.length === 0 ? <option value="1">Realm 1</option> : null}
-                    {availableRealmIds.map((realmId) => (
-                      <option key={realmId} value={String(realmId)}>{formatRealmOptionLabel(realmId)}</option>
-                    ))}
-                  </select>
-                </label>
-                  New channel key
-                  <input value={chatAdminNewChannel} onChange={(event) => setChatAdminNewChannel(event.target.value)} placeholder="new-channel-key" />
-                </label>
-              )}
-              <label>
-                Realm Target
-                <select value={chatRealmTargetMode} onChange={(event) => setChatRealmTargetMode(event.target.value as "all" | "single" | "list")}>
-                  <option value="all">* all realms</option>
-                  <option value="single">specific realm</option>
-                  <option value="list">list of realms</option>
-                </select>
-              </label>
-              {chatRealmTargetMode === "single" ? (
-                <label>
-                  Realm
-                  <select value={chatAdminRealmId} onChange={(event) => setChatAdminRealmId(event.target.value)}>
-                    {availableRealmIds.length === 0 ? <option value="1">Realm 1</option> : null}
-                    {availableRealmIds.map((realmId) => (
-                      <option key={realmId} value={String(realmId)}>{formatRealmOptionLabel(realmId)}</option>
-                    ))}
-                  </select>
-                </label>
-              ) : null}
-              {chatRealmTargetMode === "list" ? (
-                <label>
-                  Realm List
-                  <input
-                    value={chatAdminRealmList}
-                    onChange={(event) => setChatAdminRealmList(event.target.value)}
-                    placeholder="1,2,3 or *"
-                  />
-                </label>
-              ) : null}
-              <label>Name<input value={chatAdminName} onChange={(event) => setChatAdminName(event.target.value)} /></label>
-              <label>Subject<input value={chatAdminSubject} onChange={(event) => setChatAdminSubject(event.target.value)} /></label>
-              <label>Description<input value={chatAdminDescription} onChange={(event) => setChatAdminDescription(event.target.value)} /></label>
-              <div className="button-row">
-                <button type="button" onClick={() => {
-                  let summary: RealmActionSummary | null = null;
-                  return runAdminAction(async () => {
-                    summary = await runChatActionAcrossRealms(async (realmId) => {
-                      await adminChatUpsertChannel({ realmId, key: chatAdminChannel, name: chatAdminName, subject: chatAdminSubject || undefined, description: chatAdminDescription || undefined });
-                    });
-                    if (summary.succeededRealmIds.length <= 0) {
-                      throw new Error(`Channel upsert failed for all target realms: ${summary.failed.map((entry) => `${entry.realmId} (${entry.reason})`).join("; ")}`);
-                    }
-                  }, () => formatRealmActionSummary("Channel upsert completed.", summary), () => {
-                    setChatAdminSubject("");
-                    setChatAdminDescription("");
-                  });
-                }} disabled={actionBusy}>Upsert</button>
-                <button type="button" onClick={() => {
-                  let summary: RealmActionSummary | null = null;
-                  return runAdminAction(async () => {
-                    summary = await runChatActionForOperationRealm(async (realmId) => {
-                      await adminChatDisableChannel(chatAdminChannel, { realmId });
-                    });
-                    if (summary.succeededRealmIds.length <= 0) {
-                      throw new Error(`Channel disable failed for all target realms: ${summary.failed.map((entry) => `${entry.realmId} (${entry.reason})`).join("; ")}`);
-                    }
-                  }, () => formatRealmActionSummary("Channel disable completed.", summary));
-                }} disabled={actionBusy}>Disable</button>
-              </div>
-              <button type="button" onClick={() => {
-                let summary: RealmActionSummary | null = null;
-                return runAdminAction(async () => {
-                  summary = await runChatActionForOperationRealm(async (realmId) => {
-                    await adminChatFlushChannel(chatAdminChannel, { realmId, reasonCode: chatAdminReason, note: chatAdminNote || undefined });
-                  });
-                  if (summary.succeededRealmIds.length <= 0) {
-                    throw new Error(`Channel flush failed for all target realms: ${summary.failed.map((entry) => `${entry.realmId} (${entry.reason})`).join("; ")}`);
-                  }
-                }, () => formatRealmActionSummary("Channel flush completed.", summary), () => {
-                  setChatAdminNote("");
+              <label>Channel Key<input value={chatCreateKey} onChange={(event) => setChatCreateKey(event.target.value)} placeholder="new-channel-key" /></label>
+              <label>Name<input value={chatCreateName} onChange={(event) => setChatCreateName(event.target.value)} /></label>
+              <label>Subject<input value={chatCreateSubject} onChange={(event) => setChatCreateSubject(event.target.value)} /></label>
+              <label>Description<input value={chatCreateDescription} onChange={(event) => setChatCreateDescription(event.target.value)} /></label>
+              <button type="button" onClick={() => runAdminAction(async () => {
+                const realmId = parseNumber(chatCreateRealmId);
+                const key = chatCreateKey.trim();
+                const name = chatCreateName.trim();
+                if (!realmId) throw new Error("create realm is required");
+                if (!key) throw new Error("channel key is required");
+                if (!name) throw new Error("channel name is required");
+
+                await adminChatCreateChannel({
+                  realmId,
+                  key,
+                  name,
+                  subject: chatCreateSubject.trim() || undefined,
+                  description: chatCreateDescription.trim() || undefined
                 });
-              }} disabled={actionBusy}>Flush messages</button>
+
+                setChatEditBinding(key.toLowerCase());
+                setChatAssignmentChannelKey(key.toLowerCase());
+              }, "Channel created.", () => {
+                setChatCreateKey("");
+                setChatCreateName("");
+                setChatCreateSubject("");
+                setChatCreateDescription("");
+              })} disabled={actionBusy}>Create channel key + binding</button>
+
+              <h3>Edit channel</h3>
+              <p className="muted">Channel metadata (name/subject/description) is global per channel key across realm bindings.</p>
+              <label>
+                Channel key
+                <select value={chatEditBinding} onChange={(event) => setChatEditBinding(event.target.value)}>
+                  {knownChannelKeys.map((entry) => (
+                    <option key={entry.key} value={entry.key.toLowerCase()}>{entry.key}</option>
+                  ))}
+                </select>
+              </label>
+              <label>Name<input value={chatEditName} onChange={(event) => setChatEditName(event.target.value)} /></label>
+              <label>Subject<input value={chatEditSubject} onChange={(event) => setChatEditSubject(event.target.value)} /></label>
+              <label>Description<input value={chatEditDescription} onChange={(event) => setChatEditDescription(event.target.value)} /></label>
+              <button type="button" onClick={() => runAdminAction(async () => {
+                if (!selectedEditBinding) {
+                  throw new Error("select a channel key to edit");
+                }
+                const name = chatEditName.trim();
+                if (!name) {
+                  throw new Error("channel name is required");
+                }
+
+                await adminChatEditChannel({
+                  realmId: selectedEditBinding.realmId,
+                  key: selectedEditBinding.key,
+                  name,
+                  subject: chatEditSubject.trim() || undefined,
+                  description: chatEditDescription.trim() || undefined
+                });
+              }, "Channel metadata updated.")} disabled={actionBusy}>Save global metadata</button>
+
+              <h3>Realm membership</h3>
+              <label>
+                Source channel key
+                <select value={chatAssignmentChannelKey} onChange={(event) => setChatAssignmentChannelKey(event.target.value)}>
+                  {knownChannelKeys.map((entry) => (
+                    <option key={entry.key} value={entry.key.toLowerCase()}>{entry.key}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Target realm
+                <select value={chatAssignmentRealmId} onChange={(event) => setChatAssignmentRealmId(event.target.value)}>
+                  {availableRealmIds.length === 0 ? <option value="1">Realm 1</option> : null}
+                  {availableRealmIds.map((realmId) => (
+                    <option key={realmId} value={String(realmId)}>{formatRealmOptionLabel(realmId)}</option>
+                  ))}
+                </select>
+              </label>
+              <div className="button-row">
+                <button type="button" onClick={() => runAdminAction(async () => {
+                  const targetRealmId = parseNumber(chatAssignmentRealmId);
+                  if (!targetRealmId) {
+                    throw new Error("target realm is required");
+                  }
+                  if (!selectedAssignmentChannel) {
+                    throw new Error("source channel key is required");
+                  }
+
+                  await adminChatAttachChannel({
+                    realmId: targetRealmId,
+                    key: selectedAssignmentChannel.key
+                  });
+                }, "Channel binding added to realm.")} disabled={actionBusy}>Attach key to realm</button>
+                <button type="button" onClick={() => runAdminAction(async () => {
+                  const targetRealmId = parseNumber(chatAssignmentRealmId);
+                  if (!targetRealmId) {
+                    throw new Error("target realm is required");
+                  }
+                  if (!selectedAssignmentChannel) {
+                    throw new Error("source channel key is required");
+                  }
+
+                  await adminChatDisableChannel(selectedAssignmentChannel.key, { realmId: targetRealmId });
+                }, "Channel binding removed from realm.")} disabled={actionBusy}>Detach key from realm</button>
+              </div>
+
+              <div>
+                <h4>Active channel bindings</h4>
+                <table className="mini-table">
+                  <thead><tr><th>Channel</th><th>Realm</th><th>Name</th></tr></thead>
+                  <tbody>
+                    {adminChatChannels.filter((entry) => entry.active !== false).length === 0 ? (
+                      <tr><td colSpan={3}>No active channel bindings.</td></tr>
+                    ) : (
+                      adminChatChannels.filter((entry) => entry.active !== false).map((entry) => (
+                        <tr key={`${entry.realmId}:${entry.key}`}>
+                          <td>{entry.key}</td>
+                          <td>{entry.realmId}</td>
+                          <td>{entry.name}</td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
             </div>
 
             <div className="column-form">
               <h3>Moderation + system message</h3>
+              <label>
+                Channel key
+                <select value={chatEditBinding} onChange={(event) => setChatEditBinding(event.target.value)}>
+                  {knownChannelKeys.map((entry) => (
+                    <option key={entry.key} value={entry.key.toLowerCase()}>{entry.key}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Operation realm
+                <select value={chatAdminOpRealmId} onChange={(event) => setChatAdminOpRealmId(event.target.value)}>
+                  {availableRealmIds.length === 0 ? <option value="1">Realm 1</option> : null}
+                  {availableRealmIds.map((realmId) => (
+                    <option key={realmId} value={String(realmId)}>{formatRealmOptionLabel(realmId)}</option>
+                  ))}
+                </select>
+              </label>
+              <button type="button" onClick={() => {
+                let summary: RealmActionSummary | null = null;
+                return runAdminAction(async () => {
+                  summary = await runChatActionForOperationRealm(async (realmId) => {
+                    await adminChatFlushChannel(activeChannelKey, { realmId, reasonCode: chatAdminReason, note: chatAdminNote || undefined });
+                  });
+                  if (summary.succeededRealmIds.length <= 0) {
+                    throw new Error(`Channel flush failed for operation realm: ${summary.failed.map((entry) => `${entry.realmId} (${entry.reason})`).join("; ")}`);
+                  }
+                }, () => formatRealmActionSummary("Channel flush completed.", summary), () => {
+                  setChatAdminNote("");
+                });
+              }} disabled={actionBusy}>Flush channel messages</button>
               <label>Account ID<input value={chatAdminAccountId} onChange={(event) => setChatAdminAccountId(event.target.value)} /></label>
               <label>
                 Action
@@ -1152,7 +1432,7 @@ export function AdminModal(props: AdminModalProps) {
                   const accountId = parseNumber(chatAdminAccountId);
                   if (!accountId) throw new Error("account id is required");
                   summary = await runChatActionForOperationRealm(async (realmId) => {
-                    await adminChatModerateChannel(chatAdminChannel, {
+                    await adminChatModerateChannel(activeChannelKey, {
                       realmId,
                       accountId,
                       action: chatAdminAction,
@@ -1172,7 +1452,7 @@ export function AdminModal(props: AdminModalProps) {
                 let summary: RealmActionSummary | null = null;
                 return runAdminAction(async () => {
                   summary = await runChatActionForOperationRealm(async (realmId) => {
-                    await adminChatSystemMessage(chatAdminChannel, {
+                    await adminChatSystemMessage(activeChannelKey, {
                       realmId,
                       message: chatAdminSystemMessage,
                       reasonCode: chatAdminReason,

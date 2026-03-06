@@ -66,6 +66,8 @@ type Config struct {
 	IdempotencyTTL           time.Duration
 	StreamMaxConnsPerAccount int
 	StreamMaxConnsPerSession int
+	StreamAllowQueryAccessToken bool
+	StreamAllowedOrigins        []string
 }
 
 func LoadFromEnv() Config {
@@ -117,6 +119,8 @@ func LoadFromEnv() Config {
 	idempotencyTTL := getDurationOrDefault("LIVED_IDEMPOTENCY_TTL", 10*time.Minute)
 	streamMaxConnsPerAccount := getIntOrDefault("LIVED_STREAM_MAX_CONNS_PER_ACCOUNT", 5)
 	streamMaxConnsPerSession := getIntOrDefault("LIVED_STREAM_MAX_CONNS_PER_SESSION", 2)
+	streamAllowQueryAccessToken := getBoolOrDefault("LIVED_STREAM_QUERY_ACCESS_TOKEN_ENABLED", false)
+	streamAllowedOrigins := getCSVOrDefault("LIVED_STREAM_ALLOWED_ORIGINS", nil)
 
 	databaseURL := os.Getenv("LIVED_DATABASE_URL")
 	if databaseURL == "" {
@@ -158,6 +162,8 @@ func LoadFromEnv() Config {
 			IdempotencyTTL:           idempotencyTTL,
 			StreamMaxConnsPerAccount: streamMaxConnsPerAccount,
 			StreamMaxConnsPerSession: streamMaxConnsPerSession,
+			StreamAllowQueryAccessToken: streamAllowQueryAccessToken,
+			StreamAllowedOrigins:        streamAllowedOrigins,
 		}
 	}
 
@@ -194,7 +200,29 @@ func LoadFromEnv() Config {
 		IdempotencyTTL:           idempotencyTTL,
 		StreamMaxConnsPerAccount: streamMaxConnsPerAccount,
 		StreamMaxConnsPerSession: streamMaxConnsPerSession,
+		StreamAllowQueryAccessToken: streamAllowQueryAccessToken,
+		StreamAllowedOrigins:        streamAllowedOrigins,
 	}
+}
+
+func getCSVOrDefault(key string, fallback []string) []string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	if len(out) == 0 {
+		return fallback
+	}
+	return out
 }
 
 func getEnvOrDefault(key, fallback string) string {

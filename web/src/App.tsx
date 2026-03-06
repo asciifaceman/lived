@@ -33,7 +33,8 @@ import {
   setSession,
   subscribeSessionChanges,
   startBehavior,
-  startOnboarding
+  startOnboarding,
+  switchOnboardingCharacter
 } from "./api";
 import { AdminModal } from "./components/AdminModal";
 import { ChatView } from "./components/ChatView";
@@ -498,6 +499,11 @@ export function App() {
   const coreStatRows = useMemo(() => buildStatDisplayRows(coreStats), [coreStats]);
   const derivedStatRows = useMemo(() => buildStatDisplayRows(derivedStats), [derivedStats]);
   const stream = useWorldStream(selectedCharacter?.id, isLoggedIn && !!selectedCharacter?.id);
+  const streamErrorLabel = stream.lastError
+    ? stream.lastError.length > 140
+      ? `${stream.lastError.slice(0, 140)}...`
+      : stream.lastError
+    : null;
 
   const liveStreamEvent = stream.status === "live" ? stream.event : null;
   const snapshotTick = liveStreamEvent?.tick ?? playerStatus?.simulationTick;
@@ -676,22 +682,30 @@ export function App() {
     }
   }, [handleError, resetClientState]);
 
-  const onCharacterSwitch = useCallback((nextCharacterID: number | undefined) => {
-  if (!nextCharacterID || nextCharacterID <= 0) {
-    return;
-  }
+  const onCharacterSwitch = useCallback(async (nextCharacterID: number | undefined) => {
+    if (!nextCharacterID || nextCharacterID <= 0) {
+      return;
+    }
 
-  if (nextCharacterID === selectedCharacter?.id) {
-    return;
-  }
+    if (nextCharacterID === selectedCharacter?.id) {
+      return;
+    }
 
-  savePreferredCharacterID(nextCharacterID);
-  setSelectedCharacterId(nextCharacterID);
-  setNotice("Switching character context...");
-  if (typeof window !== "undefined") {
-    window.location.reload();
-  }
-  }, [selectedCharacter?.id]);
+    setActionBusy(true);
+    try {
+      await switchOnboardingCharacter(nextCharacterID);
+      savePreferredCharacterID(nextCharacterID);
+      setSelectedCharacterId(nextCharacterID);
+      setNotice("Switching character context...");
+      if (typeof window !== "undefined") {
+        window.location.reload();
+      }
+    } catch (err) {
+      handleError(err);
+    } finally {
+      setActionBusy(false);
+    }
+  }, [handleError, selectedCharacter?.id]);
 
   const loadGameplay = useCallback(async () => {
     if (!isLoggedIn || !selectedCharacter?.id) {
@@ -976,56 +990,58 @@ export function App() {
 
   return (
     <div className="new-shell">
-      <header className="top-nav">
-        <div>
-          <h1>Lived MMO Console</h1>
-          <p>Frontend {webPackage.version} · API-aware rebuild</p>
-        </div>
-
-        <div className="top-controls">
-          <label>
-            Character
-            <select
-              value={selectedCharacter?.id ?? ""}
-              onChange={(event) => onCharacterSwitch(parseNumber(event.target.value))}
-            >
-              {characters.map((character) => (
-                <option key={character.id} value={character.id}>
-                  {character.name} · {formatRealmName(character.realmId)} {character.isPrimary ? "(primary)" : ""}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <div className="nav-tabs">
-            <button className={view === "profile" ? "active" : ""} onClick={() => setView("profile")} type="button">Profile</button>
-            <button className={view === "gameplay" ? "active" : ""} onClick={() => setView("gameplay")} type="button" disabled={!hasCharacterContext}>Gameplay</button>
-            <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")} type="button" disabled={!hasCharacterContext}>Chat</button>
+      <div className="app-header-chrome">
+        <header className="top-nav">
+          <div>
+            <h1>Lived MMO Console</h1>
+            <p>Frontend {webPackage.version} · API-aware rebuild</p>
           </div>
 
-          {isAdmin ? <button type="button" onClick={() => setAdminOpen(true)}>Admin Panel</button> : null}
-          <button type="button" onClick={onLogout} disabled={actionBusy}>Logout</button>
-        </div>
-      </header>
+          <div className="top-controls">
+            <label>
+              Character
+              <select
+                value={selectedCharacter?.id ?? ""}
+                onChange={(event) => onCharacterSwitch(parseNumber(event.target.value))}
+              >
+                {characters.map((character) => (
+                  <option key={character.id} value={character.id}>
+                    {character.name} · {formatRealmName(character.realmId)} {character.isPrimary ? "(primary)" : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
 
-      {loading || bootstrapping ? <div className="notice">Loading account context...</div> : null}
+            <div className="nav-tabs">
+              <button className={view === "profile" ? "active" : ""} onClick={() => setView("profile")} type="button">Profile</button>
+              <button className={view === "gameplay" ? "active" : ""} onClick={() => setView("gameplay")} type="button" disabled={!hasCharacterContext}>Gameplay</button>
+              <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")} type="button" disabled={!hasCharacterContext}>Chat</button>
+            </div>
 
-      <PlayerSnapshot
-        name={selectedCharacter?.name ?? account?.username ?? "Player"}
-        realmId={selectedCharacter?.realmId}
-        tick={snapshotTick}
-        day={snapshotDay}
-        clock={snapshotClock}
-        dayPart={snapshotDayPart}
-        marketState={snapshotMarketState}
-        streamStatus={stream.status}
-        staminaCurrent={staminaCurrent}
-        staminaMax={staminaMax}
-        coins={snapshotCoins}
-        queuedOrActive={liveStreamEvent?.player?.queuedOrActiveBehaviors ?? queuedOrActiveCount}
-        behaviorBars={snapshotBehaviorBars}
-        realmPausedMessage={realmPausedMessage}
-      />
+            {isAdmin ? <button type="button" onClick={() => setAdminOpen(true)}>Admin Panel</button> : null}
+            <button type="button" onClick={onLogout} disabled={actionBusy}>Logout</button>
+          </div>
+        </header>
+
+        {loading || bootstrapping ? <div className="notice">Loading account context...</div> : null}
+
+        <PlayerSnapshot
+          name={selectedCharacter?.name ?? account?.username ?? "Player"}
+          realmId={selectedCharacter?.realmId}
+          tick={snapshotTick}
+          day={snapshotDay}
+          clock={snapshotClock}
+          dayPart={snapshotDayPart}
+          marketState={snapshotMarketState}
+          streamStatus={stream.status}
+          staminaCurrent={staminaCurrent}
+          staminaMax={staminaMax}
+          coins={snapshotCoins}
+          queuedOrActive={liveStreamEvent?.player?.queuedOrActiveBehaviors ?? queuedOrActiveCount}
+          behaviorBars={snapshotBehaviorBars}
+          realmPausedMessage={realmPausedMessage}
+        />
+      </div>
 
       <main className="page-grid">
         {view === "profile" ? (
@@ -1398,6 +1414,19 @@ export function App() {
           ))}
         </div>
       ) : null}
+
+      <footer className="app-footer panel">
+        <div className="app-footer-row">
+          <span><strong>Account:</strong> {account?.username ?? "-"}</span>
+          <span><strong>Character:</strong> {selectedCharacter?.name ?? "-"}</span>
+          <span><strong>Realm:</strong> {formatRealmName(selectedCharacter?.realmId)}</span>
+          <span><strong>Tick:</strong> {snapshotTick}</span>
+          <span><strong>Stream:</strong> {stream.status}</span>
+          <span><strong>Stream Attempts:</strong> {stream.attempts}</span>
+          {streamErrorLabel ? <span><strong>Stream Error:</strong> {streamErrorLabel}</span> : null}
+          <span><strong>Market:</strong> {snapshotMarketState}</span>
+        </div>
+      </footer>
     </div>
   );
 }

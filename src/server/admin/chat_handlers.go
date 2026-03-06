@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -10,6 +12,7 @@ import (
 	"github.com/asciifaceman/lived/pkg/dal"
 	"github.com/asciifaceman/lived/src/gameplay"
 	serverAuth "github.com/asciifaceman/lived/src/server/auth"
+	"github.com/asciifaceman/lived/src/server/requestbind"
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
 )
@@ -27,13 +30,21 @@ const (
 )
 
 type chatChannelCreateRequest struct {
+	Command     string `json:"command,omitempty"`
 	Scope       string `json:"scope,omitempty"`
 	RealmID     uint   `json:"realmId"`
 	Key         string `json:"key"`
 	Name        string `json:"name"`
 	Subject     string `json:"subject,omitempty"`
 	Description string `json:"description,omitempty"`
+	ReasonCode  string `json:"reasonCode,omitempty"`
+	Note        string `json:"note,omitempty"`
 }
+
+var (
+	errChatChannelAlreadyExists = errors.New("chat channel already exists")
+	errChatChannelNotFound      = errors.New("chat channel not found")
+)
 
 type chatChannelActionRequest struct {
 	Scope      string `json:"scope,omitempty"`
@@ -76,8 +87,13 @@ func makeChatChannelCreateHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req chatChannelCreateRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid channel create payload")
+		if err := requestbind.JSON(c, &req, "invalid channel create payload"); err != nil {
+			return err
+		}
+
+		command, err := parseChatChannelCommand(req.Command)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
 		bindingScope, err := parseChatBindingScope(req.Scope)
@@ -97,7 +113,7 @@ func makeChatChannelCreateHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		displayName := strings.TrimSpace(req.Name)
-		if len(displayName) < 2 || len(displayName) > 64 {
+		if command != "attach" && (len(displayName) < 2 || len(displayName) > 64) {
 			return echo.NewHTTPError(http.StatusBadRequest, "name must be between 2 and 64 characters")
 		}
 
@@ -111,7 +127,22 @@ func makeChatChannelCreateHandler(database *gorm.DB) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, "subject must be 140 characters or less")
 		}
 
-		reasonCode, note, err := validateReasonAndNote("chat_channel_create", "")
+		defaultReason := "chat_channel_create"
+		switch command {
+		case "create":
+			defaultReason = "chat_channel_create"
+		case "edit":
+			defaultReason = "chat_channel_edit"
+		case "attach":
+			defaultReason = "chat_channel_attach"
+		}
+
+		reasonInput := strings.TrimSpace(req.ReasonCode)
+		if reasonInput == "" {
+			reasonInput = defaultReason
+		}
+
+		reasonCode, note, err := validateReasonAndNote(reasonInput, req.Note)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
@@ -122,56 +153,164 @@ func makeChatChannelCreateHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		created := false
-		var channel dal.ChatChannel
 		err = database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
-			result := tx.WithContext(c.Request().Context()).Where("realm_id = ? AND channel_key = ?", realmID, channelKey).Limit(1).Find(&channel)
-			if result.Error != nil {
-				return result.Error
+			existing := make([]dal.ChatChannel, 0)
+			if err := tx.WithContext(c.Request().Context()).Where("channel_key = ?", channelKey).Find(&existing).Error; err != nil {
+				return err
+			}
+			if command == "create" && len(existing) > 0 {
+				return errChatChannelAlreadyExists
+			}
+			if (command == "edit" || command == "attach") && len(existing) == 0 {
+				return errChatChannelNotFound
 			}
 
-			before := map[string]any{"exists": result.RowsAffected > 0}
-			after := map[string]any{"realmId": realmID, "key": channelKey, "name": displayName, "subject": subject, "description": description, "active": true}
+			beforeActiveBindings := make([]uint, 0)
+			for _, row := range existing {
+				if row.IsActive {
+					beforeActiveBindings = append(beforeActiveBindings, row.RealmID)
+				}
+			}
 
-			if result.RowsAffected == 0 {
-				channel = dal.ChatChannel{
-					RealmID:      realmID,
-					ChannelKey:   channelKey,
-					DisplayName:  displayName,
-					Subject:      subject,
-					Description:  description,
-					IsActive:     true,
-					ManagedByKey: "admin",
-				}
-				if err := tx.WithContext(c.Request().Context()).Create(&channel).Error; err != nil {
-					return err
-				}
-				created = true
-			} else {
-				if err := tx.WithContext(c.Request().Context()).Model(&dal.ChatChannel{}).Where("id = ?", channel.ID).Updates(map[string]any{
+			target := dal.ChatChannel{}
+			targetResult := tx.WithContext(c.Request().Context()).Where("realm_id = ? AND channel_key = ?", realmID, channelKey).Limit(1).Find(&target)
+			if targetResult.Error != nil {
+				return targetResult.Error
+			}
+
+			canonical := dal.ChatChannel{}
+			if len(existing) > 0 {
+				canonical = existing[0]
+			}
+
+			switch command {
+			case "edit":
+				if err := tx.WithContext(c.Request().Context()).Model(&dal.ChatChannel{}).Where("channel_key = ?", channelKey).Updates(map[string]any{
 					"display_name":   displayName,
 					"subject":        subject,
 					"description":    description,
-					"is_active":      true,
+					"managed_by_key": "admin",
+				}).Error; err != nil {
+					return err
+				}
+
+			case "attach":
+				if targetResult.RowsAffected == 0 {
+					target = dal.ChatChannel{
+						RealmID:      realmID,
+						ChannelKey:   channelKey,
+						DisplayName:  canonical.DisplayName,
+						Subject:      canonical.Subject,
+						Description:  canonical.Description,
+						IsActive:     true,
+						ManagedByKey: "admin",
+					}
+					if err := tx.WithContext(c.Request().Context()).Create(&target).Error; err != nil {
+						return err
+					}
+					created = true
+				} else {
+					if err := tx.WithContext(c.Request().Context()).Model(&dal.ChatChannel{}).Where("id = ?", target.ID).Updates(map[string]any{
+						"is_active":      true,
+						"managed_by_key": "admin",
+					}).Error; err != nil {
+						return err
+					}
+				}
+
+			default:
+				if targetResult.RowsAffected == 0 {
+					target = dal.ChatChannel{
+						RealmID:      realmID,
+						ChannelKey:   channelKey,
+						DisplayName:  displayName,
+						Subject:      subject,
+						Description:  description,
+						IsActive:     true,
+						ManagedByKey: "admin",
+					}
+					if err := tx.WithContext(c.Request().Context()).Create(&target).Error; err != nil {
+						return err
+					}
+					created = true
+				} else {
+					if err := tx.WithContext(c.Request().Context()).Model(&dal.ChatChannel{}).Where("id = ?", target.ID).Updates(map[string]any{
+						"is_active":      true,
+						"managed_by_key": "admin",
+					}).Error; err != nil {
+						return err
+					}
+				}
+
+				if err := tx.WithContext(c.Request().Context()).Model(&dal.ChatChannel{}).Where("channel_key = ?", channelKey).Updates(map[string]any{
+					"display_name":   displayName,
+					"subject":        subject,
+					"description":    description,
 					"managed_by_key": "admin",
 				}).Error; err != nil {
 					return err
 				}
 			}
 
-			return appendAdminAudit(tx, actor.AccountID, "chat_channel_create", reasonCode, note, before, after, tick, realmID)
+			afterRows := make([]dal.ChatChannel, 0)
+			if err := tx.WithContext(c.Request().Context()).Where("channel_key = ?", channelKey).Find(&afterRows).Error; err != nil {
+				return err
+			}
+			afterActiveBindings := make([]uint, 0)
+			for _, row := range afterRows {
+				if row.IsActive {
+					afterActiveBindings = append(afterActiveBindings, row.RealmID)
+				}
+			}
+
+			before := map[string]any{
+				"bindingExists":       targetResult.RowsAffected > 0,
+				"metadataScope":       "channelKey",
+				"activeBindingRealms": beforeActiveBindings,
+			}
+			after := map[string]any{
+				"realmId":             realmID,
+				"key":                 channelKey,
+				"name":                displayName,
+				"subject":             subject,
+				"description":         description,
+				"metadataScope":       "channelKey",
+				"activeBindingRealms": afterActiveBindings,
+				"bindingActive":       true,
+			}
+
+			auditAction := "chat_channel_create"
+			switch command {
+			case "create":
+				auditAction = "chat_channel_create"
+			case "edit":
+				auditAction = "chat_channel_edit"
+			case "attach":
+				auditAction = "chat_channel_attach"
+			}
+
+			return appendAdminAudit(tx, actor.AccountID, auditAction, reasonCode, note, before, after, tick, realmID)
 		})
 		if err != nil {
+			if errors.Is(err, errChatChannelAlreadyExists) {
+				return echo.NewHTTPError(http.StatusConflict, "channel key already exists; use edit or attach")
+			}
+			if errors.Is(err, errChatChannelNotFound) {
+				return echo.NewHTTPError(http.StatusNotFound, "channel key not found; create it first")
+			}
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to create channel")
 		}
 
-		return respondSuccess(c, http.StatusOK, "Chat channel upserted.", map[string]any{
-			"scope":    bindingScope,
-			"scopeKey": bindingScopeKey,
-			"realmId":  realmID,
-			"key":      channelKey,
-			"name":     displayName,
-			"subject":  subject,
-			"created":  created,
+		return respondSuccess(c, http.StatusOK, "Chat channel command applied.", map[string]any{
+			"command":       command,
+			"scope":         bindingScope,
+			"scopeKey":      bindingScopeKey,
+			"realmId":       realmID,
+			"key":           channelKey,
+			"name":          displayName,
+			"subject":       subject,
+			"metadataScope": "channelKey",
+			"created":       created,
 		})
 	}
 }
@@ -253,8 +392,8 @@ func makeChatChannelFlushHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req chatChannelActionRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid flush payload")
+		if err := requestbind.JSON(c, &req, "invalid flush payload"); err != nil {
+			return err
 		}
 
 		bindingScope, err := parseChatBindingScope(req.Scope)
@@ -285,6 +424,10 @@ func makeChatChannelFlushHandler(database *gorm.DB) echo.HandlerFunc {
 
 		deleted := int64(0)
 		err = database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
+			if err := ensureActiveChatBinding(c.Request().Context(), tx, realmID, key); err != nil {
+				return err
+			}
+
 			eventTypes := []string{
 				chatEventPrefixPlayer + key,
 				chatEventPrefixMod + key,
@@ -300,6 +443,9 @@ func makeChatChannelFlushHandler(database *gorm.DB) echo.HandlerFunc {
 			return appendAdminAudit(tx, actor.AccountID, "chat_channel_flush", reasonCode, note, map[string]any{"channel": key}, map[string]any{"deleted": deleted}, tick, realmID)
 		})
 		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return echo.NewHTTPError(http.StatusNotFound, "channel binding not found for this realm")
+			}
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to flush channel")
 		}
 
@@ -315,8 +461,8 @@ func makeChatChannelModerationHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req chatChannelModerationRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid moderation payload")
+		if err := requestbind.JSON(c, &req, "invalid moderation payload"); err != nil {
+			return err
 		}
 
 		bindingScope, err := parseChatBindingScope(req.Scope)
@@ -367,6 +513,10 @@ func makeChatChannelModerationHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		err = database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
+			if err := ensureActiveChatBinding(c.Request().Context(), tx, realmID, key); err != nil {
+				return err
+			}
+
 			before := map[string]any{"action": action, "accountId": req.AccountID}
 			after := map[string]any{"action": action, "accountId": req.AccountID}
 
@@ -400,6 +550,9 @@ func makeChatChannelModerationHandler(database *gorm.DB) echo.HandlerFunc {
 			return appendAdminAudit(tx, actor.AccountID, "chat_channel_moderation", reasonCode, note, before, after, tick, realmID)
 		})
 		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return echo.NewHTTPError(http.StatusNotFound, "channel binding not found for this realm")
+			}
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to apply chat moderation")
 		}
 
@@ -419,8 +572,8 @@ func makeChatSystemMessageHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req chatSystemMessageRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid system message payload")
+		if err := requestbind.JSON(c, &req, "invalid system message payload"); err != nil {
+			return err
 		}
 
 		bindingScope, err := parseChatBindingScope(req.Scope)
@@ -464,6 +617,10 @@ func makeChatSystemMessageHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		err = database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
+			if err := ensureActiveChatBinding(c.Request().Context(), tx, realmID, key); err != nil {
+				return err
+			}
+
 			if err := tx.WithContext(c.Request().Context()).Create(&event).Error; err != nil {
 				return err
 			}
@@ -471,6 +628,9 @@ func makeChatSystemMessageHandler(database *gorm.DB) echo.HandlerFunc {
 			return appendAdminAudit(tx, actor.AccountID, "chat_system_message", reasonCode, note, map[string]any{"channel": key}, map[string]any{"message": message}, tick, realmID)
 		})
 		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return echo.NewHTTPError(http.StatusNotFound, "channel binding not found for this realm")
+			}
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to publish system message")
 		}
 
@@ -510,8 +670,15 @@ func makeChatChannelListHandler(database *gorm.DB) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
-		query := database.WithContext(c.Request().Context()).
-			Where("is_active = ?", true)
+		includeInactive, err := parseOptionalBoolQuery(c.QueryParam("includeInactive"), "includeInactive")
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		query := database.WithContext(c.Request().Context())
+		if !includeInactive {
+			query = query.Where("is_active = ?", true)
+		}
 		if realmID != 0 {
 			query = query.Where("realm_id = ?", realmID)
 		}
@@ -531,12 +698,14 @@ func makeChatChannelListHandler(database *gorm.DB) echo.HandlerFunc {
 				"name":        row.DisplayName,
 				"subject":     row.Subject,
 				"description": row.Description,
+				"active":      row.IsActive,
 			})
 		}
 
 		response := map[string]any{
-			"scope":    chatBindingScopeRealm,
-			"channels": channels,
+			"scope":           chatBindingScopeRealm,
+			"includeInactive": includeInactive,
+			"channels":        channels,
 		}
 		if realmID != 0 {
 			response["realmId"] = realmID
@@ -554,8 +723,8 @@ func makeChatWordlistAddHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req chatWordlistRuleRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid wordlist payload")
+		if err := requestbind.JSON(c, &req, "invalid wordlist payload"); err != nil {
+			return err
 		}
 
 		policyScope, err := parseChatPolicyScope(req.Scope)
@@ -746,6 +915,19 @@ func parseRealmIDWithDefault(raw string) uint {
 	return uint(value)
 }
 
+func parseChatChannelCommand(raw string) (string, error) {
+	command := strings.ToLower(strings.TrimSpace(raw))
+	if command == "" {
+		return "", fmt.Errorf("command is required")
+	}
+	switch command {
+	case "create", "edit", "attach":
+		return command, nil
+	default:
+		return "", fmt.Errorf("command must be create, edit, or attach")
+	}
+}
+
 func parseRuleIDPathParam(raw string) (uint, error) {
 	trimmed := strings.TrimSpace(raw)
 	value, err := strconv.ParseUint(trimmed, 10, 64)
@@ -754,4 +936,19 @@ func parseRuleIDPathParam(raw string) (uint, error) {
 	}
 
 	return uint(value), nil
+}
+
+func ensureActiveChatBinding(ctx context.Context, tx *gorm.DB, realmID uint, key string) error {
+	channel := dal.ChatChannel{}
+	result := tx.WithContext(ctx).
+		Where("realm_id = ? AND channel_key = ? AND is_active = ?", realmID, key, true).
+		Limit(1).
+		Find(&channel)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/asciifaceman/lived/pkg/ratelimit"
 	"github.com/asciifaceman/lived/src/gameplay"
 	serverAuth "github.com/asciifaceman/lived/src/server/auth"
+	"github.com/asciifaceman/lived/src/server/requestbind"
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -33,6 +35,11 @@ const (
 	eventPrefixMod    = "chat_message_mod:"
 	eventPrefixAdmin  = "chat_message_admin:"
 	eventPrefixSystem = "chat_message_system:"
+
+	globalChannelKey         = "global"
+	globalChannelDisplayName = "Global"
+	globalChannelSubject     = "General realm discussion"
+	globalChannelDesc        = "Realm-wide chat channel."
 )
 
 type apiResponse struct {
@@ -297,8 +304,8 @@ func parseOptionalPositiveUint(raw string, fieldName string) (uint, error) {
 func makePostMessageHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		var req postMessageRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid chat message payload")
+		if err := requestbind.JSON(c, &req, "invalid chat message payload"); err != nil {
+			return err
 		}
 
 		message := strings.TrimSpace(req.Message)
@@ -636,18 +643,111 @@ func realmChannelBinding(realmID uint) (string, string) {
 }
 
 func ensureDefaultChatChannel(ctx context.Context, database *gorm.DB, realmID uint) error {
+	if realmID == 0 {
+		realmID = 1
+	}
+
 	return database.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "realm_id"}, {Name: "channel_key"}},
-		DoNothing: true,
+		Columns: []clause.Column{{Name: "realm_id"}, {Name: "channel_key"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"is_active": true,
+		}),
 	}).Create(&dal.ChatChannel{
 		RealmID:      realmID,
-		ChannelKey:   "global",
-		DisplayName:  "Global",
-		Subject:      "General realm discussion",
-		Description:  "Realm-wide chat channel.",
+		ChannelKey:   globalChannelKey,
+		DisplayName:  globalChannelDisplayName,
+		Subject:      globalChannelSubject,
+		Description:  globalChannelDesc,
 		IsActive:     true,
 		ManagedByKey: "system",
 	}).Error
+}
+
+func EnsureGlobalChannelBootstrap(ctx context.Context, database *gorm.DB) error {
+	realmIDs, err := listKnownRealmIDsForGlobalChannelBootstrap(ctx, database)
+	if err != nil {
+		return err
+	}
+
+	for _, realmID := range realmIDs {
+		if err := ensureDefaultChatChannel(ctx, database, realmID); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func listKnownRealmIDsForGlobalChannelBootstrap(ctx context.Context, database *gorm.DB) ([]uint, error) {
+	realmSet := map[uint]struct{}{1: {}}
+
+	characterRows := make([]struct{ RealmID uint }, 0)
+	if err := database.WithContext(ctx).
+		Model(&dal.Character{}).
+		Distinct("realm_id").
+		Where("realm_id > 0").
+		Find(&characterRows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range characterRows {
+		realmSet[row.RealmID] = struct{}{}
+	}
+
+	worldRows := make([]struct{ RealmID uint }, 0)
+	if err := database.WithContext(ctx).
+		Model(&dal.WorldState{}).
+		Distinct("realm_id").
+		Where("realm_id > 0").
+		Find(&worldRows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range worldRows {
+		realmSet[row.RealmID] = struct{}{}
+	}
+
+	runtimeRows := make([]struct{ RealmID uint }, 0)
+	if err := database.WithContext(ctx).
+		Model(&dal.WorldRuntimeState{}).
+		Distinct("realm_id").
+		Where("realm_id > 0").
+		Find(&runtimeRows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range runtimeRows {
+		realmSet[row.RealmID] = struct{}{}
+	}
+
+	realmConfigRows := make([]struct{ RealmID uint }, 0)
+	if err := database.WithContext(ctx).
+		Model(&dal.RealmConfig{}).
+		Distinct("realm_id").
+		Where("realm_id > 0").
+		Find(&realmConfigRows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range realmConfigRows {
+		realmSet[row.RealmID] = struct{}{}
+	}
+
+	channelRows := make([]struct{ RealmID uint }, 0)
+	if err := database.WithContext(ctx).
+		Model(&dal.ChatChannel{}).
+		Distinct("realm_id").
+		Where("realm_id > 0").
+		Find(&channelRows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range channelRows {
+		realmSet[row.RealmID] = struct{}{}
+	}
+
+	realmIDs := make([]uint, 0, len(realmSet))
+	for realmID := range realmSet {
+		realmIDs = append(realmIDs, realmID)
+	}
+
+	sort.Slice(realmIDs, func(i, j int) bool { return realmIDs[i] < realmIDs[j] })
+	return realmIDs, nil
 }
 
 func ensureChannelActive(ctx context.Context, database *gorm.DB, realmID uint, channel string) error {

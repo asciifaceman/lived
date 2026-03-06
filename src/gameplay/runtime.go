@@ -60,6 +60,7 @@ const (
 )
 
 var ErrAscensionNotEligible = errors.New("ascension is not yet available")
+var ErrBehaviorConflict = errors.New("behavior queue conflict")
 
 type BehaviorView struct {
 	ID                        uint   `json:"id"`
@@ -180,7 +181,7 @@ func QueuePlayerBehavior(ctx context.Context, database *gorm.DB, playerID uint, 
 		if group == "" {
 			group = "exclusive"
 		}
-		return fmt.Errorf("cannot queue %s while another %s behavior is active", behaviorKey, group)
+		return fmt.Errorf("%w: cannot queue %s while another %s behavior is active", ErrBehaviorConflict, behaviorKey, group)
 	}
 
 	payload := behaviorRuntimePayload{Mode: mode}

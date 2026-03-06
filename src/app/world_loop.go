@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/asciifaceman/lived/pkg/config"
 	"github.com/asciifaceman/lived/pkg/dal"
 	"github.com/asciifaceman/lived/pkg/telemetry"
 	"github.com/asciifaceman/lived/src/gameplay"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"gorm.io/gorm"
@@ -25,7 +27,7 @@ var worldLoopTracer = otel.Tracer("lived/world-loop")
 
 func runWorldLoop(ctx context.Context, cfg config.Config, database *gorm.DB) error {
 	startupTime := time.Now().UTC()
-	if err := runTickAtForKnownRealms(database, cfg, startupTime); err != nil {
+	if err := runTickAtForKnownRealms(ctx, database, cfg, startupTime); err != nil {
 		return err
 	}
 
@@ -36,23 +38,23 @@ func runWorldLoop(ctx context.Context, cfg config.Config, database *gorm.DB) err
 		select {
 		case <-ctx.Done():
 			shutdownTime := time.Now().UTC()
-			if err := runTickAtForKnownRealms(database, cfg, shutdownTime); err != nil {
-				return err
-			}
+			shutdownCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			_ = runTickAtForKnownRealms(shutdownCtx, database, cfg, shutdownTime)
+			cancel()
 			return nil
 		case tickTime := <-ticker.C:
-			if err := runTickAtForKnownRealms(database, cfg, tickTime.UTC()); err != nil {
+			if err := runTickAtForKnownRealms(ctx, database, cfg, tickTime.UTC()); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func runTickAtForKnownRealms(database *gorm.DB, cfg config.Config, tickTime time.Time) error {
-	spanCtx, span := worldLoopTracer.Start(context.Background(), "world.tick.discover_realms")
+func runTickAtForKnownRealms(ctx context.Context, database *gorm.DB, cfg config.Config, tickTime time.Time) error {
+	spanCtx, span := worldLoopTracer.Start(ctx, "world.tick.discover_realms")
 	defer span.End()
 
-	discoveryCtx, cancel := context.WithTimeout(context.Background(), tickDBTimeout)
+	discoveryCtx, cancel := context.WithTimeout(ctx, tickDBTimeout)
 	defer cancel()
 
 	realmIDs, err := listKnownRealmIDs(discoveryCtx, database)
@@ -89,7 +91,7 @@ func runTickAtWithContext(ctx context.Context, database *gorm.DB, cfg config.Con
 		telemetry.RecordWorldTick(ctx, realmID, advanceByMinutes, time.Since(startedAt), failed)
 	}()
 
-	opCtx, cancel := context.WithTimeout(context.Background(), tickDBTimeout)
+	opCtx, cancel := context.WithTimeout(ctx, tickDBTimeout)
 	defer cancel()
 
 	runtimeState, err := loadOrInitRuntimeState(opCtx, database, realmID)
@@ -282,9 +284,32 @@ func persistRuntimeState(ctx context.Context, database *gorm.DB, runtimeState *d
 }
 
 func opCtxErrGuard(err error) error {
+	if err == nil {
+		return nil
+	}
+
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}
 
+	if isTransientPostgresAdminShutdownError(err) {
+		return nil
+	}
+
 	return err
+}
+
+func isTransientPostgresAdminShutdownError(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "57P01", "57P02", "57P03":
+			return true
+		}
+	}
+
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "sqlstate 57p01") ||
+		strings.Contains(message, "sqlstate 57p02") ||
+		strings.Contains(message, "sqlstate 57p03")
 }

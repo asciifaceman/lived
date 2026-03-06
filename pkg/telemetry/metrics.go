@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -41,7 +42,33 @@ var (
 		Name: "lived_stream_connections_rejected_total",
 		Help: "Total number of rejected stream connection attempts by reason.",
 	}, []string{"reason"})
+
+	worldTickAggregateMu sync.RWMutex
+	worldTickAggregate   = worldTickAggregateState{}
 )
+
+type worldTickAggregateState struct {
+	totalRuns           int64
+	totalFailures       int64
+	totalDurationMS     float64
+	totalAdvanceMinutes float64
+	lastDurationMS      float64
+	lastAdvanceMinutes  int64
+	lastRealmID         uint
+	lastUpdatedAt       time.Time
+}
+
+type WorldTickAggregateSnapshot struct {
+	TotalRuns           int64
+	TotalFailures       int64
+	FailureRate         float64
+	AvgDurationMS       float64
+	AvgAdvanceMinutes   float64
+	LastDurationMS      float64
+	LastAdvanceMinutes  int64
+	LastRealmID         uint
+	LastUpdatedAt       time.Time
+}
 
 func RecordWorldTick(ctx context.Context, realmID uint, advanceMinutes int64, duration time.Duration, failed bool) {
 	_ = ctx
@@ -51,6 +78,46 @@ func RecordWorldTick(ctx context.Context, realmID uint, advanceMinutes int64, du
 	worldTickAdvanceMinutes.With(realmLabel).Observe(float64(advanceMinutes))
 	if failed {
 		worldTickErrors.With(realmLabel).Inc()
+	}
+
+	worldTickAggregateMu.Lock()
+	worldTickAggregate.totalRuns += 1
+	if failed {
+		worldTickAggregate.totalFailures += 1
+	}
+	worldTickAggregate.totalDurationMS += duration.Seconds() * 1000
+	worldTickAggregate.totalAdvanceMinutes += float64(advanceMinutes)
+	worldTickAggregate.lastDurationMS = duration.Seconds() * 1000
+	worldTickAggregate.lastAdvanceMinutes = advanceMinutes
+	worldTickAggregate.lastRealmID = realmID
+	worldTickAggregate.lastUpdatedAt = time.Now().UTC()
+	worldTickAggregateMu.Unlock()
+}
+
+func SnapshotWorldTickAggregate() WorldTickAggregateSnapshot {
+	worldTickAggregateMu.RLock()
+	state := worldTickAggregate
+	worldTickAggregateMu.RUnlock()
+
+	avgDuration := 0.0
+	avgAdvance := 0.0
+	failureRate := 0.0
+	if state.totalRuns > 0 {
+		avgDuration = state.totalDurationMS / float64(state.totalRuns)
+		avgAdvance = state.totalAdvanceMinutes / float64(state.totalRuns)
+		failureRate = float64(state.totalFailures) / float64(state.totalRuns)
+	}
+
+	return WorldTickAggregateSnapshot{
+		TotalRuns:          state.totalRuns,
+		TotalFailures:      state.totalFailures,
+		FailureRate:        failureRate,
+		AvgDurationMS:      avgDuration,
+		AvgAdvanceMinutes:  avgAdvance,
+		LastDurationMS:     state.lastDurationMS,
+		LastAdvanceMinutes: state.lastAdvanceMinutes,
+		LastRealmID:        state.lastRealmID,
+		LastUpdatedAt:      state.lastUpdatedAt,
 	}
 }
 

@@ -269,6 +269,9 @@ const openAPISpecJSON = `{
           "404": {
             "$ref": "#/components/responses/ErrorResponse"
           },
+          "409": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
           "500": {
             "$ref": "#/components/responses/ErrorResponse"
           }
@@ -444,7 +447,7 @@ const openAPISpecJSON = `{
       "post": {
         "tags": ["Onboarding"],
         "summary": "Start onboarding",
-        "description": "Creates an initial character for the authenticated account in the selected realm. Idempotent per account+realm. When the target realm is configured as whitelist-only, the account must have an active realm access grant (admins are always allowed).",
+        "description": "Creates a new character for the authenticated account in the selected realm. Create is explicit: if the account already has a character in the target realm, this endpoint returns conflict and callers should use /v1/onboarding/switch to select that character.",
         "security": [
           { "BearerAuth": [] }
         ],
@@ -459,16 +462,6 @@ const openAPISpecJSON = `{
           }
         },
         "responses": {
-          "200": {
-            "description": "Already onboarded for realm",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/APIResponse"
-                }
-              }
-            }
-          },
           "201": {
             "description": "Onboarding completed",
             "content": {
@@ -488,11 +481,48 @@ const openAPISpecJSON = `{
         }
       }
     },
+    "/v1/onboarding/switch": {
+      "post": {
+        "tags": ["Onboarding"],
+        "summary": "Switch active character",
+        "description": "Selects the authenticated account's active/default character by setting it as primary. This controls the canonical character used by endpoints when characterId is omitted.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OnboardingSwitchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Active character selected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ErrorResponse" },
+          "401": { "$ref": "#/components/responses/ErrorResponse" },
+          "404": { "$ref": "#/components/responses/ErrorResponse" },
+          "409": { "$ref": "#/components/responses/ErrorResponse" },
+          "500": { "$ref": "#/components/responses/ErrorResponse" }
+        }
+      }
+    },
     "/v1/onboarding/status": {
       "get": {
         "tags": ["Onboarding"],
         "summary": "Get onboarding status",
-        "description": "Returns onboarding status and characters for authenticated account, plus realm metadata (realmId, name, whitelistOnly, canCreateCharacter, decommissioned) used by clients to drive realm selector UX and creation eligibility messaging.",
+        "description": "Returns onboarding status and characters for authenticated account, plus realm metadata (realmId, name, whitelistOnly, canCreateCharacter, decommissioned) used by clients to drive realm selector UX and creation eligibility messaging. Characters are ordered with active/default (primary) first.",
         "security": [
           { "BearerAuth": [] }
         ],
@@ -699,7 +729,7 @@ const openAPISpecJSON = `{
           "Stream"
         ],
         "summary": "Stream world snapshots",
-        "description": "WebSocket endpoint for UI live updates. Clients should upgrade the connection and receive continuous world/player snapshots including tick, clock, dayPart, market session, and player summary. In MMO mode this route requires bearer auth, resolves stream context by authenticated account character (optional characterId selector), and enforces configured concurrent connection limits per account/session.",
+        "description": "WebSocket endpoint for UI live updates. Clients should upgrade the connection and receive continuous world/player snapshots including tick, clock, dayPart, market session, and player summary. In MMO mode this route requires auth, resolves stream context by authenticated account character (optional characterId selector), supports cursor-based resume hints via 'lastEventId' with snapshot fallback semantics, and enforces configured concurrent connection limits per account/session. Preferred auth transport is WebSocket subprotocol ('Sec-WebSocket-Protocol': 'lived.v1, bearer.<accessToken>'); query-token fallback is optional and config-gated.",
         "parameters": [
           {
             "name": "characterId",
@@ -707,6 +737,20 @@ const openAPISpecJSON = `{
             "required": false,
             "schema": { "type": "integer", "minimum": 1 },
             "description": "Optional character selector in MMO mode."
+          },
+          {
+            "name": "lastEventId",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional stream resume cursor in 'realmId:tick' format. When unavailable/invalid, stream responds with snapshot fallback metadata."
+          },
+          {
+            "name": "accessToken",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional query-token auth fallback. Availability is config-gated by 'LIVED_STREAM_QUERY_ACCESS_TOKEN_ENABLED' and defaults to disabled. Prefer WebSocket subprotocol bearer transport."
           }
         ],
         "security": [
@@ -1786,6 +1830,69 @@ const openAPISpecJSON = `{
             "$ref": "#/components/responses/ErrorResponse"
           }
         }
+      },
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Create realm",
+        "description": "Creates a new realm with a DB-assigned incremental realmId, bootstraps runtime state/config, and records immutable admin audit context. Requires admin role.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 2,
+                    "maxLength": 64,
+                    "description": "Optional realm display name. Defaults to Realm {id}."
+                  },
+                  "whitelistOnly": {
+                    "type": "boolean",
+                    "description": "When true, character creation requires an active realm access grant (except admins)."
+                  },
+                  "reasonCode": {
+                    "type": "string",
+                    "maxLength": 64,
+                    "description": "Optional audit reason code. Defaults to realm_create."
+                  },
+                  "note": {
+                    "type": "string",
+                    "maxLength": 500
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Realm created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
       }
     },
     "/v1/admin/realms/{id}/config": {
@@ -2346,7 +2453,7 @@ const openAPISpecJSON = `{
       "post": {
         "tags": ["Admin"],
         "summary": "Apply realm admin action",
-        "description": "Applies an admin action to the selected realm and records an immutable audit event. Supports market and maintenance actions. Requires admin role.",
+        "description": "Applies an admin action to the selected existing realm and records an immutable audit event. Supports market controls, pause/resume maintenance, and realm lifecycle maintenance hooks (realm_decommission drains queued/active behavior work, revokes active realm sessions, marks realm decommissioned, and emits a system broadcast; realm_recommission clears decommissioned state, resumes realm processing, and emits a system broadcast; realm_delete performs destructive realm finalization and is allowed only for decommissioned non-default realms with no remaining characters). realm_create is handled by POST /v1/admin/realms. Requires admin role.",
         "security": [
           { "BearerAuth": [] }
         ],
@@ -2372,7 +2479,7 @@ const openAPISpecJSON = `{
                 "properties": {
                   "action": {
                     "type": "string",
-                    "enum": ["market_reset_defaults", "market_set_price", "realm_create", "realm_pause", "realm_resume"]
+                    "enum": ["market_reset_defaults", "market_set_price", "realm_pause", "realm_resume", "realm_decommission", "realm_recommission", "realm_delete"]
                   },
                   "reasonCode": {
                     "type": "string",
@@ -2681,6 +2788,68 @@ const openAPISpecJSON = `{
             "$ref": "#/components/responses/ErrorResponse"
           },
           "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/v1/admin/moderation/accounts/bulk": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Bulk moderate realm-scoped accounts",
+        "description": "Applies bulk account moderation for accounts active in a selected realm with bounded batch size and optional dry-run preview. Supports command=set_status (active|locked) and command=set_role (grant|revoke roleKey). Emits per-account audit events for applied changes and a bulk summary audit event.",
+        "security": [
+          { "BearerAuth": [] }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["command", "realmId", "reasonCode"],
+                "properties": {
+                  "command": { "type": "string", "enum": ["set_status", "set_role"] },
+                  "realmId": { "type": "integer", "minimum": 1 },
+                  "accountIds": {
+                    "type": "array",
+                    "items": { "type": "integer", "minimum": 1 },
+                    "description": "Optional explicit target accounts; when omitted, endpoint targets active realm accounts up to limit."
+                  },
+                  "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
+                  "dryRun": { "type": "boolean", "default": false },
+                  "status": { "type": "string", "enum": ["active", "locked"] },
+                  "revokeSessions": { "type": "boolean" },
+                  "roleKey": { "type": "string", "maxLength": 32 },
+                  "action": { "type": "string", "enum": ["grant", "revoke"] },
+                  "reasonCode": { "type": "string", "maxLength": 64 },
+                  "note": { "type": "string", "maxLength": 500 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bulk moderation applied or dry-run preview returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
             "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {
@@ -3001,6 +3170,17 @@ const openAPISpecJSON = `{
             "type": "integer",
             "minimum": 1,
             "default": 1
+          }
+        }
+      },
+      "OnboardingSwitchRequest": {
+        "type": "object",
+        "required": ["characterId"],
+        "properties": {
+          "characterId": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Character id owned by the authenticated account to set as active/default."
           }
         }
       },

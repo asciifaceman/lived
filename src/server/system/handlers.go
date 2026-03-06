@@ -17,6 +17,7 @@ import (
 	"github.com/asciifaceman/lived/pkg/version"
 	"github.com/asciifaceman/lived/src/gameplay"
 	serverAuth "github.com/asciifaceman/lived/src/server/auth"
+	"github.com/asciifaceman/lived/src/server/requestbind"
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
 )
@@ -210,8 +211,8 @@ func makeImportHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 		}
 
 		var req importRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid import payload")
+		if err := requestbind.JSON(c, &req, "invalid import payload"); err != nil {
+			return err
 		}
 
 		if strings.TrimSpace(req.Save) == "" {
@@ -247,8 +248,8 @@ func makeNewGameHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 		}
 
 		var req newGameRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid new game payload")
+		if err := requestbind.JSON(c, &req, "invalid new game payload"); err != nil {
+			return err
 		}
 
 		name := strings.TrimSpace(req.Name)
@@ -441,8 +442,8 @@ func makeVersionHandler() echo.HandlerFunc {
 func makeStartBehaviorHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		var req startBehaviorRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid behavior payload")
+		if err := requestbind.JSON(c, &req, "invalid behavior payload"); err != nil {
+			return err
 		}
 
 		key := strings.TrimSpace(req.BehaviorKey)
@@ -539,7 +540,7 @@ func makeStartBehaviorHandler(database *gorm.DB, cfg config.Config) echo.Handler
 			currentTick,
 			gameplay.QueueBehaviorOptions{MarketWaitDurationMinutes: marketWaitMinutes, RealmID: resolvedRealmID, Mode: queueMode, RepeatUntilTick: repeatUntilTick},
 		); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+			return echo.NewHTTPError(queueBehaviorErrorStatus(err), err.Error())
 		}
 
 		behaviorName := gameplay.HumanizeIdentifier(key)
@@ -915,8 +916,8 @@ func makeAscendHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 			}
 
 			var req ascendRequest
-			if err := c.Bind(&req); err != nil {
-				return echo.NewHTTPError(http.StatusBadRequest, "invalid ascension payload")
+			if err := requestbind.JSON(c, &req, "invalid ascension payload"); err != nil {
+				return err
 			}
 
 			name := strings.TrimSpace(req.Name)
@@ -935,13 +936,13 @@ func makeAscendHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 				return echo.NewHTTPError(http.StatusInternalServerError, "failed to evaluate ascension eligibility")
 			}
 			if !eligibility.Available {
-				return echo.NewHTTPError(http.StatusBadRequest, eligibility.Reason)
+				return echo.NewHTTPError(http.StatusConflict, eligibility.Reason)
 			}
 
 			count, bonus, err := gameplay.AscendForPlayerRealm(c.Request().Context(), database, player.ID, character.RealmID, name)
 			if err != nil {
 				if errors.Is(err, gameplay.ErrAscensionNotEligible) {
-					return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+					return echo.NewHTTPError(http.StatusConflict, err.Error())
 				}
 				return echo.NewHTTPError(http.StatusInternalServerError, "failed to ascend")
 			}
@@ -950,8 +951,8 @@ func makeAscendHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 		}
 
 		var req ascendRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid ascension payload")
+		if err := requestbind.JSON(c, &req, "invalid ascension payload"); err != nil {
+			return err
 		}
 
 		name := strings.TrimSpace(req.Name)
@@ -981,13 +982,13 @@ func makeAscendHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to evaluate ascension eligibility")
 		}
 		if !eligibility.Available {
-			return echo.NewHTTPError(http.StatusBadRequest, eligibility.Reason)
+			return echo.NewHTTPError(http.StatusConflict, eligibility.Reason)
 		}
 
 		count, bonus, err := gameplay.Ascend(c.Request().Context(), database, name)
 		if err != nil {
 			if errors.Is(err, gameplay.ErrAscensionNotEligible) {
-				return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+				return echo.NewHTTPError(http.StatusConflict, err.Error())
 			}
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to ascend")
 		}
@@ -1004,6 +1005,14 @@ func respondSuccess(c echo.Context, code int, message string, data any) error {
 		RequestID: requestID,
 		Data:      data,
 	})
+}
+
+func queueBehaviorErrorStatus(err error) int {
+	if errors.Is(err, gameplay.ErrBehaviorConflict) {
+		return http.StatusConflict
+	}
+
+	return http.StatusBadRequest
 }
 
 func loadCurrentSave(ctx context.Context, database *gorm.DB) (saveGame, error) {

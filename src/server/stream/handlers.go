@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -21,13 +22,11 @@ import (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
 }
 
 type worldStreamEvent struct {
 	Type        string              `json:"type"`
+	EventID     string              `json:"eventId"`
 	At          string              `json:"at"`
 	Tick        int64               `json:"tick"`
 	Day         int64               `json:"day"`
@@ -36,7 +35,24 @@ type worldStreamEvent struct {
 	DayPart     string              `json:"dayPart"`
 	MarketOpen  bool                `json:"marketOpen"`
 	MarketState string              `json:"marketState"`
+	Resume      *streamResumeStatus `json:"resume,omitempty"`
 	Player      *playerStreamStatus `json:"player,omitempty"`
+}
+
+type streamResumeStatus struct {
+	RequestedLastEventID string `json:"requestedLastEventId,omitempty"`
+	ResolvedEventID      string `json:"resolvedEventId,omitempty"`
+	Mode                 string `json:"mode"`
+	Reason               string `json:"reason,omitempty"`
+	GapTicks             int64  `json:"gapTicks,omitempty"`
+}
+
+type streamResumeCursor struct {
+	Raw     string
+	RealmID uint
+	Tick    int64
+	Valid   bool
+	Reason  string
 }
 
 type playerStreamStatus struct {
@@ -63,7 +79,7 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 
 	handler := makeWorldStreamHandler(database, cfg, limiter)
 	if cfg.MMOAuthEnabled {
-		group.GET("/world", handler, serverAuth.RequireAuthWithQueryAccessToken(database, cfg))
+		group.GET("/world", handler, serverAuth.RequireAuthForStream(database, cfg))
 		return
 	}
 	group.GET("/world", handler)
@@ -102,7 +118,10 @@ func makeWorldStreamHandler(database *gorm.DB, cfg config.Config, limiter *strea
 			viewer = resolvedViewer
 		}
 
-		conn, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
+		requestUpgrader := upgrader
+		requestUpgrader.CheckOrigin = buildOriginChecker(cfg)
+		requestUpgrader.Subprotocols = []string{"lived.v1"}
+		conn, err := requestUpgrader.Upgrade(c.Response(), c.Request(), nil)
 		if err != nil {
 			return err
 		}
@@ -122,6 +141,8 @@ func makeWorldStreamHandler(database *gorm.DB, cfg config.Config, limiter *strea
 			}
 		}()
 
+		resumeCursor := parseStreamResumeCursor(c.QueryParam("lastEventId"))
+
 		tickEvery := cfg.TickInterval
 		if tickEvery <= 0 {
 			tickEvery = time.Second
@@ -130,9 +151,10 @@ func makeWorldStreamHandler(database *gorm.DB, cfg config.Config, limiter *strea
 		ticker := time.NewTicker(tickEvery)
 		defer ticker.Stop()
 
-		if writeErr := writeWorldSnapshot(ctx, conn, database, viewer); writeErr != nil {
+		if writeErr := writeWorldSnapshot(ctx, conn, database, viewer, resumeCursor); writeErr != nil {
 			return nil
 		}
+		resumeCursor = nil
 
 		for {
 			select {
@@ -141,7 +163,7 @@ func makeWorldStreamHandler(database *gorm.DB, cfg config.Config, limiter *strea
 			case <-readDone:
 				return nil
 			case <-ticker.C:
-				if writeErr := writeWorldSnapshot(ctx, conn, database, viewer); writeErr != nil {
+				if writeErr := writeWorldSnapshot(ctx, conn, database, viewer, nil); writeErr != nil {
 					return nil
 				}
 			}
@@ -149,7 +171,7 @@ func makeWorldStreamHandler(database *gorm.DB, cfg config.Config, limiter *strea
 	}
 }
 
-func writeWorldSnapshot(ctx context.Context, conn *websocket.Conn, database *gorm.DB, viewer *streamViewer) error {
+func writeWorldSnapshot(ctx context.Context, conn *websocket.Conn, database *gorm.DB, viewer *streamViewer, resumeCursor *streamResumeCursor) error {
 	realmID := uint(1)
 	if viewer != nil && viewer.RealmID != 0 {
 		realmID = viewer.RealmID
@@ -167,6 +189,7 @@ func writeWorldSnapshot(ctx context.Context, conn *websocket.Conn, database *gor
 
 	event := worldStreamEvent{
 		Type:        "world_snapshot",
+		EventID:     composeStreamEventID(realmID, tick),
 		At:          time.Now().UTC().Format(time.RFC3339),
 		Tick:        tick,
 		Day:         tick / (24 * 60),
@@ -175,6 +198,10 @@ func writeWorldSnapshot(ctx context.Context, conn *websocket.Conn, database *gor
 		DayPart:     dayPartLabel(market.MinuteOfDay),
 		MarketOpen:  market.IsOpen,
 		MarketState: market.SessionState,
+	}
+
+	if resumeCursor != nil && strings.TrimSpace(resumeCursor.Raw) != "" {
+		event.Resume = buildResumeStatus(resumeCursor, realmID, tick, event.EventID)
 	}
 
 	if viewer != nil {
@@ -237,6 +264,117 @@ func writeWorldSnapshot(ctx context.Context, conn *websocket.Conn, database *gor
 
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	return conn.WriteJSON(event)
+}
+
+func buildResumeStatus(cursor *streamResumeCursor, currentRealmID uint, currentTick int64, resolvedEventID string) *streamResumeStatus {
+	status := &streamResumeStatus{
+		RequestedLastEventID: strings.TrimSpace(cursor.Raw),
+		ResolvedEventID:      resolvedEventID,
+		Mode:                 "snapshot_fallback",
+	}
+
+	if !cursor.Valid {
+		status.Reason = cursor.Reason
+		return status
+	}
+	if cursor.RealmID != currentRealmID {
+		status.Reason = "realm_mismatch"
+		return status
+	}
+
+	gap := currentTick - cursor.Tick
+	if gap <= 1 {
+		status.Mode = "cursor"
+		status.Reason = "cursor_contiguous"
+		return status
+	}
+
+	status.GapTicks = gap
+	status.Reason = "cursor_gap_snapshot"
+	return status
+}
+
+func composeStreamEventID(realmID uint, tick int64) string {
+	return fmt.Sprintf("%d:%d", realmID, tick)
+}
+
+func parseStreamResumeCursor(raw string) *streamResumeCursor {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ":")
+	if len(parts) != 2 {
+		return &streamResumeCursor{Raw: raw, Valid: false, Reason: "invalid_format"}
+	}
+
+	realm, realmErr := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 64)
+	tick, tickErr := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+	if realmErr != nil || realm == 0 {
+		return &streamResumeCursor{Raw: raw, Valid: false, Reason: "invalid_realm"}
+	}
+	if tickErr != nil || tick < 0 {
+		return &streamResumeCursor{Raw: raw, Valid: false, Reason: "invalid_tick"}
+	}
+
+	return &streamResumeCursor{Raw: raw, RealmID: uint(realm), Tick: tick, Valid: true}
+}
+
+func buildOriginChecker(cfg config.Config) func(r *http.Request) bool {
+	allowed := map[string]struct{}{}
+	for _, origin := range cfg.StreamAllowedOrigins {
+		normalized := normalizeOrigin(origin)
+		if normalized == "" {
+			continue
+		}
+		allowed[normalized] = struct{}{}
+	}
+
+	frontendOrigin := normalizeOrigin(cfg.FrontendDevProxyURL)
+	if frontendOrigin != "" {
+		allowed[frontendOrigin] = struct{}{}
+	}
+
+	return func(r *http.Request) bool {
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin == "" {
+			return true
+		}
+
+		normalizedOrigin := normalizeOrigin(origin)
+		if normalizedOrigin == "" {
+			return false
+		}
+
+		reqHost := strings.TrimSpace(r.Host)
+		if reqHost != "" {
+			if normalizedOrigin == "http://"+reqHost || normalizedOrigin == "https://"+reqHost {
+				return true
+			}
+		}
+
+		_, ok := allowed[normalizedOrigin]
+		return ok
+	}
+}
+
+func normalizeOrigin(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return ""
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host
 }
 
 func resolveStreamViewer(ctx context.Context, rawCharacterID string, database *gorm.DB) (*streamViewer, error) {

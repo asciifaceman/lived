@@ -55,6 +55,11 @@ export type OnboardingStartData = {
   created: boolean;
 };
 
+export type OnboardingSwitchData = {
+  character: CharacterBrief;
+  changed: boolean;
+};
+
 export type VersionData = {
   api: string;
   backend: string;
@@ -244,6 +249,7 @@ export type AdminChatChannelEntry = AdminChatChannelBinding & {
   name: string;
   subject?: string;
   description?: string;
+  active?: boolean;
 };
 
 export type AdminChatPolicyBinding = {
@@ -526,6 +532,17 @@ export async function startOnboarding(name: string, realmId: number): Promise<On
   );
 }
 
+export async function switchOnboardingCharacter(characterId: number): Promise<OnboardingSwitchData> {
+  return request<OnboardingSwitchData>(
+    "/v1/onboarding/switch",
+    {
+      method: "POST",
+      body: JSON.stringify({ characterId })
+    },
+    { auth: true }
+  );
+}
+
 export async function getPlayerStatus(characterId?: number): Promise<PlayerStatusData> {
   return request<PlayerStatusData>(withQuery("/v1/player/status", { characterId }), { method: "GET" }, { auth: true });
 }
@@ -619,7 +636,18 @@ export async function adminGetRealms(): Promise<{ realms: AdminRealm[] }> {
   return request<{ realms: AdminRealm[] }>("/v1/admin/realms", { method: "GET" }, { auth: true });
 }
 
-export async function adminSetRealmConfig(realmId: number, payload: { name?: string; whitelistOnly?: boolean }): Promise<{ realmId: number; name: string; whitelistOnly: boolean; occurredTick: number }> {
+export async function adminCreateRealm(payload: { name?: string; whitelistOnly?: boolean; reasonCode?: string; note?: string }): Promise<{ realmId: number; name: string; whitelistOnly: boolean; occurredTick: number }> {
+  return request<{ realmId: number; name: string; whitelistOnly: boolean; occurredTick: number }>(
+    "/v1/admin/realms",
+    {
+      method: "POST",
+      body: JSON.stringify(payload)
+    },
+    { auth: true }
+  );
+}
+
+export async function adminSetRealmConfig(realmId: number, payload: { command?: "edit"; name?: string; whitelistOnly?: boolean }): Promise<{ realmId: number; name: string; whitelistOnly: boolean; occurredTick: number }> {
   return request<{ realmId: number; name: string; whitelistOnly: boolean; occurredTick: number }>(
     `/v1/admin/realms/${realmId}/config`,
     {
@@ -691,7 +719,7 @@ export async function adminModerateAccount(accountId: number, route: "lock" | "u
 
 export async function adminSetAccountStatus(
   accountId: number,
-  payload: { status: "active" | "locked"; reasonCode: string; note?: string; revokeSessions?: boolean }
+  payload: { command?: "set_status"; status: "active" | "locked"; reasonCode: string; note?: string; revokeSessions?: boolean }
 ): Promise<Record<string, unknown>> {
   return request<Record<string, unknown>>(
     `/v1/admin/moderation/accounts/${accountId}/status`,
@@ -705,10 +733,33 @@ export async function adminSetAccountStatus(
 
 export async function adminSetAccountRole(
   accountId: number,
-  payload: { roleKey: string; action: "grant" | "revoke"; reasonCode: string; note?: string }
+  payload: { command?: "set_role"; roleKey: string; action: "grant" | "revoke"; reasonCode: string; note?: string }
 ): Promise<Record<string, unknown>> {
   return request<Record<string, unknown>>(
     `/v1/admin/moderation/accounts/${accountId}/roles`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload)
+    },
+    { auth: true }
+  );
+}
+
+export async function adminModerateAccountsBulk(payload: {
+  command: "set_status" | "set_role";
+  realmId: number;
+  accountIds?: number[];
+  limit?: number;
+  dryRun?: boolean;
+  status?: "active" | "locked";
+  revokeSessions?: boolean;
+  roleKey?: string;
+  action?: "grant" | "revoke";
+  reasonCode: string;
+  note?: string;
+}): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(
+    "/v1/admin/moderation/accounts/bulk",
     {
       method: "POST",
       body: JSON.stringify(payload)
@@ -743,7 +794,7 @@ export async function adminListCharacters(filters: {
 
 export async function adminModerateCharacter(
   characterId: number,
-  payload: { name?: string; status?: "active" | "locked"; isPrimary?: boolean; reasonCode: string; note?: string }
+  payload: { command?: "edit"; name?: string; status?: "active" | "locked"; isPrimary?: boolean; reasonCode: string; note?: string }
 ): Promise<Record<string, unknown>> {
   return request<Record<string, unknown>>(
     `/v1/admin/moderation/characters/${characterId}`,
@@ -755,8 +806,8 @@ export async function adminModerateCharacter(
   );
 }
 
-export async function adminChatUpsertChannel(payload: { scope?: "realm"; realmId?: number; key: string; name: string; subject?: string; description?: string }): Promise<AdminChatChannelBinding & { name: string; subject?: string; created: boolean }> {
-  return request<AdminChatChannelBinding & { name: string; subject?: string; created: boolean }>(
+export async function adminChatUpsertChannel(payload: { command?: "create" | "edit" | "attach" | "upsert"; scope?: "realm"; realmId?: number; key: string; name: string; subject?: string; description?: string; reasonCode?: string; note?: string }): Promise<AdminChatChannelBinding & { command?: string; name: string; subject?: string; created: boolean }> {
+  return request<AdminChatChannelBinding & { command?: string; name: string; subject?: string; created: boolean }>(
     "/v1/admin/chat/channels",
     {
       method: "POST",
@@ -766,9 +817,28 @@ export async function adminChatUpsertChannel(payload: { scope?: "realm"; realmId
   );
 }
 
-export async function adminChatListChannels(filters?: { realmId?: number }): Promise<{ scope: "realm"; realmId?: number; channels: AdminChatChannelEntry[] }> {
-  return request<{ scope: "realm"; realmId?: number; channels: AdminChatChannelEntry[] }>(
-    withQuery("/v1/admin/chat/channels", { realmId: filters?.realmId }),
+export async function adminChatCreateChannel(payload: { realmId: number; key: string; name: string; subject?: string; description?: string; reasonCode?: string; note?: string }): Promise<AdminChatChannelBinding & { command?: string; name: string; subject?: string; created: boolean }> {
+  return adminChatUpsertChannel({ ...payload, command: "create" });
+}
+
+export async function adminChatEditChannel(payload: { realmId?: number; key: string; name: string; subject?: string; description?: string; reasonCode?: string; note?: string }): Promise<AdminChatChannelBinding & { command?: string; name: string; subject?: string; created: boolean }> {
+  return adminChatUpsertChannel({ ...payload, command: "edit" });
+}
+
+export async function adminChatAttachChannel(payload: { realmId: number; key: string; reasonCode?: string; note?: string }): Promise<AdminChatChannelBinding & { command?: string; name: string; subject?: string; created: boolean }> {
+  return adminChatUpsertChannel({
+    command: "attach",
+    realmId: payload.realmId,
+    key: payload.key,
+    name: "",
+    reasonCode: payload.reasonCode,
+    note: payload.note
+  });
+}
+
+export async function adminChatListChannels(filters?: { realmId?: number; includeInactive?: boolean }): Promise<{ scope: "realm"; realmId?: number; includeInactive?: boolean; channels: AdminChatChannelEntry[] }> {
+  return request<{ scope: "realm"; realmId?: number; includeInactive?: boolean; channels: AdminChatChannelEntry[] }>(
+    withQuery("/v1/admin/chat/channels", { realmId: filters?.realmId, includeInactive: filters?.includeInactive ? "true" : undefined }),
     { method: "GET" },
     { auth: true }
   );

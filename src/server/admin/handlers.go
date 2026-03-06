@@ -16,8 +16,10 @@ import (
 
 	"github.com/asciifaceman/lived/pkg/config"
 	"github.com/asciifaceman/lived/pkg/dal"
+	"github.com/asciifaceman/lived/pkg/telemetry"
 	"github.com/asciifaceman/lived/src/gameplay"
 	serverAuth "github.com/asciifaceman/lived/src/server/auth"
+	"github.com/asciifaceman/lived/src/server/requestbind"
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
 )
@@ -30,6 +32,8 @@ const (
 	realmControlStateKey    = "realm_pause_state"
 	defaultAuditLimit       = 100
 	maxAuditLimit           = 500
+	defaultBulkModLimit     = 50
+	maxBulkModLimit         = 200
 	defaultStatsWindowTicks = int64(24 * 60)
 	maxStatsWindowTicks     = int64(30 * 24 * 60)
 
@@ -37,10 +41,15 @@ const (
 	actionMarketSetPrice      = "market_set_price"
 	actionRealmPause          = "realm_pause"
 	actionRealmResume         = "realm_resume"
+	actionRealmDecommission   = "realm_decommission"
+	actionRealmRecommission   = "realm_recommission"
+	actionRealmDelete         = "realm_delete"
 	actionRealmCreate         = "realm_create"
 	actionAccountLock         = "account_lock"
 	actionAccountUnlock       = "account_unlock"
 	actionAccountStatusSet    = "account_status_set"
+	actionAccountBulkModerate = "account_bulk_moderation"
+	actionAccountBulkPreview  = "account_bulk_preview"
 	actionRoleGrant           = "account_role_grant"
 	actionRoleRevoke          = "account_role_revoke"
 	actionCharacterModify     = "character_modify"
@@ -53,6 +62,9 @@ var (
 	errCannotLockOwnAccount   = errors.New("cannot lock your own account")
 	errCannotRevokeOwnAdmin   = errors.New("cannot revoke your own admin role")
 	errLastActiveAdminBlocked = errors.New("operation would remove the last active admin account")
+	errCannotDeleteDefaultRealm          = errors.New("default realm cannot be deleted")
+	errRealmDeleteRequiresDecommission   = errors.New("realm must be decommissioned before delete")
+	errRealmDeleteHasCharacters          = errors.New("realm still has characters; migrate or remove characters before delete")
 )
 
 type apiResponse struct {
@@ -84,6 +96,7 @@ type moderationActionRequest struct {
 }
 
 type moderationRoleRequest struct {
+	Command    string `json:"command,omitempty"`
 	RoleKey    string `json:"roleKey"`
 	Action     string `json:"action"`
 	ReasonCode string `json:"reasonCode"`
@@ -91,6 +104,7 @@ type moderationRoleRequest struct {
 }
 
 type moderationAccountStatusRequest struct {
+	Command        string `json:"command,omitempty"`
 	Status         string `json:"status"`
 	ReasonCode     string `json:"reasonCode"`
 	Note           string `json:"note,omitempty"`
@@ -98,6 +112,7 @@ type moderationAccountStatusRequest struct {
 }
 
 type moderationCharacterRequest struct {
+	Command    string  `json:"command,omitempty"`
 	Name       *string `json:"name,omitempty"`
 	Status     *string `json:"status,omitempty"`
 	IsPrimary  *bool   `json:"isPrimary,omitempty"`
@@ -105,9 +120,31 @@ type moderationCharacterRequest struct {
 	Note       string  `json:"note,omitempty"`
 }
 
+type bulkAccountModerationRequest struct {
+	Command        string `json:"command"`
+	RealmID        uint   `json:"realmId"`
+	AccountIDs     []uint `json:"accountIds,omitempty"`
+	Limit          int    `json:"limit,omitempty"`
+	DryRun         bool   `json:"dryRun,omitempty"`
+	Status         string `json:"status,omitempty"`
+	RevokeSessions *bool  `json:"revokeSessions,omitempty"`
+	RoleKey        string `json:"roleKey,omitempty"`
+	Action         string `json:"action,omitempty"`
+	ReasonCode     string `json:"reasonCode"`
+	Note           string `json:"note,omitempty"`
+}
+
 type realmConfigRequest struct {
+	Command       string `json:"command,omitempty"`
 	Name          string `json:"name"`
 	WhitelistOnly *bool  `json:"whitelistOnly,omitempty"`
+}
+
+type realmCreateRequest struct {
+	Name          string `json:"name,omitempty"`
+	WhitelistOnly *bool  `json:"whitelistOnly,omitempty"`
+	ReasonCode    string `json:"reasonCode,omitempty"`
+	Note          string `json:"note,omitempty"`
 }
 
 type realmAccessRequest struct {
@@ -117,6 +154,7 @@ type realmAccessRequest struct {
 }
 
 type validatedRoleModeration struct {
+	Command    string
 	RoleKey    string
 	Action     string
 	ReasonCode string
@@ -124,6 +162,7 @@ type validatedRoleModeration struct {
 }
 
 type validatedAccountStatusModeration struct {
+	Command        string
 	Status         string
 	ReasonCode     string
 	Note           string
@@ -131,11 +170,26 @@ type validatedAccountStatusModeration struct {
 }
 
 type validatedCharacterModeration struct {
+	Command    string
 	Name       *string
 	Status     *string
 	IsPrimary  *bool
 	ReasonCode string
 	Note       string
+}
+
+type validatedBulkAccountModeration struct {
+	Command        string
+	RealmID        uint
+	AccountIDs     []uint
+	Limit          int
+	DryRun         bool
+	Status         string
+	RevokeSessions bool
+	RoleKey        string
+	Action         string
+	ReasonCode     string
+	Note           string
 }
 
 type auditQuery struct {
@@ -165,6 +219,7 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 
 	authMW := serverAuth.RequireAuth(database, cfg)
 	group.GET("/realms", makeRealmsHandler(database), authMW, requireAdminRole())
+	group.POST("/realms", makeRealmCreateHandler(database), authMW, requireAdminRole())
 	group.GET("/audit", makeAuditHandler(database), authMW, requireAdminRole())
 	group.GET("/audit/export", makeAuditExportHandler(database), authMW, requireAdminRole())
 	group.GET("/audit/:id", makeAuditDetailHandler(database), authMW, requireAdminRole())
@@ -177,6 +232,7 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 	group.POST("/moderation/accounts/:id/unlock", makeAccountUnlockHandler(database), authMW, requireAdminRole())
 	group.POST("/moderation/accounts/:id/status", makeAccountStatusHandler(database), authMW, requireAdminRole())
 	group.POST("/moderation/accounts/:id/roles", makeAccountRoleModerationHandler(database), authMW, requireAdminRole())
+	group.POST("/moderation/accounts/bulk", makeBulkAccountModerationHandler(database), authMW, requireAdminRole())
 	group.GET("/moderation/characters", makeCharacterModerationListHandler(database), authMW, requireAdminRole())
 	group.POST("/moderation/characters/:id", makeCharacterModerationHandler(database), authMW, requireAdminRole())
 	group.GET("/chat/channels", makeChatChannelListHandler(database), authMW, requireAdminRole())
@@ -188,7 +244,7 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 	group.GET("/chat/wordlist", makeChatWordlistListHandler(database), authMW, requireAdminRole())
 	group.POST("/chat/wordlist", makeChatWordlistAddHandler(database), authMW, requireAdminRole())
 	group.DELETE("/chat/wordlist/:ruleId", makeChatWordlistRemoveHandler(database), authMW, requireAdminRole())
-	group.GET("/stats", makeStatsHandler(database), authMW, requireAdminRole())
+	group.GET("/stats", makeStatsHandler(database, cfg), authMW, requireAdminRole())
 }
 
 func makeAuditHandler(database *gorm.DB) echo.HandlerFunc {
@@ -439,7 +495,92 @@ func makeRealmsHandler(database *gorm.DB) echo.HandlerFunc {
 	}
 }
 
-func makeStatsHandler(database *gorm.DB) echo.HandlerFunc {
+func makeRealmCreateHandler(database *gorm.DB) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+		if !ok {
+			return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+		}
+
+		var req realmCreateRequest
+		if err := requestbind.JSON(c, &req, "invalid realm create payload"); err != nil {
+			return err
+		}
+
+		displayName := strings.TrimSpace(req.Name)
+		if displayName != "" && (len(displayName) < 2 || len(displayName) > 64) {
+			return echo.NewHTTPError(http.StatusBadRequest, "name must be between 2 and 64 characters")
+		}
+
+		reasonInput := strings.TrimSpace(req.ReasonCode)
+		if reasonInput == "" {
+			reasonInput = actionRealmCreate
+		}
+		reasonCode, note, err := validateReasonAndNote(reasonInput, req.Note)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		whitelistOnly := req.WhitelistOnly != nil && *req.WhitelistOnly
+		resultData := map[string]any{}
+
+		err = database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
+			realmID, reserveErr := reserveNextRealmID(c.Request().Context(), tx)
+			if reserveErr != nil {
+				return reserveErr
+			}
+
+			beforeState, bootstrapState, bootstrapErr := applyRealmCreate(c.Request().Context(), tx, realmID)
+			if bootstrapErr != nil {
+				return bootstrapErr
+			}
+
+			resolvedName := displayName
+			if resolvedName == "" {
+				resolvedName = defaultRealmDisplayName(realmID)
+			}
+
+			if err := tx.WithContext(c.Request().Context()).Model(&dal.RealmConfig{}).Where("realm_id = ?", realmID).Updates(map[string]any{
+				"display_name":   resolvedName,
+				"whitelist_only": whitelistOnly,
+				"decommissioned": false,
+				"updated_at":     time.Now().UTC(),
+			}).Error; err != nil {
+				return err
+			}
+
+			tick, tickErr := adminAuditTick(c.Request().Context(), tx, realmID)
+			if tickErr != nil {
+				return tickErr
+			}
+
+			afterState := map[string]any{
+				"realmId":       realmID,
+				"name":          resolvedName,
+				"whitelistOnly": whitelistOnly,
+				"bootstrap":     bootstrapState,
+			}
+			if err := appendAdminAudit(tx, actor.AccountID, actionRealmCreate, reasonCode, note, beforeState, afterState, tick, realmID); err != nil {
+				return err
+			}
+
+			resultData["realmId"] = realmID
+			resultData["name"] = resolvedName
+			resultData["whitelistOnly"] = whitelistOnly
+			resultData["occurredTick"] = tick
+			resultData["action"] = actionRealmCreate
+			resultData["reasonCode"] = reasonCode
+			return nil
+		})
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to create realm")
+		}
+
+		return respondSuccess(c, http.StatusOK, "Realm created.", resultData)
+	}
+}
+
+func makeStatsHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		windowTicks, err := parseWindowTicks(c.QueryParam("windowTicks"))
 		if err != nil {
@@ -555,12 +696,34 @@ func makeStatsHandler(database *gorm.DB) echo.HandlerFunc {
 			})
 		}
 
+		tickAggregate := telemetry.SnapshotWorldTickAggregate()
+		targetTickMS := cfg.TickInterval.Seconds() * 1000
+		budgetDeltaMS := tickAggregate.AvgDurationMS - targetTickMS
+		budgetRatio := 0.0
+		if targetTickMS > 0 {
+			budgetRatio = tickAggregate.AvgDurationMS / targetTickMS
+		}
+
 		return respondSuccess(c, http.StatusOK, "Admin stats loaded.", map[string]any{
 			"activeAccounts":    activeAccounts,
 			"activeCharacters":  activeCharacters,
 			"activeSessions":    activeSessions,
 			"queuedOrActive":    queuedBehaviors,
 			"publicWorldEvents": worldEvents,
+			"tickBudget": map[string]any{
+				"targetTickMs":       targetTickMS,
+				"avgTickMs":          tickAggregate.AvgDurationMS,
+				"budgetDeltaMs":      budgetDeltaMS,
+				"budgetRatio":        budgetRatio,
+				"totalRuns":          tickAggregate.TotalRuns,
+				"totalFailures":      tickAggregate.TotalFailures,
+				"failureRate":        tickAggregate.FailureRate,
+				"avgAdvanceMinutes":  tickAggregate.AvgAdvanceMinutes,
+				"lastTickMs":         tickAggregate.LastDurationMS,
+				"lastAdvanceMinutes": tickAggregate.LastAdvanceMinutes,
+				"lastRealmId":        tickAggregate.LastRealmID,
+				"lastUpdatedAt":      tickAggregate.LastUpdatedAt,
+			},
 			"adminAudit": map[string]any{
 				"total":       adminAuditTotal,
 				"windowTotal": adminAuditWindow,
@@ -589,8 +752,8 @@ func makeRealmActionHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req realmActionRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid admin action payload")
+		if err := requestbind.JSON(c, &req, "invalid admin action payload"); err != nil {
+			return err
 		}
 
 		action, err := validateRealmAction(req)
@@ -641,13 +804,32 @@ func makeRealmActionHandler(database *gorm.DB) echo.HandlerFunc {
 				}
 				beforeState = before
 				afterState = after
-			case actionRealmCreate:
-				before, after, applyErr := applyRealmCreate(c.Request().Context(), tx, realmID)
+			case actionRealmDecommission:
+				before, after, revokedSessions, drainedBehaviors, broadcastEventID, applyErr := applyRealmDecommission(c.Request().Context(), tx, realmID, action.ReasonCode, action.Note, tick)
 				if applyErr != nil {
 					return applyErr
 				}
 				beforeState = before
 				afterState = after
+				resultData["revokedSessions"] = revokedSessions
+				resultData["drainedBehaviors"] = drainedBehaviors
+				resultData["maintenanceBroadcastEventId"] = broadcastEventID
+			case actionRealmRecommission:
+				before, after, broadcastEventID, applyErr := applyRealmRecommission(c.Request().Context(), tx, realmID, action.ReasonCode, action.Note, tick)
+				if applyErr != nil {
+					return applyErr
+				}
+				beforeState = before
+				afterState = after
+				resultData["maintenanceBroadcastEventId"] = broadcastEventID
+			case actionRealmDelete:
+				before, after, deletedRows, applyErr := applyRealmDelete(c.Request().Context(), tx, realmID, action.ReasonCode, action.Note, tick)
+				if applyErr != nil {
+					return applyErr
+				}
+				beforeState = before
+				afterState = after
+				resultData["deletedRows"] = deletedRows
 			default:
 				return fmt.Errorf("unsupported realm action")
 			}
@@ -678,6 +860,12 @@ func makeRealmActionHandler(database *gorm.DB) echo.HandlerFunc {
 			return nil
 		})
 		if err != nil {
+			if errors.Is(err, errCannotDeleteDefaultRealm) {
+				return echo.NewHTTPError(http.StatusConflict, err.Error())
+			}
+			if errors.Is(err, errRealmDeleteRequiresDecommission) || errors.Is(err, errRealmDeleteHasCharacters) {
+				return echo.NewHTTPError(http.StatusConflict, err.Error())
+			}
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to apply admin action")
 		}
 
@@ -703,8 +891,16 @@ func makeRealmConfigHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req realmConfigRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid realm config payload")
+		if err := requestbind.JSON(c, &req, "invalid realm config payload"); err != nil {
+			return err
+		}
+
+		command := strings.TrimSpace(strings.ToLower(req.Command))
+		if command == "" {
+			command = "edit"
+		}
+		if command != "edit" {
+			return echo.NewHTTPError(http.StatusBadRequest, "command must be edit")
 		}
 
 		name := strings.TrimSpace(req.Name)
@@ -770,6 +966,7 @@ func makeRealmConfigHandler(database *gorm.DB) echo.HandlerFunc {
 			}
 
 			result["realmId"] = realmID
+			result["command"] = command
 			result["name"] = nextName
 			result["whitelistOnly"] = nextWhitelist
 			result["occurredTick"] = tick
@@ -850,8 +1047,8 @@ func makeRealmAccessGrantHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req realmAccessRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid realm access payload")
+		if err := requestbind.JSON(c, &req, "invalid realm access payload"); err != nil {
+			return err
 		}
 		if req.AccountID == 0 {
 			return echo.NewHTTPError(http.StatusBadRequest, "accountId is required")
@@ -947,8 +1144,8 @@ func makeRealmAccessRevokeHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req realmAccessRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid realm access payload")
+		if err := requestbind.JSON(c, &req, "invalid realm access payload"); err != nil {
+			return err
 		}
 		if req.AccountID == 0 {
 			return echo.NewHTTPError(http.StatusBadRequest, "accountId is required")
@@ -1021,8 +1218,8 @@ func makeAccountLockHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req moderationActionRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid moderation payload")
+		if err := requestbind.JSON(c, &req, "invalid moderation payload"); err != nil {
+			return err
 		}
 
 		reasonCode, note, err := validateReasonAndNote(req.ReasonCode, req.Note)
@@ -1117,8 +1314,8 @@ func makeAccountUnlockHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req moderationActionRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid moderation payload")
+		if err := requestbind.JSON(c, &req, "invalid moderation payload"); err != nil {
+			return err
 		}
 
 		reasonCode, note, err := validateReasonAndNote(req.ReasonCode, req.Note)
@@ -1182,8 +1379,8 @@ func makeAccountRoleModerationHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req moderationRoleRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid moderation role payload")
+		if err := requestbind.JSON(c, &req, "invalid moderation role payload"); err != nil {
+			return err
 		}
 
 		validated, err := validateRoleModeration(req)
@@ -1297,8 +1494,8 @@ func makeAccountStatusHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req moderationAccountStatusRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid account status payload")
+		if err := requestbind.JSON(c, &req, "invalid account status payload"); err != nil {
+			return err
 		}
 
 		validated, err := validateAccountStatusModeration(req)
@@ -1392,6 +1589,273 @@ func makeAccountStatusHandler(database *gorm.DB) echo.HandlerFunc {
 	}
 }
 
+func makeBulkAccountModerationHandler(database *gorm.DB) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+		if !ok {
+			return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+		}
+
+		var req bulkAccountModerationRequest
+		if err := requestbind.JSON(c, &req, "invalid bulk moderation payload"); err != nil {
+			return err
+		}
+
+		validated, err := validateBulkAccountModeration(req)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		tick, err := adminAuditTick(c.Request().Context(), database, validated.RealmID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+		}
+
+		response := map[string]any{}
+		err = database.WithContext(c.Request().Context()).Transaction(func(tx *gorm.DB) error {
+			realmAccountIDs, err := listActiveRealmAccountIDs(c.Request().Context(), tx, validated.RealmID)
+			if err != nil {
+				return err
+			}
+
+			realmAccountSet := make(map[uint]struct{}, len(realmAccountIDs))
+			for _, accountID := range realmAccountIDs {
+				realmAccountSet[accountID] = struct{}{}
+			}
+
+			targeted := make([]uint, 0)
+			failed := make([]map[string]any, 0)
+			if len(validated.AccountIDs) > 0 {
+				for _, accountID := range validated.AccountIDs {
+					if _, exists := realmAccountSet[accountID]; !exists {
+						failed = append(failed, map[string]any{"accountId": accountID, "reason": "account not active in realm"})
+						continue
+					}
+					targeted = append(targeted, accountID)
+				}
+			} else {
+				targeted = append(targeted, realmAccountIDs...)
+				if len(targeted) > validated.Limit {
+					targeted = targeted[:validated.Limit]
+				}
+			}
+
+			accounts := make([]dal.Account, 0)
+			if len(targeted) > 0 {
+				if err := tx.WithContext(c.Request().Context()).Where("id IN ?", targeted).Find(&accounts).Error; err != nil {
+					return err
+				}
+			}
+
+			accountsByID := make(map[uint]dal.Account, len(accounts))
+			for _, account := range accounts {
+				accountsByID[account.ID] = account
+			}
+
+			results := make([]map[string]any, 0, len(targeted))
+			skipped := make([]map[string]any, 0)
+			changedCount := 0
+			processedCount := 0
+
+			for _, accountID := range targeted {
+				account, exists := accountsByID[accountID]
+				if !exists {
+					failed = append(failed, map[string]any{"accountId": accountID, "reason": "account not found"})
+					continue
+				}
+
+				processedCount++
+				resultRow := map[string]any{
+					"accountId": accountID,
+					"status":    account.Status,
+				}
+
+				switch validated.Command {
+				case "set_status":
+					hasAdminRole, roleErr := accountHasRole(c.Request().Context(), tx, accountID, roleAdmin)
+					if roleErr != nil {
+						return roleErr
+					}
+
+					if validated.Status == statusLocked {
+						if accountID == actor.AccountID {
+							failed = append(failed, map[string]any{"accountId": accountID, "reason": errCannotLockOwnAccount.Error()})
+							continue
+						}
+						if hasAdminRole {
+							remainingAdmins, countErr := countActiveAdminAccountsExcluding(c.Request().Context(), tx, accountID)
+							if countErr != nil {
+								return countErr
+							}
+							if remainingAdmins == 0 {
+								failed = append(failed, map[string]any{"accountId": accountID, "reason": errLastActiveAdminBlocked.Error()})
+								continue
+							}
+						}
+					}
+
+					changed := account.Status != validated.Status || validated.RevokeSessions
+					if !changed {
+						skipped = append(skipped, map[string]any{"accountId": accountID, "reason": "status already set and no session revocation requested"})
+						continue
+					}
+
+					revokedSessions := int64(0)
+					if !validated.DryRun {
+						if err := tx.WithContext(c.Request().Context()).Model(&dal.Account{}).Where("id = ?", accountID).Update("status", validated.Status).Error; err != nil {
+							return err
+						}
+						if validated.RevokeSessions {
+							updates := tx.WithContext(c.Request().Context()).Model(&dal.AccountSession{}).
+								Where("account_id = ? AND revoked_at IS NULL", accountID).
+								Update("revoked_at", gorm.Expr("NOW()"))
+							if updates.Error != nil {
+								return updates.Error
+							}
+							revokedSessions = updates.RowsAffected
+						}
+
+						before := map[string]any{"status": account.Status}
+						after := map[string]any{"status": validated.Status, "revokeSessions": validated.RevokeSessions, "revokedSessions": revokedSessions}
+						if err := appendAdminAudit(tx, actor.AccountID, actionAccountStatusSet, validated.ReasonCode, validated.Note, before, after, tick, validated.RealmID); err != nil {
+							return err
+						}
+					}
+
+					changedCount++
+					resultRow["changed"] = true
+					resultRow["nextStatus"] = validated.Status
+					resultRow["revokeSessions"] = validated.RevokeSessions
+					resultRow["revokedSessions"] = revokedSessions
+					results = append(results, resultRow)
+
+				case "set_role":
+					beforeRoles, roleErr := loadAccountRoles(c.Request().Context(), tx, accountID)
+					if roleErr != nil {
+						return roleErr
+					}
+					hasTargetRole := hasRole(beforeRoles, validated.RoleKey)
+
+					if validated.Action == "revoke" && validated.RoleKey == roleAdmin {
+						if accountID == actor.AccountID {
+							failed = append(failed, map[string]any{"accountId": accountID, "reason": errCannotRevokeOwnAdmin.Error()})
+							continue
+						}
+						if hasTargetRole {
+							remainingAdmins, countErr := countActiveAdminAccountsExcluding(c.Request().Context(), tx, accountID)
+							if countErr != nil {
+								return countErr
+							}
+							if remainingAdmins == 0 {
+								failed = append(failed, map[string]any{"accountId": accountID, "reason": errLastActiveAdminBlocked.Error()})
+								continue
+							}
+						}
+					}
+
+					if validated.Action == "grant" && hasTargetRole {
+						skipped = append(skipped, map[string]any{"accountId": accountID, "reason": "role already granted"})
+						continue
+					}
+					if validated.Action == "revoke" && !hasTargetRole {
+						skipped = append(skipped, map[string]any{"accountId": accountID, "reason": "role not currently granted"})
+						continue
+					}
+
+					afterRoles := append([]string{}, beforeRoles...)
+					if validated.Action == "grant" {
+						afterRoles = append(afterRoles, validated.RoleKey)
+						sort.Strings(afterRoles)
+					} else {
+						filtered := make([]string, 0, len(afterRoles))
+						for _, role := range afterRoles {
+							if strings.EqualFold(role, validated.RoleKey) {
+								continue
+							}
+							filtered = append(filtered, role)
+						}
+						afterRoles = filtered
+					}
+
+					if !validated.DryRun {
+						if validated.Action == "grant" {
+							if err := tx.WithContext(c.Request().Context()).Create(&dal.AccountRole{AccountID: accountID, RoleKey: validated.RoleKey}).Error; err != nil {
+								return err
+							}
+						} else {
+							if err := tx.WithContext(c.Request().Context()).Where("account_id = ? AND role_key = ?", accountID, validated.RoleKey).Delete(&dal.AccountRole{}).Error; err != nil {
+								return err
+							}
+						}
+
+						auditAction := actionRoleGrant
+						if validated.Action == "revoke" {
+							auditAction = actionRoleRevoke
+						}
+						if err := appendAdminAudit(tx, actor.AccountID, auditAction, validated.ReasonCode, validated.Note, map[string]any{"roles": beforeRoles}, map[string]any{"roles": afterRoles, "roleKey": validated.RoleKey}, tick, validated.RealmID); err != nil {
+							return err
+						}
+					}
+
+					changedCount++
+					resultRow["changed"] = true
+					resultRow["roleKey"] = validated.RoleKey
+					resultRow["action"] = validated.Action
+					resultRow["roles"] = afterRoles
+					results = append(results, resultRow)
+				}
+			}
+
+			before := map[string]any{
+				"command":       validated.Command,
+				"realmId":       validated.RealmID,
+				"dryRun":        validated.DryRun,
+				"targetedCount": len(targeted),
+			}
+			after := map[string]any{
+				"command":       validated.Command,
+				"realmId":       validated.RealmID,
+				"dryRun":        validated.DryRun,
+				"targetedCount": len(targeted),
+				"processedCount": processedCount,
+				"changedCount":  changedCount,
+				"failedCount":   len(failed),
+				"skippedCount":  len(skipped),
+			}
+			auditAction := actionAccountBulkModerate
+			if validated.DryRun {
+				auditAction = actionAccountBulkPreview
+			}
+			if err := appendAdminAudit(tx, actor.AccountID, auditAction, validated.ReasonCode, validated.Note, before, after, tick, validated.RealmID); err != nil {
+				return err
+			}
+
+			response["realmId"] = validated.RealmID
+			response["command"] = validated.Command
+			response["dryRun"] = validated.DryRun
+			response["targetedCount"] = len(targeted)
+			response["processedCount"] = processedCount
+			response["changedCount"] = changedCount
+			response["skippedCount"] = len(skipped)
+			response["failedCount"] = len(failed)
+			response["results"] = results
+			response["skipped"] = skipped
+			response["failed"] = failed
+			response["reasonCode"] = validated.ReasonCode
+			response["occurredTick"] = tick
+			return nil
+		})
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to apply bulk account moderation")
+		}
+
+		if validated.DryRun {
+			return respondSuccess(c, http.StatusOK, "Bulk moderation dry-run preview generated.", response)
+		}
+		return respondSuccess(c, http.StatusOK, "Bulk account moderation applied.", response)
+	}
+}
+
 func makeCharacterModerationHandler(database *gorm.DB) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		characterID, err := parseCharacterIDPathParam(c.Param("id"))
@@ -1405,8 +1869,8 @@ func makeCharacterModerationHandler(database *gorm.DB) echo.HandlerFunc {
 		}
 
 		var req moderationCharacterRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid character moderation payload")
+		if err := requestbind.JSON(c, &req, "invalid character moderation payload"); err != nil {
+			return err
 		}
 
 		validated, err := validateCharacterModeration(req)
@@ -1725,6 +2189,26 @@ func parseCharacterModerationFilters(c echo.Context) (characterModerationQuery, 
 	}, nil
 }
 
+func listActiveRealmAccountIDs(ctx context.Context, database *gorm.DB, realmID uint) ([]uint, error) {
+	rows := make([]struct {
+		AccountID uint `gorm:"column:account_id"`
+	}, 0)
+	if err := database.WithContext(ctx).
+		Model(&dal.Character{}).
+		Select("DISTINCT account_id").
+		Where("realm_id = ? AND status = ?", realmID, statusActive).
+		Order("account_id ASC").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	accountIDs := make([]uint, 0, len(rows))
+	for _, row := range rows {
+		accountIDs = append(accountIDs, row.AccountID)
+	}
+	return accountIDs, nil
+}
+
 func parseOptionalUintQuery(raw string, field string) (uint, error) {
 	if strings.TrimSpace(raw) == "" {
 		return 0, nil
@@ -1836,11 +2320,72 @@ func validateRealmAction(req realmActionRequest) (validatedRealmAction, error) {
 			return validatedRealmAction{}, fmt.Errorf("price must be a positive integer for market_set_price")
 		}
 		return validated, nil
-	case actionRealmPause, actionRealmResume, actionRealmCreate:
+	case actionRealmPause, actionRealmResume, actionRealmDecommission, actionRealmRecommission, actionRealmDelete:
 		return validated, nil
 	default:
 		return validatedRealmAction{}, fmt.Errorf("unsupported action")
 	}
+}
+
+func reserveNextRealmID(ctx context.Context, tx *gorm.DB) (uint, error) {
+	for attempts := 0; attempts < 5; attempts++ {
+		maxExistingRealmID, err := maxKnownRealmID(ctx, tx)
+		if err != nil {
+			return 0, err
+		}
+
+		maxIdentityID := uint(0)
+		if err := tx.WithContext(ctx).
+			Model(&dal.Realm{}).
+			Select("COALESCE(MAX(id), 0)").
+			Scan(&maxIdentityID).Error; err != nil {
+			return 0, err
+		}
+
+		nextRealmID := maxExistingRealmID
+		if maxIdentityID > nextRealmID {
+			nextRealmID = maxIdentityID
+		}
+		nextRealmID++
+
+		createErr := tx.WithContext(ctx).Create(&dal.Realm{BaseModel: dal.BaseModel{ID: nextRealmID}}).Error
+		if createErr == nil {
+			return nextRealmID, nil
+		}
+		if !isDuplicateKeyError(createErr) {
+			return 0, createErr
+		}
+	}
+
+	return 0, fmt.Errorf("failed to reserve next realm id")
+}
+
+func maxKnownRealmID(ctx context.Context, database *gorm.DB) (uint, error) {
+	var maxRealmID uint
+	query := `
+		SELECT GREATEST(
+			COALESCE((SELECT MAX(id) FROM realms), 0),
+			COALESCE((SELECT MAX(realm_id) FROM world_states), 0),
+			COALESCE((SELECT MAX(realm_id) FROM world_runtime_states), 0),
+			COALESCE((SELECT MAX(realm_id) FROM realm_configs), 0),
+			COALESCE((SELECT MAX(realm_id) FROM characters), 0)
+		)
+	`
+	if err := database.WithContext(ctx).Raw(query).Scan(&maxRealmID).Error; err != nil {
+		return 0, err
+	}
+	return maxRealmID, nil
+}
+
+func isDuplicateKeyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "duplicate") && strings.Contains(message, "key")
 }
 
 func validateReasonAndNote(rawReasonCode string, rawNote string) (string, string, error) {
@@ -1861,6 +2406,14 @@ func validateReasonAndNote(rawReasonCode string, rawNote string) (string, string
 }
 
 func validateRoleModeration(req moderationRoleRequest) (validatedRoleModeration, error) {
+	command := strings.TrimSpace(strings.ToLower(req.Command))
+	if command == "" {
+		command = "set_role"
+	}
+	if command != "set_role" {
+		return validatedRoleModeration{}, fmt.Errorf("command must be set_role")
+	}
+
 	action := strings.TrimSpace(strings.ToLower(req.Action))
 	roleKey := strings.TrimSpace(strings.ToLower(req.RoleKey))
 	reasonCode, note, err := validateReasonAndNote(req.ReasonCode, req.Note)
@@ -1885,6 +2438,7 @@ func validateRoleModeration(req moderationRoleRequest) (validatedRoleModeration,
 	}
 
 	return validatedRoleModeration{
+		Command:    command,
 		RoleKey:    roleKey,
 		Action:     action,
 		ReasonCode: reasonCode,
@@ -1893,6 +2447,14 @@ func validateRoleModeration(req moderationRoleRequest) (validatedRoleModeration,
 }
 
 func validateAccountStatusModeration(req moderationAccountStatusRequest) (validatedAccountStatusModeration, error) {
+	command := strings.TrimSpace(strings.ToLower(req.Command))
+	if command == "" {
+		command = "set_status"
+	}
+	if command != "set_status" {
+		return validatedAccountStatusModeration{}, fmt.Errorf("command must be set_status")
+	}
+
 	status := strings.TrimSpace(strings.ToLower(req.Status))
 	if status != statusActive && status != statusLocked {
 		return validatedAccountStatusModeration{}, fmt.Errorf("status must be active or locked")
@@ -1909,6 +2471,7 @@ func validateAccountStatusModeration(req moderationAccountStatusRequest) (valida
 	}
 
 	return validatedAccountStatusModeration{
+		Command:        command,
 		Status:         status,
 		ReasonCode:     reasonCode,
 		Note:           note,
@@ -1917,12 +2480,21 @@ func validateAccountStatusModeration(req moderationAccountStatusRequest) (valida
 }
 
 func validateCharacterModeration(req moderationCharacterRequest) (validatedCharacterModeration, error) {
+	command := strings.TrimSpace(strings.ToLower(req.Command))
+	if command == "" {
+		command = "edit"
+	}
+	if command != "edit" {
+		return validatedCharacterModeration{}, fmt.Errorf("command must be edit")
+	}
+
 	reasonCode, note, err := validateReasonAndNote(req.ReasonCode, req.Note)
 	if err != nil {
 		return validatedCharacterModeration{}, err
 	}
 
 	validated := validatedCharacterModeration{
+		Command:    command,
 		ReasonCode: reasonCode,
 		Note:       note,
 	}
@@ -1952,6 +2524,93 @@ func validateCharacterModeration(req moderationCharacterRequest) (validatedChara
 		return validatedCharacterModeration{}, fmt.Errorf("at least one character field must be provided")
 	}
 
+	return validated, nil
+}
+
+func validateBulkAccountModeration(req bulkAccountModerationRequest) (validatedBulkAccountModeration, error) {
+	command := strings.TrimSpace(strings.ToLower(req.Command))
+	if command != "set_status" && command != "set_role" {
+		return validatedBulkAccountModeration{}, fmt.Errorf("command must be set_status or set_role")
+	}
+
+	if req.RealmID == 0 {
+		return validatedBulkAccountModeration{}, fmt.Errorf("realmId is required")
+	}
+
+	limit := req.Limit
+	if limit == 0 {
+		limit = defaultBulkModLimit
+	}
+	if limit < 1 || limit > maxBulkModLimit {
+		return validatedBulkAccountModeration{}, fmt.Errorf("limit must be between 1 and %d", maxBulkModLimit)
+	}
+
+	accountIDs := make([]uint, 0, len(req.AccountIDs))
+	seenAccountID := map[uint]struct{}{}
+	for _, accountID := range req.AccountIDs {
+		if accountID == 0 {
+			return validatedBulkAccountModeration{}, fmt.Errorf("accountIds must contain positive integers")
+		}
+		if _, exists := seenAccountID[accountID]; exists {
+			continue
+		}
+		seenAccountID[accountID] = struct{}{}
+		accountIDs = append(accountIDs, accountID)
+	}
+	if len(accountIDs) > limit {
+		return validatedBulkAccountModeration{}, fmt.Errorf("accountIds exceed limit of %d", limit)
+	}
+
+	reasonCode, note, err := validateReasonAndNote(req.ReasonCode, req.Note)
+	if err != nil {
+		return validatedBulkAccountModeration{}, err
+	}
+
+	validated := validatedBulkAccountModeration{
+		Command:    command,
+		RealmID:    req.RealmID,
+		AccountIDs: accountIDs,
+		Limit:      limit,
+		DryRun:     req.DryRun,
+		ReasonCode: reasonCode,
+		Note:       note,
+	}
+
+	if command == "set_status" {
+		status := strings.TrimSpace(strings.ToLower(req.Status))
+		if status != statusActive && status != statusLocked {
+			return validatedBulkAccountModeration{}, fmt.Errorf("status must be active or locked")
+		}
+		revokeSessions := status == statusLocked
+		if req.RevokeSessions != nil {
+			revokeSessions = *req.RevokeSessions
+		}
+		validated.Status = status
+		validated.RevokeSessions = revokeSessions
+		return validated, nil
+	}
+
+	roleKey := strings.TrimSpace(strings.ToLower(req.RoleKey))
+	if roleKey == "" {
+		return validatedBulkAccountModeration{}, fmt.Errorf("roleKey is required")
+	}
+	if len(roleKey) > 32 {
+		return validatedBulkAccountModeration{}, fmt.Errorf("roleKey must be 32 characters or less")
+	}
+	for _, r := range roleKey {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-' {
+			continue
+		}
+		return validatedBulkAccountModeration{}, fmt.Errorf("roleKey may only contain letters, numbers, underscores, or hyphens")
+	}
+
+	action := strings.TrimSpace(strings.ToLower(req.Action))
+	if action != "grant" && action != "revoke" {
+		return validatedBulkAccountModeration{}, fmt.Errorf("action must be grant or revoke")
+	}
+
+	validated.RoleKey = roleKey
+	validated.Action = action
 	return validated, nil
 }
 
@@ -2086,9 +2745,262 @@ func applyRealmResume(ctx context.Context, tx *gorm.DB, realmID uint, reasonCode
 	return map[string]any{"paused": beforePaused, "reasonCode": beforeReason}, state, nil
 }
 
+func applyRealmDecommission(ctx context.Context, tx *gorm.DB, realmID uint, reasonCode, note string, tick int64) (map[string]any, map[string]any, int64, int64, uint, error) {
+	config, configCreated, err := ensureRealmConfigRow(ctx, tx, realmID)
+	if err != nil {
+		return nil, nil, 0, 0, 0, err
+	}
+
+	beforePaused, beforeReason, err := loadRealmPauseState(ctx, tx, realmID)
+	if err != nil {
+		return nil, nil, 0, 0, 0, err
+	}
+
+	if err := tx.WithContext(ctx).Model(&dal.RealmConfig{}).Where("id = ?", config.ID).Update("decommissioned", true).Error; err != nil {
+		return nil, nil, 0, 0, 0, err
+	}
+
+	_, pauseAfter, revokedSessions, err := applyRealmPause(ctx, tx, realmID, reasonCode, note, tick)
+	if err != nil {
+		return nil, nil, 0, 0, 0, err
+	}
+
+	behaviorDrain := tx.WithContext(ctx).
+		Model(&dal.BehaviorInstance{}).
+		Where("realm_id = ? AND state IN ?", realmID, []string{"queued", "active"}).
+		Updates(map[string]any{
+			"state":          "failed",
+			"failure_reason": "realm_decommissioned",
+			"result_message": "realm entered maintenance",
+		})
+	if behaviorDrain.Error != nil {
+		return nil, nil, 0, 0, 0, behaviorDrain.Error
+	}
+
+	broadcastMessage := fmt.Sprintf("Realm %d entered maintenance and is now decommissioned.", realmID)
+	event := dal.WorldEvent{
+		RealmID:    realmID,
+		Tick:       tick,
+		EventType:  "chat_message_system:global",
+		Message:    broadcastMessage,
+		Visibility: "public",
+		Source:     "System",
+	}
+	if err := tx.WithContext(ctx).Create(&event).Error; err != nil {
+		return nil, nil, 0, 0, 0, err
+	}
+
+	before := map[string]any{
+		"decommissioned": config.Decommissioned,
+		"paused":         beforePaused,
+		"reasonCode":     beforeReason,
+		"configCreated":  configCreated,
+	}
+	after := map[string]any{
+		"decommissioned": true,
+		"paused":         true,
+		"reasonCode":     pauseAfter["reasonCode"],
+		"note":           note,
+		"effectiveTick":  tick,
+		"drainedBehaviors": behaviorDrain.RowsAffected,
+		"broadcast": map[string]any{
+			"channel": "global",
+			"eventId": event.ID,
+		},
+	}
+
+	return before, after, revokedSessions, behaviorDrain.RowsAffected, event.ID, nil
+}
+
+func applyRealmRecommission(ctx context.Context, tx *gorm.DB, realmID uint, reasonCode, note string, tick int64) (map[string]any, map[string]any, uint, error) {
+	config, configCreated, err := ensureRealmConfigRow(ctx, tx, realmID)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	beforePaused, beforeReason, err := loadRealmPauseState(ctx, tx, realmID)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	if err := tx.WithContext(ctx).Model(&dal.RealmConfig{}).Where("id = ?", config.ID).Update("decommissioned", false).Error; err != nil {
+		return nil, nil, 0, err
+	}
+
+	_, resumeAfter, err := applyRealmResume(ctx, tx, realmID, reasonCode, note, tick)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	broadcastMessage := fmt.Sprintf("Realm %d maintenance ended and the realm is recommissioned.", realmID)
+	event := dal.WorldEvent{
+		RealmID:    realmID,
+		Tick:       tick,
+		EventType:  "chat_message_system:global",
+		Message:    broadcastMessage,
+		Visibility: "public",
+		Source:     "System",
+	}
+	if err := tx.WithContext(ctx).Create(&event).Error; err != nil {
+		return nil, nil, 0, err
+	}
+
+	before := map[string]any{
+		"decommissioned": config.Decommissioned,
+		"paused":         beforePaused,
+		"reasonCode":     beforeReason,
+		"configCreated":  configCreated,
+	}
+	after := map[string]any{
+		"decommissioned": false,
+		"paused":         false,
+		"reasonCode":     resumeAfter["reasonCode"],
+		"note":           note,
+		"effectiveTick":  tick,
+		"broadcast": map[string]any{
+			"channel": "global",
+			"eventId": event.ID,
+		},
+	}
+
+	return before, after, event.ID, nil
+}
+
+func ensureRealmConfigRow(ctx context.Context, tx *gorm.DB, realmID uint) (dal.RealmConfig, bool, error) {
+	config := dal.RealmConfig{}
+	result := tx.WithContext(ctx).Where("realm_id = ?", realmID).Limit(1).Find(&config)
+	if result.Error != nil {
+		return dal.RealmConfig{}, false, result.Error
+	}
+	if result.RowsAffected > 0 {
+		return config, false, nil
+	}
+
+	config = dal.RealmConfig{
+		RealmID:        realmID,
+		DisplayName:    defaultRealmDisplayName(realmID),
+		WhitelistOnly:  false,
+		Decommissioned: false,
+	}
+	if err := tx.WithContext(ctx).Create(&config).Error; err != nil {
+		return dal.RealmConfig{}, false, err
+	}
+
+	return config, true, nil
+}
+
+func applyRealmDelete(ctx context.Context, tx *gorm.DB, realmID uint, reasonCode, note string, tick int64) (map[string]any, map[string]any, map[string]int64, error) {
+	if realmID == 1 {
+		return nil, nil, nil, errCannotDeleteDefaultRealm
+	}
+
+	config := dal.RealmConfig{}
+	configResult := tx.WithContext(ctx).Where("realm_id = ?", realmID).Limit(1).Find(&config)
+	if configResult.Error != nil {
+		return nil, nil, nil, configResult.Error
+	}
+	if configResult.RowsAffected == 0 || !config.Decommissioned {
+		return nil, nil, nil, errRealmDeleteRequiresDecommission
+	}
+
+	characterCount := int64(0)
+	if err := tx.WithContext(ctx).Model(&dal.Character{}).Where("realm_id = ?", realmID).Count(&characterCount).Error; err != nil {
+		return nil, nil, nil, err
+	}
+	if characterCount > 0 {
+		return nil, nil, nil, errRealmDeleteHasCharacters
+	}
+
+	beforePaused, beforeReason, err := loadRealmPauseState(ctx, tx, realmID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	deletedRows := map[string]int64{}
+	deleteScoped := func(label string, model any) error {
+		result := tx.WithContext(ctx).Where("realm_id = ?", realmID).Delete(model)
+		if result.Error != nil {
+			return result.Error
+		}
+		deletedRows[label] = result.RowsAffected
+		return nil
+	}
+
+	if err := deleteScoped("worldRuntimeStates", &dal.WorldRuntimeState{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("worldStates", &dal.WorldState{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("inventoryEntries", &dal.InventoryEntry{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("playerUnlocks", &dal.PlayerUnlock{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("playerStats", &dal.PlayerStat{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("behaviorInstances", &dal.BehaviorInstance{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("worldEvents", &dal.WorldEvent{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("marketPrices", &dal.MarketPrice{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("marketHistory", &dal.MarketHistory{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("ascensionStates", &dal.AscensionState{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("chatChannels", &dal.ChatChannel{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("chatModeration", &dal.ChatChannelModeration{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("chatCensorshipTraces", &dal.ChatMessageCensorshipTrace{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("realmAccessGrants", &dal.RealmAccessGrant{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("realmConfigs", &dal.RealmConfig{}); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := deleteScoped("adminAuditEvents", &dal.AdminAuditEvent{}); err != nil {
+		return nil, nil, nil, err
+	}
+
+	realmDelete := tx.WithContext(ctx).Where("id = ?", realmID).Delete(&dal.Realm{})
+	if realmDelete.Error != nil {
+		return nil, nil, nil, realmDelete.Error
+	}
+	deletedRows["realmIdentityRows"] = realmDelete.RowsAffected
+
+	before := map[string]any{
+		"decommissioned": config.Decommissioned,
+		"paused":         beforePaused,
+		"reasonCode":     beforeReason,
+		"characterCount": characterCount,
+	}
+	after := map[string]any{
+		"deleted":       true,
+		"reasonCode":    reasonCode,
+		"note":          note,
+		"effectiveTick": tick,
+		"deletedRows":   deletedRows,
+	}
+
+	return before, after, deletedRows, nil
+}
+
 func applyRealmCreate(ctx context.Context, tx *gorm.DB, realmID uint) (map[string]any, map[string]any, error) {
 	before := map[string]any{"existed": false}
-	created := map[string]any{"worldState": false, "worldRuntime": false, "realmControl": false, "realmConfig": false}
+	created := map[string]any{"worldState": false, "worldRuntime": false, "realmControl": false, "realmConfig": false, "chatGlobalChannel": false}
 
 	state := dal.WorldState{}
 	stateResult := tx.WithContext(ctx).Where("realm_id = ?", realmID).Limit(1).Find(&state)
@@ -2137,6 +3049,31 @@ func applyRealmCreate(ctx context.Context, tx *gorm.DB, realmID uint) (map[strin
 			return nil, nil, err
 		}
 		created["realmConfig"] = true
+	}
+
+	globalChannel := dal.ChatChannel{}
+	globalChannelResult := tx.WithContext(ctx).Where("realm_id = ? AND channel_key = ?", realmID, "global").Limit(1).Find(&globalChannel)
+	if globalChannelResult.Error != nil {
+		return nil, nil, globalChannelResult.Error
+	}
+	if globalChannelResult.RowsAffected == 0 {
+		if err := tx.WithContext(ctx).Create(&dal.ChatChannel{
+			RealmID:      realmID,
+			ChannelKey:   "global",
+			DisplayName:  "Global",
+			Subject:      "General realm discussion",
+			Description:  "Realm-wide chat channel.",
+			IsActive:     true,
+			ManagedByKey: "system",
+		}).Error; err != nil {
+			return nil, nil, err
+		}
+		created["chatGlobalChannel"] = true
+	} else if !globalChannel.IsActive {
+		if err := tx.WithContext(ctx).Model(&dal.ChatChannel{}).Where("id = ?", globalChannel.ID).Update("is_active", true).Error; err != nil {
+			return nil, nil, err
+		}
+		created["chatGlobalChannel"] = true
 	}
 
 	after := map[string]any{"realmId": realmID, "created": created}

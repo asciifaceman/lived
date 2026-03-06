@@ -174,8 +174,8 @@ func TestHasExclusiveConflictWithActiveBehaviorKeys(t *testing.T) {
 	rest := playerBehaviorDefinitions["player_rest"]
 
 	active := []dal.BehaviorInstance{
-		{ID: 10, Key: "player_pushups"},
-		{ID: 11, Key: "player_scavenge_scrap"},
+		{BaseModel: dal.BaseModel{ID: 10}, Key: "player_pushups"},
+		{BaseModel: dal.BaseModel{ID: 11}, Key: "player_scavenge_scrap"},
 	}
 
 	if !hasExclusiveConflictWithActiveBehaviorKeys(rest, 99, active) {

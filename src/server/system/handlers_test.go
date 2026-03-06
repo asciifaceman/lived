@@ -1,9 +1,12 @@
 package system
 
 import (
+	"errors"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/asciifaceman/lived/src/gameplay"
 	"github.com/labstack/echo/v4"
 )
 
@@ -142,5 +145,17 @@ func TestParseBehaviorQueueMode(t *testing.T) {
 				t.Fatalf("expected repeatUntil %d, got %d", test.wantRepeatUntil, repeatUntil)
 			}
 		})
+	}
+}
+
+func TestQueueBehaviorErrorStatus(t *testing.T) {
+	if got := queueBehaviorErrorStatus(errors.New("bad input")); got != http.StatusBadRequest {
+		t.Fatalf("expected bad request status, got %d", got)
+	}
+
+	conflictErr := errors.New("wrapped")
+	conflictErr = errors.Join(conflictErr, gameplay.ErrBehaviorConflict)
+	if got := queueBehaviorErrorStatus(conflictErr); got != http.StatusConflict {
+		t.Fatalf("expected conflict status, got %d", got)
 	}
 }

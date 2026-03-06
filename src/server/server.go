@@ -67,10 +67,13 @@ func Run(ctx context.Context, cfg config.Config, database *gorm.DB, runOptions .
 	select {
 	case <-ctx.Done():
 		opts.logger.Info("http_server_shutting_down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 		if err := e.Shutdown(shutdownCtx); err != nil {
 			opts.logger.Error("http_server_shutdown_failed", "error", err)
+			if closeErr := e.Close(); closeErr != nil {
+				opts.logger.Error("http_server_force_close_failed", "error", closeErr)
+			}
 			return err
 		}
 		opts.logger.Info("http_server_stopped")

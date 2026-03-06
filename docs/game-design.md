@@ -93,7 +93,9 @@
 - Each ascension grants starting coins for the next run to accelerate early progression.
 - Tunable constants are tracked in `docs/game-data/ascension.yaml`.
 
-## Short-Term Backlog
+## Design Follow-Ups (Reference)
+
+Live execution state for these items belongs in [feature-tracker.md](feature-tracker.md).
 
 1. Add behavior priority and cancellation semantics.
 2. Move behavior definitions from static map to data-driven loading.

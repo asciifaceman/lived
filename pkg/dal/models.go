@@ -27,6 +27,10 @@ type Character struct {
 	Status    string `gorm:"size:16;not null;default:'active';index"`
 }
 
+type Realm struct {
+	BaseModel
+}
+
 type Account struct {
 	BaseModel
 	Username     string `gorm:"size:64;not null;uniqueIndex"`
@@ -232,6 +236,7 @@ func Models() []any {
 		&AccountSession{},
 		&Player{},
 		&Character{},
+		&Realm{},
 		&RealmConfig{},
 		&RealmAccessGrant{},
 		&WorldState{},

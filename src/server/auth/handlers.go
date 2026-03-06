@@ -14,6 +14,7 @@ import (
 	"github.com/asciifaceman/lived/pkg/config"
 	"github.com/asciifaceman/lived/pkg/dal"
 	"github.com/asciifaceman/lived/pkg/ratelimit"
+	"github.com/asciifaceman/lived/src/server/requestbind"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/crypto/bcrypt"
@@ -119,8 +120,8 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 func makeRegisterHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		var req registerRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid register payload")
+		if err := requestbind.JSON(c, &req, "invalid register payload"); err != nil {
+			return err
 		}
 
 		username := strings.TrimSpace(req.Username)
@@ -162,8 +163,8 @@ func makeRegisterHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc 
 func makeLoginHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		var req loginRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid login payload")
+		if err := requestbind.JSON(c, &req, "invalid login payload"); err != nil {
+			return err
 		}
 
 		username := strings.TrimSpace(req.Username)
@@ -209,8 +210,8 @@ func makeLoginHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 func makeRefreshHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		var req refreshRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid refresh payload")
+		if err := requestbind.JSON(c, &req, "invalid refresh payload"); err != nil {
+			return err
 		}
 		if strings.TrimSpace(req.RefreshToken) == "" {
 			return echo.NewHTTPError(http.StatusBadRequest, "refreshToken is required")
@@ -345,15 +346,7 @@ func makeMeHandler(database *gorm.DB) echo.HandlerFunc {
 func makeAuthMiddleware(database *gorm.DB, cfg config.Config, allowQueryToken bool) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			token := ""
-			authHeader := c.Request().Header.Get("Authorization")
-			if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
-				token = strings.TrimSpace(authHeader[len("Bearer "):])
-			}
-
-			if token == "" && allowQueryToken {
-				token = strings.TrimSpace(c.QueryParam("accessToken"))
-			}
+			token := extractAccessToken(c.Request(), c.QueryParam("accessToken"), allowQueryToken)
 
 			if token == "" {
 				return echo.NewHTTPError(http.StatusUnauthorized, "missing bearer token")
@@ -394,6 +387,46 @@ func makeAuthMiddleware(database *gorm.DB, cfg config.Config, allowQueryToken bo
 			return next(c)
 		}
 	}
+}
+
+func extractAccessToken(request *http.Request, queryToken string, allowQueryToken bool) string {
+	token := parseBearerTokenHeader(request.Header.Get("Authorization"))
+	if token != "" {
+		return token
+	}
+
+	token = parseWebSocketProtocolBearer(request.Header.Get("Sec-WebSocket-Protocol"))
+	if token != "" {
+		return token
+	}
+
+	if allowQueryToken {
+		return strings.TrimSpace(queryToken)
+	}
+
+	return ""
+}
+
+func parseBearerTokenHeader(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if !strings.HasPrefix(strings.ToLower(trimmed), "bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(trimmed[len("Bearer "):])
+}
+
+func parseWebSocketProtocolBearer(value string) string {
+	for _, part := range strings.Split(value, ",") {
+		candidate := strings.TrimSpace(part)
+		if !strings.HasPrefix(strings.ToLower(candidate), "bearer.") {
+			continue
+		}
+		token := strings.TrimSpace(candidate[len("bearer."):])
+		if token != "" {
+			return token
+		}
+	}
+	return ""
 }
 
 func issueTokensForAccount(ctx context.Context, database *gorm.DB, cfg config.Config, account dal.Account, roles []string, remoteAddr, userAgent string) (authResponseData, error) {
@@ -521,6 +554,10 @@ func RequireAuth(database *gorm.DB, cfg config.Config) echo.MiddlewareFunc {
 
 func RequireAuthWithQueryAccessToken(database *gorm.DB, cfg config.Config) echo.MiddlewareFunc {
 	return makeAuthMiddleware(database, cfg, true)
+}
+
+func RequireAuthForStream(database *gorm.DB, cfg config.Config) echo.MiddlewareFunc {
+	return makeAuthMiddleware(database, cfg, cfg.StreamAllowQueryAccessToken)
 }
 
 func respondSuccess(c echo.Context, code int, message string, data any) error {

@@ -64,6 +64,30 @@ go test ./...
 go test ./src/server/system ./src/server/player ./src/server/stream
 ```
 
+## Feature tracker generation
+
+`docs/feature-tracker.yaml` is canonical. Regenerate markdown view after edits:
+
+```bash
+go run ./tools/trackergen -yaml docs/feature-tracker.yaml -md docs/feature-tracker.md
+```
+
+One-time import from existing markdown (migration/bootstrap):
+
+```bash
+go run ./tools/trackergen -import-md docs/feature-tracker.md -yaml docs/feature-tracker.yaml -md docs/feature-tracker.md
+```
+
+## Stream auth transport note
+
+- Preferred MMO stream auth is WebSocket subprotocol bearer (`Sec-WebSocket-Protocol: lived.v1, bearer.<accessToken>`).
+- Query-token fallback (`?accessToken=...`) is disabled by default.
+- Enable fallback only for compatibility clients:
+
+```bash
+LIVED_STREAM_QUERY_ACCESS_TOKEN_ENABLED=true
+```
+
 ## Docker development stack
 
 Use split compose files:

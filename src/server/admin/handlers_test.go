@@ -46,6 +46,27 @@ func TestValidateRealmAction(t *testing.T) {
 			},
 		},
 		{
+			name: "realm decommission",
+			req: realmActionRequest{
+				Action:     actionRealmDecommission,
+				ReasonCode: "maintenance",
+			},
+		},
+		{
+			name: "realm recommission",
+			req: realmActionRequest{
+				Action:     actionRealmRecommission,
+				ReasonCode: "maintenance_complete",
+			},
+		},
+		{
+			name: "realm delete",
+			req: realmActionRequest{
+				Action:     actionRealmDelete,
+				ReasonCode: "retired",
+			},
+		},
+		{
 			name: "missing reason",
 			req: realmActionRequest{
 				Action: actionMarketResetDefaults,
@@ -268,6 +289,102 @@ func TestValidateCharacterModeration(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := validateCharacterModeration(test.req)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("expected validation error")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateBulkAccountModeration(t *testing.T) {
+	locked := true
+	tests := []struct {
+		name    string
+		req     bulkAccountModerationRequest
+		wantErr bool
+	}{
+		{
+			name: "status valid",
+			req: bulkAccountModerationRequest{
+				Command:        "set_status",
+				RealmID:        2,
+				Status:         "locked",
+				RevokeSessions: &locked,
+				ReasonCode:     "policy",
+			},
+		},
+		{
+			name: "role valid",
+			req: bulkAccountModerationRequest{
+				Command:    "set_role",
+				RealmID:    3,
+				RoleKey:    "moderator",
+				Action:     "grant",
+				ReasonCode: "staffing",
+				Limit:      25,
+			},
+		},
+		{
+			name: "invalid command",
+			req: bulkAccountModerationRequest{
+				Command:    "bulk_set",
+				RealmID:    1,
+				ReasonCode: "policy",
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing realm",
+			req: bulkAccountModerationRequest{
+				Command:    "set_status",
+				Status:     "locked",
+				ReasonCode: "policy",
+			},
+			wantErr: true,
+		},
+		{
+			name: "limit too high",
+			req: bulkAccountModerationRequest{
+				Command:    "set_status",
+				RealmID:    1,
+				Status:     "active",
+				ReasonCode: "policy",
+				Limit:      maxBulkModLimit + 1,
+			},
+			wantErr: true,
+		},
+		{
+			name: "set role missing role key",
+			req: bulkAccountModerationRequest{
+				Command:    "set_role",
+				RealmID:    1,
+				Action:     "grant",
+				ReasonCode: "policy",
+			},
+			wantErr: true,
+		},
+		{
+			name: "set status invalid status",
+			req: bulkAccountModerationRequest{
+				Command:    "set_status",
+				RealmID:    1,
+				Status:     "banned",
+				ReasonCode: "policy",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := validateBulkAccountModeration(test.req)
 			if test.wantErr {
 				if err == nil {
 					t.Fatal("expected validation error")
