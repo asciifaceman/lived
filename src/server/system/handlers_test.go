@@ -1,6 +1,7 @@
 package system
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -157,5 +158,56 @@ func TestQueueBehaviorErrorStatus(t *testing.T) {
 	conflictErr = errors.Join(conflictErr, gameplay.ErrBehaviorConflict)
 	if got := queueBehaviorErrorStatus(conflictErr); got != http.StatusConflict {
 		t.Fatalf("expected conflict status, got %d", got)
+	}
+}
+
+func TestVersionHandlerIncludesEmbeddedGameDataMetadata(t *testing.T) {
+	e := echo.New()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/system/version", nil)
+	c := e.NewContext(req, rec)
+
+	handler := makeVersionHandler()
+	if err := handler(c); err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+
+	payload := map[string]any{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	data, ok := payload["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected data object, got %#v", payload["data"])
+	}
+
+	if _, ok := data["api"].(string); !ok {
+		t.Fatalf("expected api string, got %#v", data["api"])
+	}
+	if _, ok := data["backend"].(string); !ok {
+		t.Fatalf("expected backend string, got %#v", data["backend"])
+	}
+	if _, ok := data["frontend"].(string); !ok {
+		t.Fatalf("expected frontend string, got %#v", data["frontend"])
+	}
+
+	gameData, ok := data["gameData"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected gameData object, got %#v", data["gameData"])
+	}
+
+	manifestVersion, ok := gameData["manifestVersion"].(float64)
+	if !ok || manifestVersion < 1 {
+		t.Fatalf("expected positive manifestVersion, got %#v", gameData["manifestVersion"])
+	}
+
+	filesHash, ok := gameData["filesHash"].(string)
+	if !ok || filesHash == "" {
+		t.Fatalf("expected non-empty filesHash, got %#v", gameData["filesHash"])
 	}
 }

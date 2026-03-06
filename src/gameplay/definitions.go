@@ -8,25 +8,49 @@ type Requirement struct {
 }
 
 type BehaviorDefinition struct {
-	Key                string
-	Name               string
-	Summary            string
-	ActorType          string
-	ExclusiveGroup     string
-	DurationMinutes    int64
-	StaminaCost        int64
-	Requirements       Requirement
-	Costs              map[string]int64
-	Outputs            map[string]int64
-	OutputExpressions  map[string]string
-	OutputChances      map[string]float64
-	StatDeltas         map[string]int64
-	RequiresMarketOpen bool
-	GrantsUnlocks      []string
-	MarketEffects      map[string]int64
-	StartMessage       string
-	CompleteMessage    string
-	RepeatIntervalMin  int64
+	Key                   string
+	Name                  string
+	Summary               string
+	ActorType             string
+	ExclusiveGroup        string
+	ScheduleModes         []string
+	SingleUsePerAscension bool
+	DurationMinutes       int64
+	StaminaCost           int64
+	Requirements          Requirement
+	Costs                 map[string]int64
+	Outputs               map[string]int64
+	OutputExpressions     map[string]string
+	OutputChances         map[string]float64
+	StatDeltas            map[string]int64
+	RequiresMarketOpen    bool
+	RequiresNight         bool
+	GrantsUnlocks         []string
+	MarketEffects         map[string]int64
+	StartMessage          string
+	CompleteMessage       string
+	RepeatIntervalMin     int64
+}
+
+type UpgradeOutputDefinition struct {
+	QueueSlotsDelta int64
+	Unlocks         []string
+	Items           map[string]int64
+	StatDeltas      map[string]int64
+}
+
+type UpgradeDefinition struct {
+	Key           string
+	Name          string
+	Summary       string
+	Category      string
+	GateTypes     []string
+	MaxPurchases  int64
+	CostScaling   float64
+	OutputScaling float64
+	Requirements  Requirement
+	Costs         map[string]int64
+	Outputs       UpgradeOutputDefinition
 }
 
 const (
@@ -54,6 +78,19 @@ func GetBehaviorDefinition(key string) (BehaviorDefinition, bool) {
 func ListBehaviorDefinitions() []BehaviorDefinition {
 	all := make([]BehaviorDefinition, 0, len(definitions))
 	for _, definition := range definitions {
+		all = append(all, definition)
+	}
+	return all
+}
+
+func GetUpgradeDefinition(key string) (UpgradeDefinition, bool) {
+	definition, ok := upgradeDefinitions[key]
+	return definition, ok
+}
+
+func ListUpgradeDefinitions() []UpgradeDefinition {
+	all := make([]UpgradeDefinition, 0, len(upgradeDefinitions))
+	for _, definition := range upgradeDefinitions {
 		all = append(all, definition)
 	}
 	return all

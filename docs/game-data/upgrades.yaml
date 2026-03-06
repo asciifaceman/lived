@@ -1,0 +1,40 @@
+version: 1
+upgrades:
+  - key: upgrade_parallel_slots
+    name: Queue Throughput
+    summary: Expand how many behaviors you can run concurrently.
+    category: Queue Capacity
+    gateTypes: [resource]
+    maxPurchases: 0
+    costScaling: 1.6
+    outputScaling: 1.0
+    requirements:
+      unlocks: []
+      items: {}
+    costs:
+      coins: 40
+    outputs:
+      queueSlotsDelta: 1
+      unlocks: []
+      items: {}
+      statDeltas: {}
+
+  - key: upgrade_recovery_routine
+    name: Recovery Routine
+    summary: Improve passive stamina regeneration each purchase.
+    category: Stamina
+    gateTypes: [resource]
+    maxPurchases: 0
+    costScaling: 1.45
+    outputScaling: 1.2
+    requirements:
+      unlocks: []
+      items: {}
+    costs:
+      coins: 30
+    outputs:
+      queueSlotsDelta: 0
+      unlocks: []
+      items: {}
+      statDeltas:
+        stamina_recovery_rate: 1

@@ -9,39 +9,49 @@ type ChatViewProps = {
   draft: string;
   onDraftChange: (value: string) => void;
   onSubmit: (event: FormEvent) => void;
+  canCompose?: boolean;
   disabled?: boolean;
 };
 
 export function ChatView(props: ChatViewProps) {
   const selectedChannelMeta = props.channels.find((entry) => entry.key === props.selectedChannel);
+  const canCompose = props.canCompose ?? true;
 
   return (
     <section className="panel chat-layout">
       <aside className="channels-pane">
         <h3>Channels</h3>
-        {props.channels.map((channel) => (
-          <button
-            key={channel.key}
-            className={props.selectedChannel === channel.key ? "active" : ""}
-            type="button"
-            onClick={() => props.onSelectChannel(channel.key)}
-          >
-            <span>{channel.name} ({channel.key})</span>
-            {channel.subject ? <small className="channel-subject">{channel.subject}</small> : null}
-          </button>
-        ))}
+        {props.channels.length === 0 ? (
+          <p className="muted">No channels available yet.</p>
+        ) : (
+          props.channels.map((channel) => (
+            <button
+              key={channel.key}
+              className={props.selectedChannel === channel.key ? "active" : ""}
+              type="button"
+              onClick={() => props.onSelectChannel(channel.key)}
+            >
+              <span>{channel.name} ({channel.key})</span>
+              {channel.subject ? <small className="channel-subject">{channel.subject}</small> : null}
+            </button>
+          ))
+        )}
       </aside>
 
       <div className="chat-pane">
         <h3>#{props.selectedChannel}</h3>
         {selectedChannelMeta?.subject ? <p className="muted channel-header-subject">{selectedChannelMeta.subject}</p> : null}
         <div className="messages-pane">
-          {props.messages.map((message) => (
-            <div key={message.id} className={`message ${message.messageClass}`}>
-              <div className="meta">{message.clock} · {message.author} · {message.messageClass}{message.censored ? ` · censored (${message.censorHits})` : ""}</div>
-              <div>{message.message}</div>
-            </div>
-          ))}
+          {props.messages.length === 0 ? (
+            <p className="muted">No messages yet.</p>
+          ) : (
+            props.messages.map((message) => (
+              <div key={message.id} className={`message ${message.messageClass}`}>
+                <div className="meta">{message.clock} · {message.author} · {message.messageClass}{message.censored ? ` · censored (${message.censorHits})` : ""}</div>
+                <div>{message.message}</div>
+              </div>
+            ))
+          )}
         </div>
 
         <form onSubmit={props.onSubmit} className="chat-compose">
@@ -50,8 +60,9 @@ export function ChatView(props: ChatViewProps) {
             onChange={(event) => props.onDraftChange(event.target.value)}
             maxLength={280}
             placeholder="Type a message"
+            disabled={props.disabled || !canCompose}
           />
-          <button type="submit" disabled={props.disabled || !props.draft.trim()}>Send</button>
+          <button type="submit" disabled={props.disabled || !canCompose || !props.draft.trim()}>Send</button>
         </form>
       </div>
     </section>

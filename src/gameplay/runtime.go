@@ -20,6 +20,7 @@ const (
 	behaviorQueued          = "queued"
 	behaviorActive          = "active"
 	behaviorCompleted       = "completed"
+	behaviorCancelled       = "cancelled"
 	behaviorFailed          = "failed"
 	behaviorModeOnce        = "once"
 	behaviorModeRepeat      = "repeat"
@@ -30,6 +31,8 @@ const (
 
 	marketOpenMinute  = 8 * 60
 	marketCloseMinute = 20 * 60
+	nightStartMinute  = 20 * 60
+	nightEndMinute    = 6 * 60
 	minutesPerDay     = 24 * 60
 
 	ascensionBaseMinCoins      int64   = 250
@@ -39,14 +42,25 @@ const (
 	defaultMarketWaitDurationMinutes int64 = 24 * 60
 	maxMarketWaitDurationMinutes     int64 = 14 * 24 * 60
 
+	marketImpactBudgetWindowTicks       int64 = 6 * 60
+	marketImpactMinBudgetPerDirection   int64 = 4
+	marketImpactMaxBudgetPerDirection   int64 = 32
+	marketImpactLiquidityDivisor        int64 = 4000
+	marketImpactPopulationBaselineDiv   int64 = 6
+	marketImpactStorytellerBonus        int64 = 2
+	marketImpactWorldEventBonus         int64 = 1
+	marketStorytellerDeltaSource              = "storyteller_curve"
+
 	statStrength  = "strength"
 	statSocial    = "social"
+	statFinancial = "financial"
 	statEndurance = "endurance"
 
 	statStamina              = "stamina"
 	statMaxStamina           = "max_stamina"
 	statStaminaRecoveryRate  = "stamina_recovery_rate"
 	statStaminaRecoveryCarry = "stamina_recovery_carry"
+	statTradingAptitude      = "trading_aptitude"
 
 	defaultMaxStamina          int64 = 100
 	defaultStaminaRecoveryRate int64 = 8
@@ -61,24 +75,29 @@ const (
 
 var ErrAscensionNotEligible = errors.New("ascension is not yet available")
 var ErrBehaviorConflict = errors.New("behavior queue conflict")
+var ErrQueueSlotsFull = errors.New("queue slots are full")
+var ErrBehaviorNotCancelable = errors.New("behavior is not cancelable")
 
 type BehaviorView struct {
-	ID                        uint   `json:"id"`
-	Key                       string `json:"key"`
-	ActorType                 string `json:"actorType"`
-	ActorID                   uint   `json:"actorId"`
-	State                     string `json:"state"`
-	Mode                      string `json:"mode,omitempty"`
-	RepeatIntervalMinutes     int64  `json:"repeatIntervalMinutes,omitempty"`
-	RepeatUntilTick           int64  `json:"repeatUntilTick,omitempty"`
-	ScheduledAt               int64  `json:"scheduledAtTick"`
-	StartedAt                 int64  `json:"startedAtTick"`
-	CompletesAt               int64  `json:"completesAtTick"`
-	DurationMinute            int64  `json:"durationMinutes"`
-	MarketWaitDurationMinutes int64  `json:"marketWaitDurationMinutes,omitempty"`
-	MarketWaitUntilTick       int64  `json:"marketWaitUntilTick,omitempty"`
-	ResultMessage             string `json:"resultMessage"`
-	FailureReason             string `json:"failureReason"`
+	ID                        uint             `json:"id"`
+	Key                       string           `json:"key"`
+	ActorType                 string           `json:"actorType"`
+	ActorID                   uint             `json:"actorId"`
+	State                     string           `json:"state"`
+	Mode                      string           `json:"mode,omitempty"`
+	RepeatIntervalMinutes     int64            `json:"repeatIntervalMinutes,omitempty"`
+	RepeatUntilTick           int64            `json:"repeatUntilTick,omitempty"`
+	ScheduledAt               int64            `json:"scheduledAtTick"`
+	StartedAt                 int64            `json:"startedAtTick"`
+	CompletesAt               int64            `json:"completesAtTick"`
+	DurationMinute            int64            `json:"durationMinutes"`
+	MarketWaitDurationMinutes int64            `json:"marketWaitDurationMinutes,omitempty"`
+	MarketWaitUntilTick       int64            `json:"marketWaitUntilTick,omitempty"`
+	ResultMessage             string           `json:"resultMessage"`
+	FailureReason             string           `json:"failureReason"`
+	WaitReason                string           `json:"waitReason,omitempty"`
+	Spent                     map[string]int64 `json:"spent,omitempty"`
+	Gained                    map[string]int64 `json:"gained,omitempty"`
 }
 
 type RecentEventView struct {
@@ -112,12 +131,38 @@ type AscensionEligibility struct {
 }
 
 type MarketTickerView struct {
-	Symbol       string `json:"symbol"`
-	Price        int64  `json:"price"`
-	Delta        int64  `json:"delta"`
-	LastSource   string `json:"lastSource"`
-	UpdatedTick  int64  `json:"updatedTick"`
-	SessionState string `json:"sessionState"`
+	Symbol       string                  `json:"symbol"`
+	Price        int64                   `json:"price"`
+	Delta        int64                   `json:"delta"`
+	LastSource   string                  `json:"lastSource"`
+	UpdatedTick  int64                   `json:"updatedTick"`
+	SessionState string                  `json:"sessionState"`
+	Liquidity    MarketLiquidityView     `json:"liquidity"`
+	Movement     MarketMovementStatsView `json:"movement"`
+}
+
+type MarketLiquidityView struct {
+	Quantity         int64   `json:"quantity"`
+	BaselineQuantity int64   `json:"baselineQuantity"`
+	MinQuantity      int64   `json:"minQuantity"`
+	MaxQuantity      int64   `json:"maxQuantity"`
+	UtilizationPct   float64 `json:"utilizationPct"`
+	CapEstimate      int64   `json:"capEstimate"`
+	LastPressure     int64   `json:"lastPressure"`
+}
+
+type MarketMovementStatsView struct {
+	WindowTicks          int64   `json:"windowTicks"`
+	WindowChange         int64   `json:"windowChange"`
+	WindowRange          int64   `json:"windowRange"`
+	WindowHigh           int64   `json:"windowHigh"`
+	WindowLow            int64   `json:"windowLow"`
+	Trades               int64   `json:"trades"`
+	NPCTradeSharePct     float64 `json:"npcTradeSharePct"`
+	NPCParticipantTrades int64   `json:"npcParticipantTrades"`
+	NPCCycleMoves        int64   `json:"npcCycleMoves"`
+	StorytellerMoves     int64   `json:"storytellerMoves"`
+	OrderbookMoves       int64   `json:"orderbookMoves"`
 }
 
 type MarketStatus struct {
@@ -140,6 +185,16 @@ type MarketHistoryEntry struct {
 	SessionState string `json:"sessionState"`
 }
 
+type MarketCandleEntry struct {
+	Symbol          string `json:"symbol"`
+	BucketStartTick int64  `json:"bucketStartTick"`
+	Open            int64  `json:"open"`
+	High            int64  `json:"high"`
+	Low             int64  `json:"low"`
+	Close           int64  `json:"close"`
+	Points          int64  `json:"points"`
+}
+
 type QueueBehaviorOptions struct {
 	MarketWaitDurationMinutes int64
 	RealmID                   uint
@@ -148,11 +203,13 @@ type QueueBehaviorOptions struct {
 }
 
 type behaviorRuntimePayload struct {
-	MarketWaitDurationMinutes int64  `json:"marketWaitDurationMinutes,omitempty"`
-	MarketWaitUntilTick       int64  `json:"marketWaitUntilTick,omitempty"`
-	Mode                      string `json:"mode,omitempty"`
-	RepeatIntervalMinutes     int64  `json:"repeatIntervalMinutes,omitempty"`
-	RepeatUntilTick           int64  `json:"repeatUntilTick,omitempty"`
+	MarketWaitDurationMinutes int64            `json:"marketWaitDurationMinutes,omitempty"`
+	MarketWaitUntilTick       int64            `json:"marketWaitUntilTick,omitempty"`
+	Mode                      string           `json:"mode,omitempty"`
+	RepeatIntervalMinutes     int64            `json:"repeatIntervalMinutes,omitempty"`
+	RepeatUntilTick           int64            `json:"repeatUntilTick,omitempty"`
+	Spent                     map[string]int64 `json:"spent,omitempty"`
+	Gained                    map[string]int64 `json:"gained,omitempty"`
 }
 
 func QueuePlayerBehavior(ctx context.Context, database *gorm.DB, playerID uint, behaviorKey string, currentTick int64, options QueueBehaviorOptions) error {
@@ -168,8 +225,30 @@ func QueuePlayerBehavior(ctx context.Context, database *gorm.DB, playerID uint, 
 	if mode != behaviorModeOnce && mode != behaviorModeRepeat && mode != behaviorModeRepeatUntil {
 		return fmt.Errorf("mode must be once, repeat, or repeat-until")
 	}
+	if !behaviorModeSupported(definition, mode) {
+		return fmt.Errorf("mode %q is not supported for behavior %s", mode, behaviorKey)
+	}
 
 	realmID := normalizeRealmID(options.RealmID)
+
+	if definition.SingleUsePerAscension {
+		consumed, err := hasConsumedSingleUseBehavior(ctx, database, playerID, behaviorKey, realmID)
+		if err != nil {
+			return err
+		}
+		if consumed {
+			return fmt.Errorf("%w: behavior %s can only be queued once per ascension", ErrBehaviorConflict, behaviorKey)
+		}
+	}
+
+	slots, err := QueueSlotSummaryForPlayer(ctx, database, playerID, realmID)
+	if err != nil {
+		return err
+	}
+	if slots.Used >= slots.Total {
+		return fmt.Errorf("%w: %d/%d used", ErrQueueSlotsFull, slots.Used, slots.Total)
+	}
+
 	if hasConflict, err := hasActiveExclusiveConflict(ctx, database, dal.BehaviorInstance{
 		RealmID:   realmID,
 		ActorType: ActorPlayer,
@@ -199,10 +278,7 @@ func QueuePlayerBehavior(ctx context.Context, database *gorm.DB, playerID uint, 
 	}
 
 	if mode == behaviorModeRepeat || mode == behaviorModeRepeatUntil {
-		repeatIntervalMinutes := definition.DurationMinutes
-		if repeatIntervalMinutes <= 0 {
-			return fmt.Errorf("behavior duration must be positive for repeat mode")
-		}
+		repeatIntervalMinutes := int64(0)
 		payload.RepeatIntervalMinutes = repeatIntervalMinutes
 	}
 
@@ -308,6 +384,9 @@ func ProcessWorldTickForRealm(ctx context.Context, database *gorm.DB, currentTic
 		if err := processCompletions(ctx, tx, currentTick, realmID); err != nil {
 			return err
 		}
+		if err := processMarketOrdersAtTick(ctx, tx, currentTick, realmID); err != nil {
+			return err
+		}
 		return EnsureRecurringWorldBehavior(ctx, tx, currentTick, realmID)
 	})
 }
@@ -405,16 +484,26 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint, re
 
 	behaviors := make([]dal.BehaviorInstance, 0)
 	if err := database.WithContext(ctx).
-		Where("realm_id = ? AND state IN ?", realmID, []string{behaviorQueued, behaviorActive, behaviorCompleted, behaviorFailed}).
+		Where("realm_id = ? AND state IN ?", realmID, []string{behaviorQueued, behaviorActive, behaviorCompleted, behaviorCancelled, behaviorFailed}).
 		Order("id DESC").
 		Limit(20).
 		Find(&behaviors).Error; err != nil {
+		return WorldSnapshot{}, err
+	}
+	currentTick, err := CurrentWorldTickForRealm(ctx, database, realmID)
+	if err != nil {
 		return WorldSnapshot{}, err
 	}
 
 	views := make([]BehaviorView, 0, len(behaviors))
 	for _, behavior := range behaviors {
 		payload := parseBehaviorRuntimePayload(behavior.PayloadJSON)
+		waitReason := ""
+		if behavior.State == behaviorQueued {
+			if definition, ok := GetBehaviorDefinition(behavior.Key); ok {
+				waitReason = queuedBehaviorWaitReason(ctx, database, behavior, definition, payload, currentTick)
+			}
+		}
 
 		views = append(views, BehaviorView{
 			ID:                        behavior.ID,
@@ -433,6 +522,9 @@ func LoadWorldSnapshot(ctx context.Context, database *gorm.DB, playerID uint, re
 			MarketWaitUntilTick:       payload.MarketWaitUntilTick,
 			ResultMessage:             behavior.ResultMessage,
 			FailureReason:             behavior.FailureReason,
+			WaitReason:                waitReason,
+			Spent:                     payload.Spent,
+			Gained:                    payload.Gained,
 		})
 	}
 
@@ -483,6 +575,7 @@ func splitCoreAndDerivedStats(stats map[string]int64) (map[string]int64, map[str
 	core := map[string]int64{
 		statStrength:  stats[statStrength],
 		statSocial:    stats[statSocial],
+		statFinancial: stats[statFinancial],
 		statEndurance: stats[statEndurance],
 	}
 
@@ -490,6 +583,7 @@ func splitCoreAndDerivedStats(stats map[string]int64) (map[string]int64, map[str
 		statStamina:             stats[statStamina],
 		statMaxStamina:          stats[statMaxStamina],
 		statStaminaRecoveryRate: stats[statStaminaRecoveryRate],
+		statTradingAptitude:     stats[statTradingAptitude],
 	}
 
 	return core, derived
@@ -612,6 +706,9 @@ func Ascend(ctx context.Context, database *gorm.DB, playerName string) (int64, f
 		if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&dal.PlayerStat{}).Error; err != nil {
 			return err
 		}
+		if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&dal.PlayerUpgrade{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&dal.MarketPrice{}).Error; err != nil {
 			return err
 		}
@@ -720,6 +817,11 @@ func AscendForPlayerRealm(ctx context.Context, database *gorm.DB, playerID uint,
 			Delete(&dal.PlayerStat{}).Error; err != nil {
 			return err
 		}
+		if err := tx.WithContext(ctx).
+			Where("realm_id = ? AND player_id = ?", realmID, playerID).
+			Delete(&dal.PlayerUpgrade{}).Error; err != nil {
+			return err
+		}
 
 		startingCoins := ascensionStartingCoins(ascension.Count)
 		if startingCoins > 0 {
@@ -771,6 +873,35 @@ func loadPlayerCoinsForPlayer(ctx context.Context, database *gorm.DB, playerID u
 	return total, nil
 }
 
+func behaviorModeSupported(definition BehaviorDefinition, mode string) bool {
+	supported := definition.ScheduleModes
+	if len(supported) == 0 {
+		supported = []string{behaviorModeOnce, behaviorModeRepeat, behaviorModeRepeatUntil}
+	}
+
+	normalizedMode := strings.ToLower(strings.TrimSpace(mode))
+	for _, candidate := range supported {
+		if strings.ToLower(strings.TrimSpace(candidate)) == normalizedMode {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasConsumedSingleUseBehavior(ctx context.Context, database *gorm.DB, playerID uint, behaviorKey string, realmID uint) (bool, error) {
+	var count int64
+	err := database.WithContext(ctx).
+		Model(&dal.BehaviorInstance{}).
+		Where("realm_id = ? AND actor_type = ? AND actor_id = ? AND key = ? AND state IN ?", realmID, ActorPlayer, playerID, behaviorKey, []string{behaviorQueued, behaviorActive, behaviorCompleted}).
+		Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+
+	return count > 0, nil
+}
+
 func loadPlayerStats(ctx context.Context, database *gorm.DB, playerID uint, realmID uint) (map[string]int64, error) {
 	realmID = normalizeRealmID(realmID)
 	rawStats := map[string]int64{}
@@ -793,6 +924,11 @@ func loadPlayerStats(ctx context.Context, database *gorm.DB, playerID uint, real
 	social := rawStats[statSocial]
 	if social < 0 {
 		social = 0
+	}
+
+	financial := rawStats[statFinancial]
+	if financial < 0 {
+		financial = 0
 	}
 
 	endurance, foundEndurance := rawStats[statEndurance]
@@ -824,11 +960,13 @@ func loadPlayerStats(ctx context.Context, database *gorm.DB, playerID uint, real
 	stats := map[string]int64{
 		statStrength:             strength,
 		statSocial:               social,
+		statFinancial:            financial,
 		statEndurance:            endurance,
 		statStamina:              stamina,
 		statMaxStamina:           maxStamina,
 		statStaminaRecoveryRate:  recoveryRate,
 		statStaminaRecoveryCarry: recoveryCarry,
+		statTradingAptitude:      social + financial,
 	}
 
 	return stats, nil
@@ -1106,7 +1244,7 @@ func processActivations(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 	for _, behavior := range queued {
 		definition, ok := GetBehaviorDefinition(behavior.Key)
 		if !ok {
-			if err := markBehaviorFailed(ctx, tx, behavior.ID, "unknown behavior definition"); err != nil {
+			if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, "unknown behavior definition", currentTick); err != nil {
 				return err
 			}
 			continue
@@ -1125,29 +1263,49 @@ func processActivations(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 		if definition.RequiresMarketOpen && !IsMarketOpen(currentTick) {
 			if payload.MarketWaitUntilTick > 0 && currentTick >= payload.MarketWaitUntilTick {
 				reason := fmt.Sprintf("market did not open before timeout (waited %d minutes)", payload.MarketWaitDurationMinutes)
-				if err := markBehaviorFailed(ctx, tx, behavior.ID, reason); err != nil {
+				if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, reason, currentTick); err != nil {
 					return err
 				}
 			}
 			continue
 		}
 
+		if definition.RequiresNight && !IsNightTick(currentTick) {
+			continue
+		}
+
 		if err := validateRequirements(ctx, tx, behavior.ActorID, definition.Requirements, behavior.RealmID); err != nil {
-			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
+			if shouldAutoCompleteQueuedBehavior(payload, err) {
+				if err := markBehaviorCompletedAtTick(ctx, tx, behavior.ID, "Loop completed: requirements are no longer met.", currentTick); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, err.Error(), currentTick); err != nil {
 				return err
 			}
 			continue
 		}
 
 		if err := applyItemDelta(ctx, tx, behavior.ActorID, behavior.RealmID, negateMap(definition.Costs)); err != nil {
-			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
+			if shouldAutoCompleteQueuedBehavior(payload, err) {
+				if err := markBehaviorCompletedAtTick(ctx, tx, behavior.ID, "Loop completed: requirements are no longer met.", currentTick); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, err.Error(), currentTick); err != nil {
 				return err
 			}
 			continue
 		}
 
 		if err := consumeBehaviorStamina(ctx, tx, behavior, definition); err != nil {
-			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
+			if isInsufficientStaminaError(err) {
+				// Keep the behavior queued so it can auto-resume once stamina recovers.
+				continue
+			}
+			if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, err.Error(), currentTick); err != nil {
 				return err
 			}
 			continue
@@ -1178,6 +1336,12 @@ func processActivations(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 }
 
 func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, realmID uint) error {
+	type batchSummary struct {
+		CompletedRuns int64
+		Spent         map[string]int64
+		Gained        map[string]int64
+	}
+
 	realmID = normalizeRealmID(realmID)
 	active := make([]dal.BehaviorInstance, 0)
 	if err := tx.WithContext(ctx).
@@ -1191,11 +1355,12 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 	if err != nil {
 		return err
 	}
+	batchByPlayerID := map[uint]*batchSummary{}
 
 	for _, behavior := range active {
 		definition, ok := GetBehaviorDefinition(behavior.Key)
 		if !ok {
-			if err := markBehaviorFailed(ctx, tx, behavior.ID, "unknown behavior definition"); err != nil {
+			if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, "unknown behavior definition", currentTick); err != nil {
 				return err
 			}
 			continue
@@ -1206,7 +1371,7 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 		if definition.RequiresMarketOpen && !IsMarketOpen(currentTick) {
 			if payload.MarketWaitUntilTick > 0 && currentTick >= payload.MarketWaitUntilTick {
 				reason := fmt.Sprintf("market did not open before timeout (waited %d minutes)", payload.MarketWaitDurationMinutes)
-				if err := markBehaviorFailed(ctx, tx, behavior.ID, reason); err != nil {
+				if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, reason, currentTick); err != nil {
 					return err
 				}
 				continue
@@ -1223,7 +1388,7 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 
 		outputs, dynamicMessage, err := resolveBehaviorOutputs(ctx, tx, behavior, definition, currentTick)
 		if err != nil {
-			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
+			if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, err.Error(), currentTick); err != nil {
 				return err
 			}
 			continue
@@ -1231,29 +1396,29 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 
 		outputs = applyAscensionBonus(outputs, ascension.WealthBonusPct)
 		if err := applyItemDelta(ctx, tx, behavior.ActorID, behavior.RealmID, outputs); err != nil {
-			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
+			if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, err.Error(), currentTick); err != nil {
 				return err
 			}
 			continue
 		}
 
 		if err := grantUnlocks(ctx, tx, behavior.ActorID, definition.GrantsUnlocks, behavior.RealmID); err != nil {
-			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
+			if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, err.Error(), currentTick); err != nil {
 				return err
 			}
 			continue
 		}
 
 		if err := applyStatDelta(ctx, tx, behavior.ActorID, behavior.RealmID, definition.StatDeltas); err != nil {
-			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
+			if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, err.Error(), currentTick); err != nil {
 				return err
 			}
 			continue
 		}
 
-		restMessage, err := applyRestRecoveryOnCompletion(ctx, tx, behavior, definition)
+		restMessage, restRecovered, err := applyRestRecoveryOnCompletion(ctx, tx, behavior, definition)
 		if err != nil {
-			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
+			if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, err.Error(), currentTick); err != nil {
 				return err
 			}
 			continue
@@ -1261,7 +1426,7 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 
 		marketMessage, err := applyMarketEffects(ctx, tx, behavior, definition, currentTick)
 		if err != nil {
-			if err := markBehaviorFailed(ctx, tx, behavior.ID, err.Error()); err != nil {
+			if err := markBehaviorFailedAtTick(ctx, tx, behavior.ID, err.Error(), currentTick); err != nil {
 				return err
 			}
 			continue
@@ -1281,12 +1446,22 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 			message = strings.TrimSpace(message + " " + marketMessage)
 		}
 
+		resolvedSpent := realizedBehaviorSpent(definition)
+		resolvedGained := realizedBehaviorGained(outputs, definition.StatDeltas, restRecovered)
+		payload.Spent = resolvedSpent
+		payload.Gained = resolvedGained
+		payloadJSON, err := marshalBehaviorRuntimePayload(payload)
+		if err != nil {
+			return err
+		}
+
 		if err := tx.WithContext(ctx).Model(&dal.BehaviorInstance{}).
 			Where("id = ?", behavior.ID).
 			Updates(map[string]any{
 				"state":          behaviorCompleted,
 				"result_message": message,
 				"failure_reason": "",
+				"payload_json":   payloadJSON,
 			}).Error; err != nil {
 			return err
 		}
@@ -1299,24 +1474,24 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 		if repeatIntervalMinutes <= 0 {
 			repeatIntervalMinutes = payload.RepeatIntervalMinutes
 		}
-		if repeatIntervalMinutes <= 0 {
-			repeatIntervalMinutes = definition.RepeatIntervalMin
+
+		if behavior.ActorType == ActorPlayer && behavior.ActorID != 0 {
+			summary := batchByPlayerID[behavior.ActorID]
+			if summary == nil {
+				summary = &batchSummary{Spent: map[string]int64{}, Gained: map[string]int64{}}
+				batchByPlayerID[behavior.ActorID] = summary
+			}
+			summary.CompletedRuns++
+			addInt64Map(summary.Spent, resolvedSpent)
+			addInt64Map(summary.Gained, resolvedGained)
 		}
 
-		shouldQueueNext := false
-		switch payload.Mode {
-		case behaviorModeOnce:
-			shouldQueueNext = false
-		case behaviorModeRepeat:
-			shouldQueueNext = repeatIntervalMinutes > 0
-		case behaviorModeRepeatUntil:
-			shouldQueueNext = repeatIntervalMinutes > 0 && (payload.RepeatUntilTick == 0 || currentTick < payload.RepeatUntilTick)
-		default:
-			shouldQueueNext = repeatIntervalMinutes > 0
-		}
+		shouldQueueNext := shouldQueueNextBehavior(payload, currentTick, repeatIntervalMinutes, behavior.Key, restRecovered)
 
 		if shouldQueueNext {
 			nextPayload := payload
+			nextPayload.Spent = nil
+			nextPayload.Gained = nil
 			if definition.RequiresMarketOpen {
 				waitDuration := payload.MarketWaitDurationMinutes
 				if waitDuration <= 0 {
@@ -1341,7 +1516,7 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 				ActorType:         behavior.ActorType,
 				ActorID:           behavior.ActorID,
 				State:             behaviorQueued,
-				ScheduledAtTick:   currentTick + repeatIntervalMinutes,
+				ScheduledAtTick:   currentTick + maxInt64(repeatIntervalMinutes, 0),
 				DurationMinutes:   definition.DurationMinutes,
 				PayloadJSON:       nextPayloadJSON,
 				RepeatIntervalMin: repeatIntervalMinutes,
@@ -1352,27 +1527,37 @@ func processCompletions(ctx context.Context, tx *gorm.DB, currentTick int64, rea
 		}
 	}
 
+	for playerID, summary := range batchByPlayerID {
+		if summary.CompletedRuns <= 1 {
+			continue
+		}
+		message := fmt.Sprintf("%d queued runs finished. Spent: %s. Gained: %s.", summary.CompletedRuns, formatSummaryMap(summary.Spent), formatSummaryMap(summary.Gained))
+		if err := createWorldEvent(ctx, tx, currentTick, "behavior_batch_completed", message, ActorPlayer, playerID, realmID); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
-func applyRestRecoveryOnCompletion(ctx context.Context, tx *gorm.DB, behavior dal.BehaviorInstance, definition BehaviorDefinition) (string, error) {
+func applyRestRecoveryOnCompletion(ctx context.Context, tx *gorm.DB, behavior dal.BehaviorInstance, definition BehaviorDefinition) (string, int64, error) {
 	if behavior.ActorType != ActorPlayer || behavior.ActorID == 0 || behavior.Key != restBehaviorKey {
-		return "", nil
+		return "", 0, nil
 	}
 
 	endurance, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statEndurance, 0, behavior.RealmID)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	maxStamina, recoveryRate := deriveStaminaByEndurance(endurance)
 	currentStamina, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statStamina, maxStamina, behavior.RealmID)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	recovered := computeRestRecoveryPoints(recoveryRate, definition.DurationMinutes)
 	if recovered <= 0 {
-		return "", nil
+		return "", 0, nil
 	}
 
 	nextStamina := currentStamina + recovered
@@ -1382,14 +1567,14 @@ func applyRestRecoveryOnCompletion(ctx context.Context, tx *gorm.DB, behavior da
 
 	actualRecovered := nextStamina - currentStamina
 	if actualRecovered <= 0 {
-		return "Stamina is already full.", nil
+		return "Stamina is already full.", 0, nil
 	}
 
 	if err := setPlayerStatValue(ctx, tx, behavior.ActorID, statStamina, nextStamina, behavior.RealmID); err != nil {
-		return "", err
+		return "", 0, err
 	}
 
-	return fmt.Sprintf("Rest recovery restored %d stamina.", actualRecovered), nil
+	return fmt.Sprintf("Rest recovery restored %d stamina.", actualRecovered), actualRecovered, nil
 }
 
 func computeRestRecoveryPoints(recoveryRate int64, durationMinutes int64) int64 {
@@ -1541,13 +1726,222 @@ func getInventoryQuantity(ctx context.Context, tx *gorm.DB, playerID uint, item 
 }
 
 func markBehaviorFailed(ctx context.Context, tx *gorm.DB, behaviorID uint, reason string) error {
+	return markBehaviorFailedAtTick(ctx, tx, behaviorID, reason, 0)
+}
+
+func markBehaviorCompletedAtTick(ctx context.Context, tx *gorm.DB, behaviorID uint, message string, completedAtTick int64) error {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "Behavior completed."
+	}
+	updates := map[string]any{"state": behaviorCompleted, "result_message": message, "failure_reason": ""}
+	if completedAtTick > 0 {
+		updates["completes_at_tick"] = completedAtTick
+	}
+	return tx.WithContext(ctx).Model(&dal.BehaviorInstance{}).
+		Where("id = ?", behaviorID).
+		Updates(updates).Error
+}
+
+func markBehaviorFailedAtTick(ctx context.Context, tx *gorm.DB, behaviorID uint, reason string, failedAtTick int64) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "behavior failed"
 	}
+	updates := map[string]any{"state": behaviorFailed, "failure_reason": reason}
+	if failedAtTick > 0 {
+		updates["completes_at_tick"] = failedAtTick
+	}
 	return tx.WithContext(ctx).Model(&dal.BehaviorInstance{}).
 		Where("id = ?", behaviorID).
-		Updates(map[string]any{"state": behaviorFailed, "failure_reason": reason}).Error
+		Updates(updates).Error
+}
+
+func isInsufficientStaminaError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "insufficient stamina")
+}
+
+func hasSufficientBehaviorStamina(ctx context.Context, tx *gorm.DB, behavior dal.BehaviorInstance, definition BehaviorDefinition) (bool, error) {
+	if behavior.ActorType != ActorPlayer || behavior.ActorID == 0 || definition.StaminaCost <= 0 {
+		return true, nil
+	}
+
+	endurance, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statEndurance, 0, behavior.RealmID)
+	if err != nil {
+		return false, err
+	}
+	maxStamina, _ := deriveStaminaByEndurance(endurance)
+
+	current, err := getPlayerStatValueOrDefault(ctx, tx, behavior.ActorID, statStamina, maxStamina, behavior.RealmID)
+	if err != nil {
+		return false, err
+	}
+
+	return current >= definition.StaminaCost, nil
+}
+
+func queuedBehaviorWaitReason(ctx context.Context, database *gorm.DB, behavior dal.BehaviorInstance, definition BehaviorDefinition, payload behaviorRuntimePayload, currentTick int64) string {
+	if behavior.ScheduledAtTick > currentTick {
+		return fmt.Sprintf("Scheduled for tick %d.", behavior.ScheduledAtTick)
+	}
+
+	if definition.RequiresMarketOpen && !IsMarketOpen(currentTick) {
+		if payload.MarketWaitUntilTick > 0 {
+			return fmt.Sprintf("Waiting for market open before tick %d.", payload.MarketWaitUntilTick)
+		}
+		return "Waiting for market to open."
+	}
+
+	if definition.RequiresNight && !IsNightTick(currentTick) {
+		return "Waiting for night hours."
+	}
+
+	hasConflict, err := hasActiveExclusiveConflict(ctx, database, behavior, definition)
+	if err == nil && hasConflict {
+		group := behaviorExclusiveGroup(definition)
+		if group == "" {
+			return "Waiting for an exclusive behavior slot."
+		}
+		return fmt.Sprintf("Waiting for %s slot.", HumanizeIdentifier(group))
+	}
+
+	if err := validateRequirements(ctx, database, behavior.ActorID, definition.Requirements, behavior.RealmID); err != nil {
+		return err.Error()
+	}
+
+	hasStamina, err := hasSufficientBehaviorStamina(ctx, database, behavior, definition)
+	if err == nil && !hasStamina {
+		return fmt.Sprintf("Waiting for %s.", HumanizeIdentifier(statStamina))
+	}
+
+	return "Queued and waiting for activation."
+}
+
+func shouldAutoCompleteQueuedBehavior(payload behaviorRuntimePayload, err error) bool {
+	if err == nil {
+		return false
+	}
+	if payload.Mode != behaviorModeRepeat && payload.Mode != behaviorModeRepeatUntil {
+		return false
+	}
+
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.HasPrefix(message, "missing ") || strings.HasPrefix(message, "insufficient ")
+}
+
+func shouldQueueNextBehavior(payload behaviorRuntimePayload, currentTick int64, repeatIntervalMinutes int64, behaviorKey string, restRecovered int64) bool {
+	shouldQueueNext := false
+	switch payload.Mode {
+	case behaviorModeOnce:
+		shouldQueueNext = false
+	case behaviorModeRepeat:
+		shouldQueueNext = true
+	case behaviorModeRepeatUntil:
+		shouldQueueNext = payload.RepeatUntilTick == 0 || currentTick < payload.RepeatUntilTick
+	default:
+		shouldQueueNext = repeatIntervalMinutes > 0
+	}
+
+	if shouldQueueNext && behaviorKey == restBehaviorKey && restRecovered <= 0 {
+		return false
+	}
+
+	return shouldQueueNext
+}
+
+func CancelPlayerBehavior(ctx context.Context, database *gorm.DB, playerID uint, behaviorID uint, currentTick int64, realmID uint) (BehaviorView, error) {
+	realmID = normalizeRealmID(realmID)
+	view := BehaviorView{}
+	err := database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		instance := dal.BehaviorInstance{}
+		result := tx.WithContext(ctx).
+			Where("id = ? AND realm_id = ? AND actor_type = ? AND actor_id = ?", behaviorID, realmID, ActorPlayer, playerID).
+			Limit(1).
+			Find(&instance)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return fmt.Errorf("%w: behavior instance not found", ErrBehaviorNotCancelable)
+		}
+		if instance.State != behaviorQueued && instance.State != behaviorActive {
+			return fmt.Errorf("%w: behavior state %s", ErrBehaviorNotCancelable, instance.State)
+		}
+
+		definition, ok := GetBehaviorDefinition(instance.Key)
+		if !ok {
+			return fmt.Errorf("unknown behavior definition")
+		}
+
+		if instance.State == behaviorActive {
+			if err := applyItemDelta(ctx, tx, instance.ActorID, instance.RealmID, definition.Costs); err != nil {
+				return err
+			}
+			if definition.StaminaCost > 0 {
+				endurance, err := getPlayerStatValueOrDefault(ctx, tx, instance.ActorID, statEndurance, 0, instance.RealmID)
+				if err != nil {
+					return err
+				}
+				maxStamina, _ := deriveStaminaByEndurance(endurance)
+				currentStamina, err := getPlayerStatValueOrDefault(ctx, tx, instance.ActorID, statStamina, maxStamina, instance.RealmID)
+				if err != nil {
+					return err
+				}
+				refunded := currentStamina + definition.StaminaCost
+				if refunded > maxStamina {
+					refunded = maxStamina
+				}
+				if err := setPlayerStatValue(ctx, tx, instance.ActorID, statStamina, refunded, instance.RealmID); err != nil {
+					return err
+				}
+			}
+		}
+
+		payload := parseBehaviorRuntimePayload(instance.PayloadJSON)
+		if err := tx.WithContext(ctx).Model(&dal.BehaviorInstance{}).
+			Where("id = ?", instance.ID).
+			Updates(map[string]any{
+				"state":             behaviorCancelled,
+				"failure_reason":    "",
+				"result_message":    "Cancelled by player.",
+				"completes_at_tick": currentTick,
+				"payload_json":      mustMarshalBehaviorRuntimePayload(payload),
+			}).Error; err != nil {
+			return err
+		}
+
+		if err := createWorldEvent(ctx, tx, currentTick, "behavior_cancelled", fmt.Sprintf("%s cancelled.", BehaviorDisplayName(definition)), ActorPlayer, instance.ID, instance.RealmID); err != nil {
+			return err
+		}
+
+		view = BehaviorView{
+			ID:                    instance.ID,
+			Key:                   instance.Key,
+			ActorType:             instance.ActorType,
+			ActorID:               instance.ActorID,
+			State:                 behaviorCancelled,
+			Mode:                  payload.Mode,
+			RepeatIntervalMinutes: maxInt64(instance.RepeatIntervalMin, payload.RepeatIntervalMinutes),
+			RepeatUntilTick:       payload.RepeatUntilTick,
+			ScheduledAt:           instance.ScheduledAtTick,
+			StartedAt:             instance.StartedAtTick,
+			CompletesAt:           currentTick,
+			DurationMinute:        instance.DurationMinutes,
+			ResultMessage:         "Cancelled by player.",
+			Spent:                 payload.Spent,
+			Gained:                payload.Gained,
+		}
+
+		return nil
+	})
+	if err != nil {
+		return BehaviorView{}, err
+	}
+
+	return view, nil
 }
 
 func createWorldEvent(ctx context.Context, tx *gorm.DB, tick int64, eventType, message, source string, refID uint, realmID uint) error {
@@ -1838,14 +2232,25 @@ func applySingleMarketDelta(ctx context.Context, tx *gorm.DB, item string, delta
 		}
 	}
 
-	entry.Price = entry.Price + delta
+	budgetedDelta, budgetErr := applyAdaptiveImpactBudget(ctx, tx, item, delta, source, currentTick, realmID)
+	if budgetErr != nil {
+		return 0, budgetErr
+	}
+	if budgetedDelta == 0 {
+		if entry.Price < 1 {
+			entry.Price = 1
+		}
+		return entry.Price, nil
+	}
+
+	entry.Price = entry.Price + budgetedDelta
 	if entry.Price < 1 {
 		entry.Price = 1
 	}
 	if entry.Price > 500 {
 		entry.Price = 500
 	}
-	entry.LastDelta = delta
+	entry.LastDelta = budgetedDelta
 	entry.LastSource = source
 	entry.UpdatedTick = currentTick
 
@@ -1853,11 +2258,131 @@ func applySingleMarketDelta(ctx context.Context, tx *gorm.DB, item string, delta
 		return 0, err
 	}
 
-	if err := appendMarketHistory(ctx, tx, item, currentTick, entry.Price, delta, source, realmID); err != nil {
+	if err := appendMarketHistory(ctx, tx, item, currentTick, entry.Price, budgetedDelta, source, realmID); err != nil {
 		return 0, err
 	}
 
 	return entry.Price, nil
+}
+
+func applyAdaptiveImpactBudget(ctx context.Context, tx *gorm.DB, item string, proposedDelta int64, source string, currentTick int64, realmID uint) (int64, error) {
+	if proposedDelta == 0 || source == "bootstrap" {
+		return proposedDelta, nil
+	}
+
+	windowStart := currentTick - marketImpactBudgetWindowTicks
+	participants, err := estimateActiveMarketParticipants(ctx, tx, realmID, windowStart)
+	if err != nil {
+		return 0, err
+	}
+
+	liquidity := dal.MarketLiquidity{}
+	if err := tx.WithContext(ctx).
+		Where("realm_id = ? AND item_key = ?", realmID, item).
+		Limit(1).
+		Find(&liquidity).Error; err != nil {
+		return 0, err
+	}
+
+	directionalBudget := marketImpactMinBudgetPerDirection + participants
+	if liquidity.Quantity > 0 {
+		directionalBudget += maxInt64(liquidity.Quantity/marketImpactLiquidityDivisor, 0)
+	}
+	if source == marketStorytellerDeltaSource {
+		directionalBudget += marketImpactStorytellerBonus
+	} else if strings.HasPrefix(source, "world_") {
+		directionalBudget += marketImpactWorldEventBonus
+	}
+	if directionalBudget < marketImpactMinBudgetPerDirection {
+		directionalBudget = marketImpactMinBudgetPerDirection
+	}
+	if directionalBudget > marketImpactMaxBudgetPerDirection {
+		directionalBudget = marketImpactMaxBudgetPerDirection
+	}
+
+	used := struct {
+		Positive int64
+		Negative int64
+	}{}
+	if err := tx.WithContext(ctx).
+		Model(&dal.MarketHistory{}).
+		Select(
+			"COALESCE(SUM(CASE WHEN delta > 0 THEN delta ELSE 0 END), 0) AS positive, COALESCE(SUM(CASE WHEN delta < 0 THEN -delta ELSE 0 END), 0) AS negative",
+		).
+		Where("realm_id = ? AND item_key = ? AND tick >= ?", realmID, item, windowStart).
+		Scan(&used).Error; err != nil {
+		return 0, err
+	}
+
+	remainingPositive := directionalBudget - used.Positive
+	remainingNegative := directionalBudget - used.Negative
+	if proposedDelta > 0 {
+		if remainingPositive <= 0 {
+			return 0, nil
+		}
+		if proposedDelta > remainingPositive {
+			return remainingPositive, nil
+		}
+		return proposedDelta, nil
+	}
+
+	absDelta := -proposedDelta
+	if remainingNegative <= 0 {
+		return 0, nil
+	}
+	if absDelta > remainingNegative {
+		return -remainingNegative, nil
+	}
+	return proposedDelta, nil
+}
+
+func estimateActiveMarketParticipants(ctx context.Context, tx *gorm.DB, realmID uint, windowStart int64) (int64, error) {
+	realmID = normalizeRealmID(realmID)
+
+	var realmPopulation int64
+	if err := tx.WithContext(ctx).
+		Model(&dal.Character{}).
+		Where("realm_id = ? AND status = ?", realmID, "active").
+		Count(&realmPopulation).Error; err != nil {
+		return 0, err
+	}
+
+	var openOrderParticipants int64
+	if err := tx.WithContext(ctx).
+		Model(&dal.MarketOrder{}).
+		Distinct("player_id").
+		Where("realm_id = ? AND state = ? AND player_id > 0", realmID, marketOrderStateOpen).
+		Count(&openOrderParticipants).Error; err != nil {
+		return 0, err
+	}
+
+	var recentTradeParticipants int64
+	if err := tx.WithContext(ctx).
+		Raw(
+			"SELECT COUNT(*) FROM ("+
+				"SELECT DISTINCT buyer_id AS pid FROM market_trades WHERE realm_id = ? AND tick >= ? AND buyer_type = 'player' AND buyer_id > 0 " +
+				"UNION " +
+				"SELECT DISTINCT seller_id AS pid FROM market_trades WHERE realm_id = ? AND tick >= ? AND seller_type = 'player' AND seller_id > 0"+
+				") AS market_participants",
+			realmID,
+			windowStart,
+			realmID,
+			windowStart,
+		).
+		Scan(&recentTradeParticipants).Error; err != nil {
+		return 0, err
+	}
+
+	participants := maxInt64(openOrderParticipants, recentTradeParticipants)
+	populationBaseline := maxInt64(realmPopulation/marketImpactPopulationBaselineDiv, 1)
+	if participants < populationBaseline {
+		participants = populationBaseline
+	}
+	if participants < 1 {
+		participants = 1
+	}
+
+	return participants, nil
 }
 
 func appendMarketHistory(ctx context.Context, tx *gorm.DB, item string, tick, price, delta int64, source string, realmID uint) error {
@@ -1921,6 +2446,11 @@ func IsMarketOpen(currentTick int64) bool {
 	return minuteOfDay >= marketOpenMinute && minuteOfDay < marketCloseMinute
 }
 
+func IsNightTick(currentTick int64) bool {
+	minuteOfDay := positiveModulo(currentTick, minutesPerDay)
+	return minuteOfDay >= nightStartMinute || minuteOfDay < nightEndMinute
+}
+
 func nextMarketOpenTick(currentTick int64) int64 {
 	minuteOfDay := positiveModulo(currentTick, minutesPerDay)
 	if minuteOfDay < marketOpenMinute {
@@ -1942,9 +2472,21 @@ func GetMarketStatus(ctx context.Context, database *gorm.DB, currentTick int64, 
 	if err := database.WithContext(ctx).Where("realm_id = ?", realmID).Order("item_key ASC").Find(&rows).Error; err != nil {
 		return MarketStatus{}, err
 	}
+	liquidityBySymbol, err := loadMarketLiquiditySnapshot(ctx, database, realmID)
+	if err != nil {
+		return MarketStatus{}, err
+	}
 
 	tickers := make([]MarketTickerView, 0, len(rows))
 	for _, row := range rows {
+		liquidity := liquidityBySymbol[row.ItemKey]
+		if liquidity.Quantity > 0 {
+			liquidity.CapEstimate = liquidity.Quantity * row.Price
+		}
+		movement, movementErr := loadMarketMovementStats(ctx, database, row.ItemKey, currentTick, realmID)
+		if movementErr != nil {
+			return MarketStatus{}, movementErr
+		}
 		tickers = append(tickers, MarketTickerView{
 			Symbol:       row.ItemKey,
 			Price:        row.Price,
@@ -1952,6 +2494,8 @@ func GetMarketStatus(ctx context.Context, database *gorm.DB, currentTick int64, 
 			LastSource:   row.LastSource,
 			UpdatedTick:  row.UpdatedTick,
 			SessionState: MarketSessionState(currentTick),
+			Liquidity:    liquidity,
+			Movement:     movement,
 		})
 	}
 
@@ -2016,6 +2560,179 @@ func GetMarketHistory(ctx context.Context, database *gorm.DB, symbol string, lim
 	}
 
 	return history, nil
+}
+
+func GetMarketCandles(ctx context.Context, database *gorm.DB, symbol string, bucketTicks int64, limit int, realmID uint) ([]MarketCandleEntry, error) {
+	realmID = normalizeRealmID(realmID)
+	if err := ensureMarketHistorySeed(ctx, database, realmID); err != nil {
+		return nil, err
+	}
+
+	if bucketTicks <= 0 {
+		bucketTicks = 30
+	}
+	if bucketTicks > 24*60 {
+		bucketTicks = 24 * 60
+	}
+	if limit <= 0 {
+		limit = 120
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	symbol = strings.TrimSpace(symbol)
+	if symbol == "" {
+		return []MarketCandleEntry{}, nil
+	}
+
+	rows := make([]dal.MarketHistory, 0)
+	if err := database.WithContext(ctx).
+		Model(&dal.MarketHistory{}).
+		Where("realm_id = ? AND item_key = ?", realmID, symbol).
+		Order("tick ASC, id ASC").
+		Limit(limit * 8).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	if len(rows) == 0 {
+		return []MarketCandleEntry{}, nil
+	}
+
+	byBucket := map[int64]*MarketCandleEntry{}
+	for _, row := range rows {
+		bucketStart := (row.Tick / bucketTicks) * bucketTicks
+		entry, exists := byBucket[bucketStart]
+		if !exists {
+			byBucket[bucketStart] = &MarketCandleEntry{
+				Symbol:          symbol,
+				BucketStartTick: bucketStart,
+				Open:            row.Price,
+				High:            row.Price,
+				Low:             row.Price,
+				Close:           row.Price,
+				Points:          1,
+			}
+			continue
+		}
+
+		if row.Price > entry.High {
+			entry.High = row.Price
+		}
+		if row.Price < entry.Low {
+			entry.Low = row.Price
+		}
+		entry.Close = row.Price
+		entry.Points++
+	}
+
+	buckets := make([]int64, 0, len(byBucket))
+	for bucket := range byBucket {
+		buckets = append(buckets, bucket)
+	}
+	sort.Slice(buckets, func(i, j int) bool { return buckets[i] < buckets[j] })
+	if len(buckets) > limit {
+		buckets = buckets[len(buckets)-limit:]
+	}
+
+	candles := make([]MarketCandleEntry, 0, len(buckets))
+	for _, bucket := range buckets {
+		candles = append(candles, *byBucket[bucket])
+	}
+
+	return candles, nil
+}
+
+func loadMarketLiquiditySnapshot(ctx context.Context, database *gorm.DB, realmID uint) (map[string]MarketLiquidityView, error) {
+	rows := make([]dal.MarketLiquidity, 0)
+	if err := database.WithContext(ctx).Where("realm_id = ?", realmID).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]MarketLiquidityView, len(rows))
+	for _, row := range rows {
+		rangeSpan := row.MaxQty - row.MinQty
+		utilization := 0.0
+		if rangeSpan > 0 {
+			utilization = float64(row.Quantity-row.MinQty) * 100 / float64(rangeSpan)
+		}
+		result[row.ItemKey] = MarketLiquidityView{
+			Quantity:         row.Quantity,
+			BaselineQuantity: row.BaselineQty,
+			MinQuantity:      row.MinQty,
+			MaxQuantity:      row.MaxQty,
+			UtilizationPct:   utilization,
+			CapEstimate:      0,
+			LastPressure:     row.LastPressure,
+		}
+	}
+
+	return result, nil
+}
+
+func loadMarketMovementStats(ctx context.Context, database *gorm.DB, symbol string, currentTick int64, realmID uint) (MarketMovementStatsView, error) {
+	const windowTicks int64 = 24 * 60
+	windowStart := currentTick - windowTicks
+
+	historyRows := make([]dal.MarketHistory, 0)
+	if err := database.WithContext(ctx).
+		Where("realm_id = ? AND item_key = ? AND tick >= ?", realmID, symbol, windowStart).
+		Order("tick ASC, id ASC").
+		Find(&historyRows).Error; err != nil {
+		return MarketMovementStatsView{}, err
+	}
+
+	movement := MarketMovementStatsView{WindowTicks: windowTicks}
+	if len(historyRows) > 0 {
+		low := historyRows[0].Price
+		high := historyRows[0].Price
+		for _, row := range historyRows {
+			if row.Price < low {
+				low = row.Price
+			}
+			if row.Price > high {
+				high = row.Price
+			}
+		}
+		movement.WindowLow = low
+		movement.WindowHigh = high
+		movement.WindowRange = high - low
+		movement.WindowChange = historyRows[len(historyRows)-1].Price - historyRows[0].Price
+		for _, row := range historyRows {
+			switch row.Source {
+			case "npc_cycle":
+				movement.NPCCycleMoves++
+			case marketStorytellerDeltaSource:
+				movement.StorytellerMoves++
+			case "orderbook_trade":
+				movement.OrderbookMoves++
+			}
+		}
+	}
+
+	var trades int64
+	if err := database.WithContext(ctx).
+		Model(&dal.MarketTrade{}).
+		Where("realm_id = ? AND item_key = ? AND tick >= ?", realmID, symbol, windowStart).
+		Count(&trades).Error; err != nil {
+		return MarketMovementStatsView{}, err
+	}
+	movement.Trades = trades
+
+	var npcTrades int64
+	if err := database.WithContext(ctx).
+		Model(&dal.MarketTrade{}).
+		Where("realm_id = ? AND item_key = ? AND tick >= ? AND (buyer_type = ? OR seller_type = ?)", realmID, symbol, windowStart, "npc", "npc").
+		Count(&npcTrades).Error; err != nil {
+		return MarketMovementStatsView{}, err
+	}
+	movement.NPCParticipantTrades = npcTrades
+	if trades > 0 {
+		movement.NPCTradeSharePct = float64(npcTrades) * 100 / float64(trades)
+	}
+
+	return movement, nil
 }
 
 func ensureMarketHistorySeed(ctx context.Context, database *gorm.DB, realmID uint) error {
@@ -2089,6 +2806,8 @@ func parseBehaviorRuntimePayload(raw string) behaviorRuntimePayload {
 	if payload.RepeatUntilTick < 0 {
 		payload.RepeatUntilTick = 0
 	}
+	payload.Spent = normalizeInt64Map(payload.Spent)
+	payload.Gained = normalizeInt64Map(payload.Gained)
 	return payload
 }
 
@@ -2100,7 +2819,9 @@ func maxInt64(left int64, right int64) int64 {
 }
 
 func marshalBehaviorRuntimePayload(payload behaviorRuntimePayload) (string, error) {
-	if payload == (behaviorRuntimePayload{}) {
+	payload.Spent = normalizeInt64Map(payload.Spent)
+	payload.Gained = normalizeInt64Map(payload.Gained)
+	if isEmptyBehaviorRuntimePayload(payload) {
 		return "{}", nil
 	}
 
@@ -2110,6 +2831,94 @@ func marshalBehaviorRuntimePayload(payload behaviorRuntimePayload) (string, erro
 	}
 
 	return string(encoded), nil
+}
+
+func mustMarshalBehaviorRuntimePayload(payload behaviorRuntimePayload) string {
+	encoded, err := marshalBehaviorRuntimePayload(payload)
+	if err != nil {
+		return "{}"
+	}
+	return encoded
+}
+
+func isEmptyBehaviorRuntimePayload(payload behaviorRuntimePayload) bool {
+	return payload.MarketWaitDurationMinutes == 0 &&
+		payload.MarketWaitUntilTick == 0 &&
+		payload.Mode == "" &&
+		payload.RepeatIntervalMinutes == 0 &&
+		payload.RepeatUntilTick == 0 &&
+		len(payload.Spent) == 0 &&
+		len(payload.Gained) == 0
+}
+
+func normalizeInt64Map(values map[string]int64) map[string]int64 {
+	if len(values) == 0 {
+		return nil
+	}
+	normalized := make(map[string]int64, len(values))
+	for key, value := range values {
+		trimmed := strings.TrimSpace(key)
+		if trimmed == "" || value == 0 {
+			continue
+		}
+		normalized[trimmed] = value
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func realizedBehaviorSpent(definition BehaviorDefinition) map[string]int64 {
+	spent := map[string]int64{}
+	if definition.StaminaCost > 0 {
+		spent[statStamina] = definition.StaminaCost
+	}
+	for itemKey, amount := range definition.Costs {
+		if amount <= 0 {
+			continue
+		}
+		spent[itemKey] = amount
+	}
+	return normalizeInt64Map(spent)
+}
+
+func realizedBehaviorGained(outputs map[string]int64, statDeltas map[string]int64, recoveredStamina int64) map[string]int64 {
+	gained := map[string]int64{}
+	addInt64Map(gained, outputs)
+	addInt64Map(gained, statDeltas)
+	if recoveredStamina > 0 {
+		gained[statStamina] += recoveredStamina
+	}
+	return normalizeInt64Map(gained)
+}
+
+func addInt64Map(target map[string]int64, delta map[string]int64) {
+	for key, amount := range delta {
+		if amount == 0 {
+			continue
+		}
+		target[key] += amount
+		if target[key] == 0 {
+			delete(target, key)
+		}
+	}
+}
+
+func formatSummaryMap(values map[string]int64) string {
+	if len(values) == 0 {
+		return "none"
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%d %s", values[key], HumanizeIdentifier(key)))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func loadOrInitAscension(ctx context.Context, database *gorm.DB) (*dal.AscensionState, error) {
@@ -2198,6 +3007,26 @@ func SortBehaviorDefinitions(definitions []BehaviorDefinition) []BehaviorDefinit
 	sort.Slice(sorted, func(i, j int) bool {
 		leftName := BehaviorDisplayName(sorted[i])
 		rightName := BehaviorDisplayName(sorted[j])
+		if leftName == rightName {
+			return sorted[i].Key < sorted[j].Key
+		}
+		return leftName < rightName
+	})
+	return sorted
+}
+
+func SortUpgradeDefinitions(definitions []UpgradeDefinition) []UpgradeDefinition {
+	sorted := make([]UpgradeDefinition, len(definitions))
+	copy(sorted, definitions)
+	sort.Slice(sorted, func(i, j int) bool {
+		leftName := strings.TrimSpace(sorted[i].Name)
+		rightName := strings.TrimSpace(sorted[j].Name)
+		if leftName == "" {
+			leftName = HumanizeIdentifier(sorted[i].Key)
+		}
+		if rightName == "" {
+			rightName = HumanizeIdentifier(sorted[j].Key)
+		}
 		if leftName == rightName {
 			return sorted[i].Key < sorted[j].Key
 		}

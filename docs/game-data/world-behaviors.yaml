@@ -1,5 +1,17 @@
 version: 1
 behaviors:
+  - key: world_market_pulse
+    actorType: world
+    durationMinutes: 60
+    requirements:
+      unlocks: []
+      items: {}
+    costs: {}
+    outputs: {}
+    outputExpressions: {}
+    startMessage: "Legacy market pulse behavior is phasing out."
+    completeMessage: "Legacy pulse completed as market systems migrate."
+
   - key: world_market_ai_cycle
     actorType: world
     durationMinutes: 60

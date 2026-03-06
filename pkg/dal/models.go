@@ -113,6 +113,14 @@ type PlayerStat struct {
 	Value    int64  `gorm:"not null;default:0"`
 }
 
+type PlayerUpgrade struct {
+	BaseModel
+	RealmID     uint   `gorm:"not null;default:1;index"`
+	PlayerID    uint   `gorm:"not null;index:idx_player_upgrade,priority:1"`
+	UpgradeKey  string `gorm:"size:64;not null;index:idx_player_upgrade,priority:2"`
+	PurchaseCnt int64  `gorm:"not null;default:0"`
+}
+
 type BehaviorInstance struct {
 	BaseModel
 	RealmID           uint   `gorm:"not null;default:1;index"`
@@ -160,6 +168,50 @@ type MarketHistory struct {
 	Delta        int64  `gorm:"not null;default:0"`
 	Source       string `gorm:"size:64;not null;default:''"`
 	SessionState string `gorm:"size:16;not null;default:'closed'"`
+}
+
+type MarketOrder struct {
+	BaseModel
+	RealmID          uint   `gorm:"not null;default:1;index:idx_market_order_lookup,priority:1"`
+	PlayerID         uint   `gorm:"not null;index:idx_market_order_lookup,priority:2"`
+	ItemKey          string `gorm:"size:64;not null;index:idx_market_order_lookup,priority:3"`
+	Side             string `gorm:"size:8;not null;index"`
+	State            string `gorm:"size:16;not null;default:'open';index"`
+	LimitPrice       int64  `gorm:"not null"`
+	QuantityTotal    int64  `gorm:"not null"`
+	QuantityOpen     int64  `gorm:"not null"`
+	EscrowCoins      int64  `gorm:"not null;default:0"`
+	CancelAfterTick  int64  `gorm:"not null;default:0;index"`
+	LastMatchedTick  int64  `gorm:"not null;default:0;index"`
+	CancellationNote string `gorm:"size:255;not null;default:''"`
+}
+
+type MarketTrade struct {
+	BaseModel
+	RealmID      uint   `gorm:"not null;default:1;index"`
+	ItemKey      string `gorm:"size:64;not null;index"`
+	Price        int64  `gorm:"not null"`
+	Quantity     int64  `gorm:"not null"`
+	Tick         int64  `gorm:"not null;index"`
+	BuyerType    string `gorm:"size:16;not null;index"`
+	BuyerID      uint   `gorm:"not null;default:0;index"`
+	SellerType   string `gorm:"size:16;not null;index"`
+	SellerID     uint   `gorm:"not null;default:0;index"`
+	BuyOrderID   uint   `gorm:"not null;default:0;index"`
+	SellOrderID  uint   `gorm:"not null;default:0;index"`
+	ExecutionTag string `gorm:"size:32;not null;default:'limit'"`
+}
+
+type MarketLiquidity struct {
+	BaseModel
+	RealmID      uint   `gorm:"not null;default:1;uniqueIndex:idx_market_liquidity_realm_item,priority:1"`
+	ItemKey      string `gorm:"size:64;not null;uniqueIndex:idx_market_liquidity_realm_item,priority:2"`
+	Quantity     int64  `gorm:"not null;default:0"`
+	BaselineQty  int64  `gorm:"not null;default:0"`
+	MinQty       int64  `gorm:"not null;default:0"`
+	MaxQty       int64  `gorm:"not null;default:0"`
+	UpdatedTick  int64  `gorm:"not null;default:0"`
+	LastPressure int64  `gorm:"not null;default:0"`
 }
 
 type AscensionState struct {
@@ -244,10 +296,14 @@ func Models() []any {
 		&InventoryEntry{},
 		&PlayerUnlock{},
 		&PlayerStat{},
+		&PlayerUpgrade{},
 		&BehaviorInstance{},
 		&WorldEvent{},
 		&MarketPrice{},
 		&MarketHistory{},
+		&MarketOrder{},
+		&MarketTrade{},
+		&MarketLiquidity{},
 		&AscensionState{},
 		&ChatChannel{},
 		&ChatChannelModeration{},

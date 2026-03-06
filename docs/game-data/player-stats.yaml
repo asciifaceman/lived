@@ -18,6 +18,16 @@ stats:
     starterProgression:
       - player_socialize_market
 
+  - key: financial
+    label: Financial
+    description: Improves valuation discipline and trading judgment.
+    effects:
+      - Directly contributes to derived trading aptitude (`trading_aptitude = social + financial`).
+      - Supports higher-tier commodity and strategy access via soft requirements.
+    starterProgression:
+      - player_study_ledger_math
+      - player_take_finance_class
+
   - key: stamina
     label: Stamina
     description: Energy pool consumed by physically demanding behaviors.

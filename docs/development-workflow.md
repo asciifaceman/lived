@@ -64,9 +64,26 @@ go test ./...
 go test ./src/server/system ./src/server/player ./src/server/stream
 ```
 
+## Game Content Codegen
+
+`docs/game-data/*.yaml` is the designer-facing source of truth. Runtime build artifacts are generated to Go source:
+
+```bash
+go run ./tools/contentgen -out pkg/gamedata/zz_generated_game_data.go
+```
+
+Generated outputs:
+
+- `pkg/gamedata/zz_generated_game_data.go` (content metadata + dynamic document payload)
+- `src/gameplay/zz_generated_behavior_definitions.go` (typed `BehaviorDefinition` maps consumed by runtime)
+
+`mage build`, `mage run`, `mage dev`, and `mage test` run this generation step automatically.
+
 ## Feature tracker generation
 
 `docs/feature-tracker.yaml` is canonical. Regenerate markdown view after edits:
+
+Run this from the repository root (`d:\\dev\\lived`). If your terminal is in `web/`, run `cd ..` first.
 
 ```bash
 go run ./tools/trackergen -yaml docs/feature-tracker.yaml -md docs/feature-tracker.md

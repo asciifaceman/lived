@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/asciifaceman/lived/pkg/config"
 	"github.com/asciifaceman/lived/pkg/dal"
+	"github.com/asciifaceman/lived/pkg/gamedata"
 	"github.com/asciifaceman/lived/pkg/idempotency"
 	"github.com/asciifaceman/lived/pkg/ratelimit"
 	"github.com/asciifaceman/lived/pkg/version"
@@ -49,13 +51,49 @@ type startBehaviorRequest struct {
 	RepeatUntil string `json:"repeatUntil,omitempty"`
 }
 
+type cancelBehaviorRequest struct {
+	BehaviorID uint `json:"behaviorId"`
+}
+
 type ascendRequest struct {
 	Name string `json:"name"`
+}
+
+type purchaseUpgradeRequest struct {
+	UpgradeKey string `json:"upgradeKey"`
 }
 
 type marketHistoryQuery struct {
 	Symbol string `query:"symbol"`
 	Limit  int    `query:"limit"`
+	Realm  uint   `query:"realmId"`
+}
+
+type marketCandleQuery struct {
+	Symbol      string `query:"symbol"`
+	Limit       int    `query:"limit"`
+	BucketTicks int64  `query:"bucketTicks"`
+	Realm       uint   `query:"realmId"`
+}
+
+type placeMarketOrderRequest struct {
+	ItemKey            string `json:"itemKey"`
+	Side               string `json:"side"`
+	Quantity           int64  `json:"quantity"`
+	LimitPrice         int64  `json:"limitPrice"`
+	CancelAfter        string `json:"cancelAfter,omitempty"`
+	ManualCancelFeeBps int64  `json:"manualCancelFeeBps,omitempty"`
+}
+
+type cancelMarketOrderRequest struct {
+	OrderID uint `json:"orderId"`
+}
+
+type marketOrderQuery struct {
+	Symbol string `query:"symbol"`
+	State  string `query:"state"`
+	Limit  int    `query:"limit"`
+	Depth  int    `query:"depth"`
 	Realm  uint   `query:"realmId"`
 }
 
@@ -84,9 +122,15 @@ type systemStatusData struct {
 }
 
 type versionData struct {
-	API      string `json:"api"`
-	Backend  string `json:"backend"`
-	Frontend string `json:"frontend"`
+	API      string          `json:"api"`
+	Backend  string          `json:"backend"`
+	Frontend string          `json:"frontend"`
+	GameData versionGameData `json:"gameData"`
+}
+
+type versionGameData struct {
+	ManifestVersion int    `json:"manifestVersion"`
+	FilesHash       string `json:"filesHash"`
 }
 
 type apiResponse struct {
@@ -132,6 +176,7 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 	}
 	group.GET("/version", makeVersionHandler())
 	startBehaviorHandler := makeStartBehaviorHandler(database, cfg)
+	cancelBehaviorHandler := makeCancelBehaviorHandler(database, cfg)
 	if cfg.MMOAuthEnabled {
 		if cfg.RateLimitEnabled {
 			if cfg.IdempotencyEnabled {
@@ -145,6 +190,11 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 			} else {
 				group.POST("/behaviors/start", startBehaviorHandler, serverAuth.RequireAuth(database, cfg))
 			}
+		}
+		if cfg.RateLimitEnabled {
+			group.POST("/behaviors/cancel", cancelBehaviorHandler, serverAuth.RequireAuth(database, cfg), behaviorLimiter.Middleware("behavior_cancel", cfg.RateLimitBehaviorMax))
+		} else {
+			group.POST("/behaviors/cancel", cancelBehaviorHandler, serverAuth.RequireAuth(database, cfg))
 		}
 	} else {
 		if cfg.RateLimitEnabled {
@@ -160,6 +210,11 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 				group.POST("/behaviors/start", startBehaviorHandler)
 			}
 		}
+		if cfg.RateLimitEnabled {
+			group.POST("/behaviors/cancel", cancelBehaviorHandler, behaviorLimiter.Middleware("behavior_cancel", cfg.RateLimitBehaviorMax))
+		} else {
+			group.POST("/behaviors/cancel", cancelBehaviorHandler)
+		}
 	}
 	catalogHandler := makeBehaviorCatalogHandler(database, cfg)
 	if cfg.MMOAuthEnabled {
@@ -169,18 +224,45 @@ func RegisterRoutes(group *echo.Group, database *gorm.DB, cfg config.Config) {
 	}
 	marketStatusHandler := makeMarketStatusHandler(database, cfg)
 	marketHistoryHandler := makeMarketHistoryHandler(database, cfg)
+	marketCandlesHandler := makeMarketCandlesHandler(database, cfg)
+	marketOverviewHandler := makeMarketOverviewHandler(database, cfg)
+	marketPlaceOrderHandler := makeMarketPlaceOrderHandler(database, cfg)
+	marketCancelOrderHandler := makeMarketCancelOrderHandler(database, cfg)
+	marketMyOrdersHandler := makeMarketMyOrdersHandler(database, cfg)
+	marketOrderBookHandler := makeMarketOrderBookHandler(database, cfg)
+	marketTradesHandler := makeMarketTradesHandler(database, cfg)
 	if cfg.MMOAuthEnabled {
 		group.GET("/market/status", marketStatusHandler, serverAuth.RequireAuth(database, cfg))
 		group.GET("/market/history", marketHistoryHandler, serverAuth.RequireAuth(database, cfg))
+		group.GET("/market/candles", marketCandlesHandler, serverAuth.RequireAuth(database, cfg))
+		group.GET("/market/overview", marketOverviewHandler, serverAuth.RequireAuth(database, cfg))
+		group.POST("/market/orders/place", marketPlaceOrderHandler, serverAuth.RequireAuth(database, cfg))
+		group.POST("/market/orders/cancel", marketCancelOrderHandler, serverAuth.RequireAuth(database, cfg))
+		group.GET("/market/orders/my", marketMyOrdersHandler, serverAuth.RequireAuth(database, cfg))
+		group.GET("/market/orders/book", marketOrderBookHandler, serverAuth.RequireAuth(database, cfg))
+		group.GET("/market/trades", marketTradesHandler, serverAuth.RequireAuth(database, cfg))
 	} else {
 		group.GET("/market/status", marketStatusHandler)
 		group.GET("/market/history", marketHistoryHandler)
+		group.GET("/market/candles", marketCandlesHandler)
+		group.GET("/market/overview", marketOverviewHandler)
+		group.POST("/market/orders/place", marketPlaceOrderHandler)
+		group.POST("/market/orders/cancel", marketCancelOrderHandler)
+		group.GET("/market/orders/my", marketMyOrdersHandler)
+		group.GET("/market/orders/book", marketOrderBookHandler)
+		group.GET("/market/trades", marketTradesHandler)
 	}
 	ascendHandler := makeAscendHandler(database, cfg)
+	upgradeCatalogHandler := makeUpgradeCatalogHandler(database, cfg)
+	purchaseUpgradeHandler := makePurchaseUpgradeHandler(database, cfg)
 	if cfg.MMOAuthEnabled {
 		group.POST("/ascend", ascendHandler, serverAuth.RequireAuth(database, cfg))
+		group.GET("/upgrades/catalog", upgradeCatalogHandler, serverAuth.RequireAuth(database, cfg))
+		group.POST("/upgrades/purchase", purchaseUpgradeHandler, serverAuth.RequireAuth(database, cfg))
 	} else {
 		group.POST("/ascend", ascendHandler)
+		group.GET("/upgrades/catalog", upgradeCatalogHandler)
+		group.POST("/upgrades/purchase", purchaseUpgradeHandler)
 	}
 }
 
@@ -566,6 +648,87 @@ func makeStartBehaviorHandler(database *gorm.DB, cfg config.Config) echo.Handler
 	}
 }
 
+func makeCancelBehaviorHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		var req cancelBehaviorRequest
+		if err := requestbind.JSON(c, &req, "invalid behavior cancel payload"); err != nil {
+			return err
+		}
+
+		if req.BehaviorID == 0 {
+			return echo.NewHTTPError(http.StatusBadRequest, "behaviorId is required")
+		}
+
+		resolvedPlayer := (*dal.Player)(nil)
+		resolvedName := ""
+		resolvedRealmID := uint(1)
+
+		if cfg.MMOAuthEnabled {
+			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+			}
+
+			requestedCharacterID := uint(0)
+			if rawCharacterID := c.QueryParam("characterId"); rawCharacterID != "" {
+				parsedID, parseErr := strconv.ParseUint(rawCharacterID, 10, 64)
+				if parseErr != nil || parsedID == 0 {
+					return echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+				}
+				requestedCharacterID = uint(parsedID)
+			}
+
+			character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, requestedCharacterID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+			}
+			if character == nil {
+				return echo.NewHTTPError(http.StatusBadRequest, "no active character found")
+			}
+
+			player, err := loadPlayerByID(c.Request().Context(), database, character.PlayerID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character player state")
+			}
+			if player == nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "character player state is missing")
+			}
+
+			resolvedPlayer = player
+			resolvedName = character.Name
+			if character.RealmID != 0 {
+				resolvedRealmID = character.RealmID
+			}
+		} else {
+			player, err := loadPrimaryPlayer(c.Request().Context(), database)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+			}
+			if player == nil {
+				return echo.NewHTTPError(http.StatusBadRequest, "create a new game first")
+			}
+
+			resolvedPlayer = player
+			resolvedName = player.Name
+		}
+
+		currentTick, err := gameplay.CurrentWorldTickForRealm(c.Request().Context(), database, resolvedRealmID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+		}
+
+		cancelled, err := gameplay.CancelPlayerBehavior(c.Request().Context(), database, resolvedPlayer.ID, req.BehaviorID, currentTick, resolvedRealmID)
+		if err != nil {
+			if errors.Is(err, gameplay.ErrBehaviorNotCancelable) {
+				return echo.NewHTTPError(http.StatusConflict, err.Error())
+			}
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		return respondSuccess(c, http.StatusOK, "The task was cancelled.", map[string]any{"behavior": cancelled, "player": resolvedName})
+	}
+}
+
 func loadActorCharacter(ctx context.Context, database *gorm.DB, accountID uint, characterID uint) (*dal.Character, error) {
 	const defaultRealmID uint = 1
 
@@ -603,11 +766,61 @@ func loadPlayerByID(ctx context.Context, database *gorm.DB, playerID uint) (*dal
 	return player, nil
 }
 
+func resolveSystemPlayerContext(c echo.Context, database *gorm.DB, cfg config.Config) (*dal.Player, string, uint, error) {
+	resolvedRealmID := uint(1)
+	if cfg.MMOAuthEnabled {
+		actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+		if !ok {
+			return nil, "", 0, echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+		}
+
+		requestedCharacterID := uint(0)
+		if rawCharacterID := c.QueryParam("characterId"); rawCharacterID != "" {
+			parsedID, parseErr := strconv.ParseUint(rawCharacterID, 10, 64)
+			if parseErr != nil || parsedID == 0 {
+				return nil, "", 0, echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+			}
+			requestedCharacterID = uint(parsedID)
+		}
+
+		character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, requestedCharacterID)
+		if err != nil {
+			return nil, "", 0, echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+		}
+		if character == nil {
+			return nil, "", 0, echo.NewHTTPError(http.StatusBadRequest, "complete onboarding first")
+		}
+
+		player, err := loadPlayerByID(c.Request().Context(), database, character.PlayerID)
+		if err != nil {
+			return nil, "", 0, echo.NewHTTPError(http.StatusInternalServerError, "failed to load character player state")
+		}
+		if player == nil {
+			return nil, "", 0, echo.NewHTTPError(http.StatusInternalServerError, "character player state is missing")
+		}
+
+		if character.RealmID != 0 {
+			resolvedRealmID = character.RealmID
+		}
+		return player, character.Name, resolvedRealmID, nil
+	}
+
+	player, err := loadPrimaryPlayer(c.Request().Context(), database)
+	if err != nil {
+		return nil, "", 0, echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+	}
+	if player == nil {
+		return nil, "", 0, echo.NewHTTPError(http.StatusBadRequest, "create a new game first")
+	}
+	return player, player.Name, resolvedRealmID, nil
+}
+
 func makeBehaviorCatalogHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		inventory := map[string]int64{}
 		stats := map[string]int64{}
 		unlockSet := map[string]struct{}{}
+		consumedBehaviorSet := map[string]struct{}{}
 		hasPrimaryPlayer := false
 
 		resolvedPlayer := (*dal.Player)(nil)
@@ -669,6 +882,12 @@ func makeBehaviorCatalogHandler(database *gorm.DB, cfg config.Config) echo.Handl
 			for _, unlock := range unlocks {
 				unlockSet[unlock.UnlockKey] = struct{}{}
 			}
+
+			consumed, consumedErr := loadConsumedBehaviorSet(c.Request().Context(), database, resolvedPlayer.ID, resolvedRealmID)
+			if consumedErr != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load consumed behaviors")
+			}
+			consumedBehaviorSet = consumed
 		}
 
 		definitions := gameplay.SortBehaviorDefinitions(gameplay.ListBehaviorDefinitions())
@@ -678,36 +897,44 @@ func makeBehaviorCatalogHandler(database *gorm.DB, cfg config.Config) echo.Handl
 				continue
 			}
 
-			available, queueVisible, unavailableReason := evaluateBehaviorAvailability(definition, inventory, stats, unlockSet, hasPrimaryPlayer)
+			available, queueVisible, unavailableReason := evaluateBehaviorAvailability(definition, inventory, stats, unlockSet, consumedBehaviorSet, hasPrimaryPlayer)
 			displayName := gameplay.BehaviorDisplayName(definition)
 
-			catalog = append(catalog, map[string]any{
-				"key":               definition.Key,
-				"name":              displayName,
-				"label":             displayName,
-				"summary":           definition.Summary,
-				"actorType":         definition.ActorType,
-				"exclusiveGroup":    definition.ExclusiveGroup,
-				"durationMinutes":   definition.DurationMinutes,
-				"staminaCost":       definition.StaminaCost,
-				"available":         available,
-				"queueVisible":      queueVisible,
-				"unavailableReason": unavailableReason,
+			entry := map[string]any{
+				"key":                   definition.Key,
+				"name":                  displayName,
+				"label":                 displayName,
+				"category":              behaviorCategory(definition),
+				"summary":               definition.Summary,
+				"actorType":             definition.ActorType,
+				"exclusiveGroup":        definition.ExclusiveGroup,
+				"durationMinutes":       definition.DurationMinutes,
+				"staminaCost":           definition.StaminaCost,
+				"scheduleModes":         normalizeScheduleModes(definition.ScheduleModes),
+				"singleUsePerAscension": definition.SingleUsePerAscension,
+				"consumedThisAscension": definition.SingleUsePerAscension && containsSetKey(consumedBehaviorSet, definition.Key),
+				"available":             available,
+				"queueVisible":          queueVisible,
+				"unavailableReason":     unavailableReason,
 				"requirements": map[string]any{
 					"unlocks": definition.Requirements.Unlocks,
 					"items":   definition.Requirements.Items,
 				},
-				"costs":                    definition.Costs,
-				"statDeltas":               definition.StatDeltas,
-				"outputs":                  definition.Outputs,
-				"outputExpressions":        definition.OutputExpressions,
-				"outputChances":            definition.OutputChances,
-				"grantsUnlocks":            definition.GrantsUnlocks,
-				"requiresMarketOpen":       definition.RequiresMarketOpen,
-				"marketWaitDefaultMinutes": gameplay.DefaultMarketWaitDurationMinutes(),
-				"marketWaitMaxMinutes":     gameplay.MaxMarketWaitDurationMinutes(),
-				"marketEffects":            definition.MarketEffects,
-			})
+				"costs":              definition.Costs,
+				"statDeltas":         definition.StatDeltas,
+				"outputs":            definition.Outputs,
+				"outputExpressions":  definition.OutputExpressions,
+				"outputChances":      definition.OutputChances,
+				"grantsUnlocks":      definition.GrantsUnlocks,
+				"requiresMarketOpen": definition.RequiresMarketOpen,
+				"requiresNight":      definition.RequiresNight,
+				"marketEffects":      definition.MarketEffects,
+			}
+			if definition.RequiresMarketOpen {
+				entry["marketWaitDefaultMinutes"] = gameplay.DefaultMarketWaitDurationMinutes()
+				entry["marketWaitMaxMinutes"] = gameplay.MaxMarketWaitDurationMinutes()
+			}
+			catalog = append(catalog, entry)
 		}
 
 		return respondSuccess(c, http.StatusOK, "Known activities are listed.", map[string]any{"behaviors": catalog})
@@ -719,10 +946,17 @@ func evaluateBehaviorAvailability(
 	inventory map[string]int64,
 	stats map[string]int64,
 	unlockSet map[string]struct{},
+	consumedBehaviorSet map[string]struct{},
 	hasPrimaryPlayer bool,
 ) (bool, bool, string) {
 	if !hasPrimaryPlayer {
 		return false, false, "Create a new game to unlock behaviors."
+	}
+
+	if definition.SingleUsePerAscension {
+		if _, consumed := consumedBehaviorSet[definition.Key]; consumed {
+			return false, false, "Already completed this ascension"
+		}
 	}
 
 	for _, unlock := range definition.Requirements.Unlocks {
@@ -746,6 +980,335 @@ func evaluateBehaviorAvailability(
 	}
 
 	return true, true, ""
+}
+
+func behaviorCategory(definition gameplay.BehaviorDefinition) string {
+	key := strings.TrimSpace(definition.Key)
+	if strings.HasPrefix(key, "player_sell_") || definition.RequiresMarketOpen {
+		return "Market"
+	}
+
+	if len(definition.GrantsUnlocks) > 0 {
+		return "Unlocks"
+	}
+
+	if strings.Contains(key, "rest") {
+		return "Recovery"
+	}
+
+	if definition.ExclusiveGroup != "" || len(definition.StatDeltas) > 0 || strings.Contains(key, "training") || strings.Contains(key, "pushups") {
+		return "Training"
+	}
+
+	if strings.Contains(key, "chop") || strings.Contains(key, "scavenge") || len(definition.Outputs) > 0 || len(definition.OutputExpressions) > 0 {
+		return "Gathering"
+	}
+
+	return "General"
+}
+
+func loadConsumedBehaviorSet(ctx context.Context, database *gorm.DB, playerID uint, realmID uint) (map[string]struct{}, error) {
+	rows := make([]struct {
+		Key string
+	}, 0)
+	err := database.WithContext(ctx).
+		Model(&dal.BehaviorInstance{}).
+		Select("DISTINCT key").
+		Where("realm_id = ? AND actor_type = ? AND actor_id = ? AND state IN ?", realmID, gameplay.ActorPlayer, playerID, []string{"queued", "active", "completed"}).
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	set := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		key := strings.TrimSpace(row.Key)
+		if key == "" {
+			continue
+		}
+		set[key] = struct{}{}
+	}
+
+	return set, nil
+}
+
+func containsSetKey(values map[string]struct{}, key string) bool {
+	_, ok := values[key]
+	return ok
+}
+
+func normalizeScheduleModes(configured []string) []string {
+	if len(configured) == 0 {
+		return []string{"once", "repeat", "repeat-until"}
+	}
+
+	normalized := make([]string, 0, len(configured))
+	seen := map[string]struct{}{}
+	for _, mode := range configured {
+		candidate := strings.ToLower(strings.TrimSpace(mode))
+		if candidate == "" {
+			continue
+		}
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		normalized = append(normalized, candidate)
+		seen[candidate] = struct{}{}
+	}
+	if len(normalized) == 0 {
+		return []string{"once"}
+	}
+	return normalized
+}
+
+func makeUpgradeCatalogHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		inventory := map[string]int64{}
+		unlockSet := map[string]struct{}{}
+		purchaseCounts := map[string]int64{}
+		hasPrimaryPlayer := false
+
+		resolvedPlayer := (*dal.Player)(nil)
+		resolvedRealmID := uint(1)
+		if cfg.MMOAuthEnabled {
+			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+			}
+
+			requestedCharacterID := uint(0)
+			if rawCharacterID := c.QueryParam("characterId"); rawCharacterID != "" {
+				parsedID, parseErr := strconv.ParseUint(rawCharacterID, 10, 64)
+				if parseErr != nil || parsedID == 0 {
+					return echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+				}
+				requestedCharacterID = uint(parsedID)
+			}
+
+			character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, requestedCharacterID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+			}
+			if character != nil {
+				resolvedRealmID = character.RealmID
+				player, err := loadPlayerByID(c.Request().Context(), database, character.PlayerID)
+				if err != nil {
+					return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character player state")
+				}
+				if player != nil {
+					resolvedPlayer = player
+				}
+			}
+		} else {
+			primaryPlayer, err := loadPrimaryPlayer(c.Request().Context(), database)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+			}
+			resolvedPlayer = primaryPlayer
+		}
+
+		if resolvedPlayer != nil {
+			hasPrimaryPlayer = true
+
+			snapshot, err := gameplay.LoadWorldSnapshot(c.Request().Context(), database, resolvedPlayer.ID, resolvedRealmID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load gameplay snapshot")
+			}
+			inventory = snapshot.Inventory
+
+			unlocks := make([]dal.PlayerUnlock, 0)
+			if err := database.WithContext(c.Request().Context()).
+				Where("realm_id = ? AND player_id = ?", resolvedRealmID, resolvedPlayer.ID).
+				Find(&unlocks).Error; err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load player unlocks")
+			}
+			for _, unlock := range unlocks {
+				unlockSet[unlock.UnlockKey] = struct{}{}
+			}
+
+			counts, countErr := gameplay.LoadPlayerUpgradeCounts(c.Request().Context(), database, resolvedPlayer.ID, resolvedRealmID)
+			if countErr != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load upgrade state")
+			}
+			purchaseCounts = counts
+		}
+
+		definitions := gameplay.SortUpgradeDefinitions(gameplay.ListUpgradeDefinitions())
+		catalog := make([]map[string]any, 0, len(definitions))
+		for _, definition := range definitions {
+			purchaseCount := purchaseCounts[definition.Key]
+			nextCosts := gameplay.ProjectedUpgradeCosts(definition, purchaseCount)
+			nextOutputs := gameplay.ProjectedUpgradeOutputs(definition, purchaseCount)
+			available, unavailableReason := evaluateUpgradeAvailability(definition, inventory, unlockSet, purchaseCount, hasPrimaryPlayer)
+			catalog = append(catalog, map[string]any{
+				"key":               definition.Key,
+				"name":              definition.Name,
+				"summary":           definition.Summary,
+				"category":          definition.Category,
+				"gateTypes":         normalizeUpgradeGateTypes(definition),
+				"maxPurchases":      definition.MaxPurchases,
+				"purchaseCount":     purchaseCount,
+				"costScaling":       definition.CostScaling,
+				"outputScaling":     definition.OutputScaling,
+				"available":         available,
+				"unavailableReason": unavailableReason,
+				"requirements": map[string]any{
+					"unlocks": definition.Requirements.Unlocks,
+					"items":   definition.Requirements.Items,
+				},
+				"costs":     definition.Costs,
+				"nextCosts": nextCosts,
+				"outputs": map[string]any{
+					"queueSlotsDelta": definition.Outputs.QueueSlotsDelta,
+					"unlocks":         definition.Outputs.Unlocks,
+					"items":           definition.Outputs.Items,
+					"statDeltas":      definition.Outputs.StatDeltas,
+				},
+				"nextOutputs": map[string]any{
+					"queueSlotsDelta": nextOutputs.QueueSlotsDelta,
+					"unlocks":         nextOutputs.Unlocks,
+					"items":           nextOutputs.Items,
+					"statDeltas":      nextOutputs.StatDeltas,
+				},
+			})
+		}
+
+		return respondSuccess(c, http.StatusOK, "Known upgrades are listed.", map[string]any{"upgrades": catalog})
+	}
+}
+
+func makePurchaseUpgradeHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		var req purchaseUpgradeRequest
+		if err := requestbind.JSON(c, &req, "invalid upgrade payload"); err != nil {
+			return err
+		}
+
+		key := strings.TrimSpace(req.UpgradeKey)
+		if key == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "upgradeKey is required")
+		}
+
+		resolvedPlayer := (*dal.Player)(nil)
+		resolvedName := ""
+		resolvedRealmID := uint(1)
+
+		if cfg.MMOAuthEnabled {
+			actor, ok := serverAuth.ActorFromContext(c.Request().Context())
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "missing actor context")
+			}
+
+			requestedCharacterID := uint(0)
+			hasRequestedCharacter := false
+			if rawCharacterID := c.QueryParam("characterId"); rawCharacterID != "" {
+				parsedID, parseErr := strconv.ParseUint(rawCharacterID, 10, 64)
+				if parseErr != nil || parsedID == 0 {
+					return echo.NewHTTPError(http.StatusBadRequest, "characterId must be a positive integer")
+				}
+				hasRequestedCharacter = true
+				requestedCharacterID = uint(parsedID)
+			}
+
+			character, err := loadActorCharacter(c.Request().Context(), database, actor.AccountID, requestedCharacterID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character")
+			}
+			if character == nil {
+				if hasRequestedCharacter {
+					return echo.NewHTTPError(http.StatusNotFound, "character not found for account")
+				}
+				return echo.NewHTTPError(http.StatusBadRequest, "complete onboarding first")
+			}
+
+			player, err := loadPlayerByID(c.Request().Context(), database, character.PlayerID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load character player state")
+			}
+			if player == nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "character player state is missing")
+			}
+
+			resolvedPlayer = player
+			resolvedName = character.Name
+			if character.RealmID != 0 {
+				resolvedRealmID = character.RealmID
+			}
+		} else {
+			player, err := loadPrimaryPlayer(c.Request().Context(), database)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load primary player")
+			}
+			if player == nil {
+				return echo.NewHTTPError(http.StatusBadRequest, "create a new game first")
+			}
+
+			resolvedPlayer = player
+			resolvedName = player.Name
+		}
+
+		nextCount, err := gameplay.PurchaseUpgradeForPlayer(c.Request().Context(), database, resolvedPlayer.ID, resolvedRealmID, key)
+		if err != nil {
+			if errors.Is(err, gameplay.ErrUpgradeNotFound) {
+				return echo.NewHTTPError(http.StatusBadRequest, "unknown upgrade key")
+			}
+			if errors.Is(err, gameplay.ErrUpgradeMaxed) {
+				return echo.NewHTTPError(http.StatusConflict, "upgrade already at maximum purchases")
+			}
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
+		slots, slotErr := gameplay.QueueSlotSummaryForPlayer(c.Request().Context(), database, resolvedPlayer.ID, resolvedRealmID)
+		if slotErr != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load queue slot summary")
+		}
+
+		return respondSuccess(c, http.StatusOK, "Upgrade purchased.", map[string]any{
+			"upgradeKey":          key,
+			"player":              resolvedName,
+			"purchaseCount":       nextCount,
+			"queueSlotsTotal":     slots.Total,
+			"queueSlotsUsed":      slots.Used,
+			"queueSlotsAvailable": slots.Available,
+		})
+	}
+}
+
+func evaluateUpgradeAvailability(definition gameplay.UpgradeDefinition, inventory map[string]int64, unlockSet map[string]struct{}, purchaseCount int64, hasPrimaryPlayer bool) (bool, string) {
+	if !hasPrimaryPlayer {
+		return false, "Create a new game to unlock upgrades."
+	}
+
+	if definition.MaxPurchases > 0 && purchaseCount >= definition.MaxPurchases {
+		return false, "Upgrade already maxed for this ascension"
+	}
+
+	for _, unlock := range definition.Requirements.Unlocks {
+		if _, ok := unlockSet[unlock]; !ok {
+			return false, "Requires unlock: " + gameplay.HumanizeIdentifier(unlock)
+		}
+	}
+
+	nextCosts := gameplay.ProjectedUpgradeCosts(definition, purchaseCount)
+	for itemKey, requiredQuantity := range nextCosts {
+		if requiredQuantity <= 0 {
+			continue
+		}
+		if inventory[itemKey] < requiredQuantity {
+			return false, "Requires " + strconv.FormatInt(requiredQuantity, 10) + " " + gameplay.HumanizeIdentifier(itemKey)
+		}
+	}
+
+	for statKey, requiredValue := range definition.Requirements.Items {
+		if requiredValue <= 0 {
+			continue
+		}
+		if inventory[statKey] < requiredValue {
+			return false, "Requires " + strconv.FormatInt(requiredValue, 10) + " " + gameplay.HumanizeIdentifier(statKey)
+		}
+	}
+
+	return true, ""
 }
 
 func makeMarketStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
@@ -800,6 +1363,270 @@ func makeMarketHistoryHandler(database *gorm.DB, cfg config.Config) echo.Handler
 	}
 }
 
+func makeMarketCandlesHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		realmID, err := resolveRealmIDForSystemRead(c, database, cfg)
+		if err != nil {
+			return err
+		}
+
+		query, err := parseMarketCandleQuery(c, realmID)
+		if err != nil {
+			return err
+		}
+
+		candles, err := gameplay.GetMarketCandles(c.Request().Context(), database, query.Symbol, query.BucketTicks, query.Limit, query.Realm)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load market candles")
+		}
+
+		return respondSuccess(c, http.StatusOK, "Market candles loaded.", map[string]any{
+			"symbol":      strings.TrimSpace(query.Symbol),
+			"limit":       query.Limit,
+			"bucketTicks": query.BucketTicks,
+			"realmId":     query.Realm,
+			"candles":     candles,
+		})
+	}
+}
+
+func makeMarketOverviewHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		realmID, err := resolveRealmIDForSystemRead(c, database, cfg)
+		if err != nil {
+			return err
+		}
+
+		currentTick, err := gameplay.CurrentWorldTickForRealm(c.Request().Context(), database, realmID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+		}
+
+		status, err := gameplay.GetMarketStatus(c.Request().Context(), database, currentTick, realmID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load market status")
+		}
+
+		bucketTicks := int64(30)
+		if rawBucketTicks := strings.TrimSpace(c.QueryParam("bucketTicks")); rawBucketTicks != "" {
+			parsed, parseErr := strconv.ParseInt(rawBucketTicks, 10, 64)
+			if parseErr != nil || parsed <= 0 {
+				return echo.NewHTTPError(http.StatusBadRequest, "bucketTicks must be a positive integer")
+			}
+			if parsed > 24*60 {
+				parsed = 24 * 60
+			}
+			bucketTicks = parsed
+		}
+
+		limit := 60
+		if rawLimit := strings.TrimSpace(c.QueryParam("limit")); rawLimit != "" {
+			parsed, parseErr := strconv.Atoi(rawLimit)
+			if parseErr != nil || parsed <= 0 {
+				return echo.NewHTTPError(http.StatusBadRequest, "limit must be a positive integer")
+			}
+			if parsed > 500 {
+				parsed = 500
+			}
+			limit = parsed
+		}
+
+		symbolRows := make([]map[string]any, 0, len(status.Tickers))
+		for _, ticker := range status.Tickers {
+			candles, candleErr := gameplay.GetMarketCandles(c.Request().Context(), database, ticker.Symbol, bucketTicks, limit, realmID)
+			if candleErr != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to load market overview candles")
+			}
+
+			symbolRows = append(symbolRows, map[string]any{
+				"symbol":       ticker.Symbol,
+				"currentPrice": ticker.Price,
+				"delta":        ticker.Delta,
+				"updatedTick":  ticker.UpdatedTick,
+				"sessionState": ticker.SessionState,
+				"liquidity":    ticker.Liquidity,
+				"movement":     ticker.Movement,
+				"candles":      candles,
+			})
+		}
+
+		return respondSuccess(c, http.StatusOK, "Market overview loaded.", map[string]any{
+			"tick":        status.Tick,
+			"realmId":     realmID,
+			"bucketTicks": bucketTicks,
+			"limit":       limit,
+			"symbols":     symbolRows,
+		})
+	}
+}
+
+func makeMarketPlaceOrderHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		var req placeMarketOrderRequest
+		if err := requestbind.JSON(c, &req, "invalid market order payload"); err != nil {
+			return err
+		}
+
+		player, _, realmID, err := resolveSystemPlayerContext(c, database, cfg)
+		if err != nil {
+			return err
+		}
+
+		currentTick, tickErr := gameplay.CurrentWorldTickForRealm(c.Request().Context(), database, realmID)
+		if tickErr != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+		}
+
+		cancelAfterMinutes, parseErr := parseDurationMinutes(strings.TrimSpace(req.CancelAfter), 24*60)
+		if parseErr != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, parseErr.Error())
+		}
+
+		order, placeErr := gameplay.PlaceMarketOrder(c.Request().Context(), database, player.ID, realmID, currentTick, gameplay.PlaceMarketOrderRequest{
+			ItemKey:            req.ItemKey,
+			Side:               req.Side,
+			Quantity:           req.Quantity,
+			LimitPrice:         req.LimitPrice,
+			CancelAfterMinutes: cancelAfterMinutes,
+			ManualCancelFeeBps: req.ManualCancelFeeBps,
+		})
+		if placeErr != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, placeErr.Error())
+		}
+
+		return respondSuccess(c, http.StatusOK, "Market order placed.", map[string]any{"order": order})
+	}
+}
+
+func makeMarketCancelOrderHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		var req cancelMarketOrderRequest
+		if err := requestbind.JSON(c, &req, "invalid market cancel payload"); err != nil {
+			return err
+		}
+		if req.OrderID == 0 {
+			return echo.NewHTTPError(http.StatusBadRequest, "orderId is required")
+		}
+
+		player, _, realmID, err := resolveSystemPlayerContext(c, database, cfg)
+		if err != nil {
+			return err
+		}
+
+		currentTick, tickErr := gameplay.CurrentWorldTickForRealm(c.Request().Context(), database, realmID)
+		if tickErr != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load world tick")
+		}
+
+		order, cancelErr := gameplay.CancelMarketOrder(c.Request().Context(), database, player.ID, realmID, req.OrderID, currentTick)
+		if cancelErr != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, cancelErr.Error())
+		}
+
+		return respondSuccess(c, http.StatusOK, "Market order cancelled.", map[string]any{"order": order})
+	}
+}
+
+func makeMarketMyOrdersHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		player, _, realmID, err := resolveSystemPlayerContext(c, database, cfg)
+		if err != nil {
+			return err
+		}
+
+		limit := 100
+		if rawLimit := strings.TrimSpace(c.QueryParam("limit")); rawLimit != "" {
+			parsed, parseErr := strconv.Atoi(rawLimit)
+			if parseErr != nil || parsed <= 0 {
+				return echo.NewHTTPError(http.StatusBadRequest, "limit must be a positive integer")
+			}
+			if parsed > 500 {
+				parsed = 500
+			}
+			limit = parsed
+		}
+
+		state := strings.TrimSpace(c.QueryParam("state"))
+		orders, listErr := gameplay.ListMarketOrdersForPlayer(c.Request().Context(), database, player.ID, realmID, state, limit)
+		if listErr != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load market orders")
+		}
+		return respondSuccess(c, http.StatusOK, "Market orders loaded.", map[string]any{"orders": orders, "state": state, "limit": limit})
+	}
+}
+
+func makeMarketOrderBookHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		realmID, err := resolveRealmIDForSystemRead(c, database, cfg)
+		if err != nil {
+			return err
+		}
+
+		depth := 20
+		if rawDepth := strings.TrimSpace(c.QueryParam("depth")); rawDepth != "" {
+			parsed, parseErr := strconv.Atoi(rawDepth)
+			if parseErr != nil || parsed <= 0 {
+				return echo.NewHTTPError(http.StatusBadRequest, "depth must be a positive integer")
+			}
+			if parsed > 200 {
+				parsed = 200
+			}
+			depth = parsed
+		}
+
+		book, bookErr := gameplay.GetMarketOrderBook(c.Request().Context(), database, realmID, strings.TrimSpace(c.QueryParam("symbol")), depth)
+		if bookErr != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load market order book")
+		}
+		return respondSuccess(c, http.StatusOK, "Market order book loaded.", book)
+	}
+}
+
+func makeMarketTradesHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		realmID, err := resolveRealmIDForSystemRead(c, database, cfg)
+		if err != nil {
+			return err
+		}
+
+		limit := 100
+		if rawLimit := strings.TrimSpace(c.QueryParam("limit")); rawLimit != "" {
+			parsed, parseErr := strconv.Atoi(rawLimit)
+			if parseErr != nil || parsed <= 0 {
+				return echo.NewHTTPError(http.StatusBadRequest, "limit must be a positive integer")
+			}
+			if parsed > 500 {
+				parsed = 500
+			}
+			limit = parsed
+		}
+
+		trades, tradesErr := gameplay.ListRecentMarketTrades(c.Request().Context(), database, realmID, strings.TrimSpace(c.QueryParam("symbol")), limit)
+		if tradesErr != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load market trades")
+		}
+		return respondSuccess(c, http.StatusOK, "Recent market trades loaded.", map[string]any{"trades": trades, "limit": limit})
+	}
+}
+
+func parseDurationMinutes(raw string, defaultMinutes int64) (int64, error) {
+	if strings.TrimSpace(raw) == "" {
+		return defaultMinutes, nil
+	}
+	duration, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("cancelAfter must be a duration like 12h or 72h")
+	}
+	minutes := int64(duration.Minutes())
+	if minutes <= 0 {
+		return 0, fmt.Errorf("cancelAfter must be positive")
+	}
+	if minutes > 30*24*60 {
+		minutes = 30 * 24 * 60
+	}
+	return minutes, nil
+}
+
 func parseMarketHistoryQuery(c echo.Context, fallbackRealmID uint) (marketHistoryQuery, error) {
 	const defaultLimit = 100
 	const maxLimit = 500
@@ -826,6 +1653,53 @@ func parseMarketHistoryQuery(c echo.Context, fallbackRealmID uint) (marketHistor
 		Limit:  limit,
 		Realm:  realmID,
 	}, nil
+}
+
+func parseMarketCandleQuery(c echo.Context, fallbackRealmID uint) (marketCandleQuery, error) {
+	const defaultLimit = 120
+	const maxLimit = 500
+
+	query := marketCandleQuery{Limit: defaultLimit, Realm: fallbackRealmID, BucketTicks: 30}
+
+	if rawSymbol := strings.TrimSpace(c.QueryParam("symbol")); rawSymbol != "" {
+		query.Symbol = rawSymbol
+	}
+
+	if rawLimit := strings.TrimSpace(c.QueryParam("limit")); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed <= 0 {
+			return marketCandleQuery{}, echo.NewHTTPError(http.StatusBadRequest, "limit must be a positive integer")
+		}
+		if parsed > maxLimit {
+			parsed = maxLimit
+		}
+		query.Limit = parsed
+	}
+
+	if rawBucketTicks := strings.TrimSpace(c.QueryParam("bucketTicks")); rawBucketTicks != "" {
+		parsed, err := strconv.ParseInt(rawBucketTicks, 10, 64)
+		if err != nil || parsed <= 0 {
+			return marketCandleQuery{}, echo.NewHTTPError(http.StatusBadRequest, "bucketTicks must be a positive integer")
+		}
+		if parsed > 24*60 {
+			parsed = 24 * 60
+		}
+		query.BucketTicks = parsed
+	}
+
+	if rawRealm := strings.TrimSpace(c.QueryParam("realmId")); rawRealm != "" {
+		parsed, err := strconv.ParseUint(rawRealm, 10, 64)
+		if err != nil || parsed == 0 {
+			return marketCandleQuery{}, echo.NewHTTPError(http.StatusBadRequest, "realmId must be a positive integer")
+		}
+		query.Realm = uint(parsed)
+	}
+
+	if query.Symbol == "" {
+		return marketCandleQuery{}, echo.NewHTTPError(http.StatusBadRequest, "symbol is required")
+	}
+
+	return query, nil
 }
 
 func resolveRealmIDForSystemRead(c echo.Context, database *gorm.DB, cfg config.Config) (uint, error) {
@@ -1008,11 +1882,44 @@ func respondSuccess(c echo.Context, code int, message string, data any) error {
 }
 
 func queueBehaviorErrorStatus(err error) int {
-	if errors.Is(err, gameplay.ErrBehaviorConflict) {
+	if errors.Is(err, gameplay.ErrBehaviorConflict) || errors.Is(err, gameplay.ErrQueueSlotsFull) || errors.Is(err, gameplay.ErrBehaviorNotCancelable) {
 		return http.StatusConflict
 	}
 
 	return http.StatusBadRequest
+}
+
+func normalizeUpgradeGateTypes(definition gameplay.UpgradeDefinition) []string {
+	if len(definition.GateTypes) > 0 {
+		values := make([]string, 0, len(definition.GateTypes))
+		seen := map[string]struct{}{}
+		for _, entry := range definition.GateTypes {
+			trimmed := strings.ToLower(strings.TrimSpace(entry))
+			if trimmed == "" {
+				continue
+			}
+			if _, exists := seen[trimmed]; exists {
+				continue
+			}
+			values = append(values, trimmed)
+			seen[trimmed] = struct{}{}
+		}
+		if len(values) > 0 {
+			return values
+		}
+	}
+
+	derived := make([]string, 0, 3)
+	if len(definition.Requirements.Unlocks) > 0 {
+		derived = append(derived, "unlock")
+	}
+	if len(definition.Requirements.Items) > 0 || len(definition.Costs) > 0 {
+		derived = append(derived, "resource")
+	}
+	if len(derived) == 0 {
+		return []string{"none"}
+	}
+	return derived
 }
 
 func loadCurrentSave(ctx context.Context, database *gorm.DB) (saveGame, error) {
@@ -1246,9 +2153,18 @@ func loadPrimaryPlayer(ctx context.Context, database *gorm.DB) (*dal.Player, err
 }
 
 func currentVersionData() versionData {
+	gameDataMeta := versionGameData{}
+	if info, err := gamedata.Info(); err == nil {
+		gameDataMeta = versionGameData{
+			ManifestVersion: info.ManifestVersion,
+			FilesHash:       info.FilesHash,
+		}
+	}
+
 	return versionData{
 		API:      version.APIVersion,
 		Backend:  version.BackendVersion,
 		Frontend: version.FrontendVersion,
+		GameData: gameDataMeta,
 	}
 }

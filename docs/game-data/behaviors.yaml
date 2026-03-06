@@ -4,3 +4,4 @@ splitBehaviorFiles:
   world: world-behaviors.yaml
 related:
   stats: player-stats.yaml
+  upgrades: upgrades.yaml

@@ -26,23 +26,26 @@ type saveGame struct {
 }
 
 type playerStatusData struct {
-	Version          versionData                   `json:"version"`
-	Save             string                        `json:"save"`
-	Players          []string                      `json:"players"`
-	SimulationTick   int64                         `json:"simulationTick"`
-	WorldAgeMinutes  int64                         `json:"worldAgeMinutes"`
-	WorldAgeHours    int64                         `json:"worldAgeHours"`
-	WorldAgeDays     int64                         `json:"worldAgeDays"`
-	HasPrimaryPlayer bool                          `json:"hasPrimaryPlayer"`
-	PlayerName       string                        `json:"playerName,omitempty"`
-	Inventory        map[string]int64              `json:"inventory"`
-	CoreStats        map[string]int64              `json:"coreStats"`
-	DerivedStats     map[string]int64              `json:"derivedStats"`
-	Stats            map[string]int64              `json:"stats"`
-	Behaviors        []gameplay.BehaviorView       `json:"behaviors"`
-	AscensionCount   int64                         `json:"ascensionCount"`
-	WealthBonusPct   float64                       `json:"wealthBonusPct"`
-	Ascension        gameplay.AscensionEligibility `json:"ascension"`
+	Version             versionData                   `json:"version"`
+	Save                string                        `json:"save"`
+	Players             []string                      `json:"players"`
+	SimulationTick      int64                         `json:"simulationTick"`
+	WorldAgeMinutes     int64                         `json:"worldAgeMinutes"`
+	WorldAgeHours       int64                         `json:"worldAgeHours"`
+	WorldAgeDays        int64                         `json:"worldAgeDays"`
+	HasPrimaryPlayer    bool                          `json:"hasPrimaryPlayer"`
+	PlayerName          string                        `json:"playerName,omitempty"`
+	Inventory           map[string]int64              `json:"inventory"`
+	CoreStats           map[string]int64              `json:"coreStats"`
+	DerivedStats        map[string]int64              `json:"derivedStats"`
+	Stats               map[string]int64              `json:"stats"`
+	Behaviors           []gameplay.BehaviorView       `json:"behaviors"`
+	QueueSlotsTotal     int64                         `json:"queueSlotsTotal"`
+	QueueSlotsUsed      int64                         `json:"queueSlotsUsed"`
+	QueueSlotsAvailable int64                         `json:"queueSlotsAvailable"`
+	AscensionCount      int64                         `json:"ascensionCount"`
+	WealthBonusPct      float64                       `json:"wealthBonusPct"`
+	Ascension           gameplay.AscensionEligibility `json:"ascension"`
 }
 
 type versionData struct {
@@ -207,6 +210,14 @@ func makeStatusHandler(database *gorm.DB, cfg config.Config) echo.HandlerFunc {
 		data.DerivedStats = snapshot.DerivedStats
 		data.Stats = snapshot.Stats
 		data.Behaviors = filterPlayerBehaviors(snapshot.Behaviors, resolvedPlayer.ID)
+
+		slots, slotErr := gameplay.QueueSlotSummaryForPlayer(c.Request().Context(), database, resolvedPlayer.ID, resolvedRealmID)
+		if slotErr != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load queue slot summary")
+		}
+		data.QueueSlotsTotal = slots.Total
+		data.QueueSlotsUsed = slots.Used
+		data.QueueSlotsAvailable = slots.Available
 		data.AscensionCount = snapshot.AscensionCount
 		data.WealthBonusPct = snapshot.WealthBonusPct
 		data.Ascension = snapshot.Ascension

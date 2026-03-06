@@ -64,6 +64,10 @@ export type VersionData = {
   api: string;
   backend: string;
   frontend: string;
+  gameData?: {
+    manifestVersion: number;
+    filesHash: string;
+  };
 };
 
 export type BehaviorView = {
@@ -71,7 +75,7 @@ export type BehaviorView = {
   key: string;
   actorType: string;
   actorId: number;
-  state: string;
+  state: "queued" | "active" | "completed" | "cancelled" | "failed";
   mode?: "once" | "repeat" | "repeat-until";
   repeatIntervalMinutes?: number;
   repeatUntilTick?: number;
@@ -83,6 +87,9 @@ export type BehaviorView = {
   marketWaitUntilTick?: number;
   resultMessage: string;
   failureReason: string;
+  waitReason?: string;
+  spent?: Record<string, number>;
+  gained?: Record<string, number>;
 };
 
 export type AscensionEligibility = {
@@ -107,6 +114,9 @@ export type PlayerStatusData = {
   derivedStats: Record<string, number>;
   stats: Record<string, number>;
   behaviors: BehaviorView[];
+  queueSlotsTotal?: number;
+  queueSlotsUsed?: number;
+  queueSlotsAvailable?: number;
   ascensionCount: number;
   wealthBonusPct: number;
   ascension: AscensionEligibility;
@@ -130,10 +140,14 @@ export type BehaviorCatalogEntry = {
   key: string;
   name?: string;
   label?: string;
+  category?: string;
   summary?: string;
   exclusiveGroup?: string;
   durationMinutes: number;
   staminaCost?: number;
+  scheduleModes?: Array<"once" | "repeat" | "repeat-until">;
+  singleUsePerAscension?: boolean;
+  consumedThisAscension?: boolean;
   available: boolean;
   queueVisible?: boolean;
   unavailableReason?: string;
@@ -142,11 +156,45 @@ export type BehaviorCatalogEntry = {
     items?: Record<string, number>;
   };
   costs?: Record<string, number>;
+  outputs?: Record<string, number>;
   statDeltas?: Record<string, number>;
   grantsUnlocks?: string[];
   requiresMarketOpen?: boolean;
+  requiresNight?: boolean;
   marketWaitDefaultMinutes?: number;
   marketWaitMaxMinutes?: number;
+};
+
+export type UpgradeCatalogEntry = {
+  key: string;
+  name?: string;
+  summary?: string;
+  category?: string;
+  gateTypes?: string[];
+  maxPurchases?: number;
+  purchaseCount?: number;
+  costScaling?: number;
+  outputScaling?: number;
+  available: boolean;
+  unavailableReason?: string;
+  requirements?: {
+    unlocks?: string[];
+    items?: Record<string, number>;
+  };
+  costs?: Record<string, number>;
+  nextCosts?: Record<string, number>;
+  outputs?: {
+    queueSlotsDelta?: number;
+    unlocks?: string[];
+    items?: Record<string, number>;
+    statDeltas?: Record<string, number>;
+  };
+  nextOutputs?: {
+    queueSlotsDelta?: number;
+    unlocks?: string[];
+    items?: Record<string, number>;
+    statDeltas?: Record<string, number>;
+  };
 };
 
 export type MarketStatus = {
@@ -164,7 +212,111 @@ export type MarketStatus = {
     lastSource: string;
     updatedTick: number;
     sessionState: string;
+    liquidity: {
+      quantity: number;
+      baselineQuantity: number;
+      minQuantity: number;
+      maxQuantity: number;
+      utilizationPct: number;
+      capEstimate: number;
+      lastPressure: number;
+    };
+    movement: {
+      windowTicks: number;
+      windowChange: number;
+      windowRange: number;
+      windowHigh: number;
+      windowLow: number;
+      trades: number;
+      npcTradeSharePct: number;
+      npcParticipantTrades: number;
+      npcCycleMoves: number;
+      storytellerMoves: number;
+      orderbookMoves: number;
+    };
   }>;
+};
+
+export type MarketOrderView = {
+  id: number;
+  itemKey: string;
+  side: "buy" | "sell";
+  state: "open" | "filled" | "cancelled" | "expired";
+  limitPrice: number;
+  quantityTotal: number;
+  quantityOpen: number;
+  escrowCoins: number;
+  cancelAfterTick: number;
+  lastMatchedTick: number;
+  cancellationNote: string;
+};
+
+export type MarketTradeView = {
+  id: number;
+  itemKey: string;
+  price: number;
+  quantity: number;
+  tick: number;
+  buyerType: string;
+  buyerId: number;
+  sellerType: string;
+  sellerId: number;
+};
+
+export type MarketOrderBook = {
+  symbol: string;
+  buys: MarketOrderView[];
+  sells: MarketOrderView[];
+};
+
+export type MarketHistoryEntry = {
+  symbol: string;
+  tick: number;
+  price: number;
+  delta: number;
+  source: string;
+  sessionState: string;
+};
+
+export type MarketCandleEntry = {
+  symbol: string;
+  bucketStartTick: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  points: number;
+};
+
+export type MarketOverviewSymbol = {
+  symbol: string;
+  currentPrice: number;
+  delta: number;
+  updatedTick: number;
+  sessionState: string;
+  liquidity: {
+    quantity: number;
+    baselineQuantity: number;
+    minQuantity: number;
+    maxQuantity: number;
+    utilizationPct: number;
+    capEstimate: number;
+    lastPressure: number;
+  };
+  movement: {
+    windowTicks: number;
+    windowChange: number;
+    windowRange: number;
+    windowHigh: number;
+    windowLow: number;
+    trades: number;
+    npcTradeSharePct: number;
+    npcParticipantTrades: number;
+    npcCycleMoves: number;
+    storytellerMoves: number;
+    orderbookMoves: number;
+  };
+  candles: MarketCandleEntry[];
 };
 
 export type FeedEvent = {
@@ -564,6 +716,15 @@ export async function getBehaviorCatalog(characterId?: number): Promise<Behavior
   return data.behaviors;
 }
 
+export async function getUpgradeCatalog(characterId?: number): Promise<UpgradeCatalogEntry[]> {
+  const data = await request<{ upgrades: UpgradeCatalogEntry[] }>(
+    withQuery("/v1/system/upgrades/catalog", { characterId }),
+    { method: "GET" },
+    { auth: true }
+  );
+  return data.upgrades;
+}
+
 export async function startBehavior(
   behaviorKey: string,
   characterId?: number,
@@ -581,8 +742,130 @@ export async function startBehavior(
   );
 }
 
+export async function cancelBehavior(behaviorId: number, characterId?: number): Promise<{ behavior: BehaviorView }> {
+  return request<{ behavior: BehaviorView }>(
+    withQuery("/v1/system/behaviors/cancel", { characterId }),
+    {
+      method: "POST",
+      body: JSON.stringify({ behaviorId })
+    },
+    { auth: true }
+  );
+}
+
 export async function getMarketStatus(realmId?: number, characterId?: number): Promise<MarketStatus> {
   return request<MarketStatus>(withQuery("/v1/system/market/status", { realmId, characterId }), { method: "GET" }, { auth: true });
+}
+
+export async function getMarketHistory(symbol?: string, limit: number = 200, realmId?: number, characterId?: number): Promise<{
+  symbol: string;
+  limit: number;
+  realmId: number;
+  history: MarketHistoryEntry[];
+}> {
+  return request<{
+    symbol: string;
+    limit: number;
+    realmId: number;
+    history: MarketHistoryEntry[];
+  }>(
+    withQuery("/v1/system/market/history", { symbol, limit, realmId, characterId }),
+    { method: "GET" },
+    { auth: true }
+  );
+}
+
+export async function getMarketCandles(symbol: string, bucketTicks: number = 30, limit: number = 120, realmId?: number, characterId?: number): Promise<{
+  symbol: string;
+  limit: number;
+  bucketTicks: number;
+  realmId: number;
+  candles: MarketCandleEntry[];
+}> {
+  return request<{
+    symbol: string;
+    limit: number;
+    bucketTicks: number;
+    realmId: number;
+    candles: MarketCandleEntry[];
+  }>(
+    withQuery("/v1/system/market/candles", { symbol, bucketTicks, limit, realmId, characterId }),
+    { method: "GET" },
+    { auth: true }
+  );
+}
+
+export async function getMarketOverview(bucketTicks: number = 30, limit: number = 60, realmId?: number, characterId?: number): Promise<{
+  tick: number;
+  realmId: number;
+  bucketTicks: number;
+  limit: number;
+  symbols: MarketOverviewSymbol[];
+}> {
+  return request<{
+    tick: number;
+    realmId: number;
+    bucketTicks: number;
+    limit: number;
+    symbols: MarketOverviewSymbol[];
+  }>(
+    withQuery("/v1/system/market/overview", { bucketTicks, limit, realmId, characterId }),
+    { method: "GET" },
+    { auth: true }
+  );
+}
+
+export async function placeMarketOrder(payload: {
+  itemKey: string;
+  side: "buy" | "sell";
+  quantity: number;
+  limitPrice: number;
+  cancelAfter?: string;
+  manualCancelFeeBps?: number;
+}, characterId?: number): Promise<{ order: MarketOrderView }> {
+  return request<{ order: MarketOrderView }>(
+    withQuery("/v1/system/market/orders/place", { characterId }),
+    {
+      method: "POST",
+      body: JSON.stringify(payload)
+    },
+    { auth: true }
+  );
+}
+
+export async function cancelMarketOrder(orderId: number, characterId?: number): Promise<{ order: MarketOrderView }> {
+  return request<{ order: MarketOrderView }>(
+    withQuery("/v1/system/market/orders/cancel", { characterId }),
+    {
+      method: "POST",
+      body: JSON.stringify({ orderId })
+    },
+    { auth: true }
+  );
+}
+
+export async function getMyMarketOrders(state?: string, limit: number = 100, characterId?: number): Promise<{ orders: MarketOrderView[] }> {
+  return request<{ orders: MarketOrderView[] }>(
+    withQuery("/v1/system/market/orders/my", { state, limit, characterId }),
+    { method: "GET" },
+    { auth: true }
+  );
+}
+
+export async function getMarketOrderBook(symbol?: string, depth: number = 20, characterId?: number): Promise<MarketOrderBook> {
+  return request<MarketOrderBook>(
+    withQuery("/v1/system/market/orders/book", { symbol, depth, characterId }),
+    { method: "GET" },
+    { auth: true }
+  );
+}
+
+export async function getRecentMarketTrades(symbol?: string, limit: number = 100, characterId?: number): Promise<{ trades: MarketTradeView[] }> {
+  return request<{ trades: MarketTradeView[] }>(
+    withQuery("/v1/system/market/trades", { symbol, limit, characterId }),
+    { method: "GET" },
+    { auth: true }
+  );
 }
 
 export async function ascend(name?: string, characterId?: number): Promise<{ ascensionCount: number; wealthBonusPct: number }> {
@@ -591,6 +874,23 @@ export async function ascend(name?: string, characterId?: number): Promise<{ asc
     {
       method: "POST",
       body: JSON.stringify({ name })
+    },
+    { auth: true }
+  );
+}
+
+export async function purchaseUpgrade(upgradeKey: string, characterId?: number): Promise<{
+  upgradeKey: string;
+  purchaseCount: number;
+  queueSlotsTotal: number;
+  queueSlotsUsed: number;
+  queueSlotsAvailable: number;
+}> {
+  return request(
+    withQuery("/v1/system/upgrades/purchase", { characterId }),
+    {
+      method: "POST",
+      body: JSON.stringify({ upgradeKey })
     },
     { auth: true }
   );

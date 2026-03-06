@@ -22,6 +22,7 @@ type taskHelp struct {
 }
 
 var taskHelpItems = []taskHelp{
+	{Name: "generateContent", Summary: "Generate runtime game-data Go from docs/game-data YAML", Example: "mage generateContent"},
 	{Name: "build", Summary: "Build backend", Example: "mage build"},
 	{Name: "buildEmbed", Summary: "Build frontend embed assets and backend", Example: "mage buildEmbed"},
 	{Name: "run", Summary: "Run backend", Example: "mage run"},
@@ -49,10 +50,16 @@ func Help() error {
 }
 
 func Build() error {
+	if err := GenerateContent(); err != nil {
+		return err
+	}
 	return run("go", "build", "./...")
 }
 
 func BuildEmbed() error {
+	if err := GenerateContent(); err != nil {
+		return err
+	}
 	if err := FrontendBuildEmbed(); err != nil {
 		return err
 	}
@@ -60,10 +67,16 @@ func BuildEmbed() error {
 }
 
 func Run() error {
+	if err := GenerateContent(); err != nil {
+		return err
+	}
 	return run("go", "run", ".", "run")
 }
 
 func Dev() error {
+	if err := GenerateContent(); err != nil {
+		return err
+	}
 	if err := run("go", "build", "./..."); err != nil {
 		return fmt.Errorf("backend preflight build failed: %w", err)
 	}
@@ -127,7 +140,14 @@ func Dev() error {
 }
 
 func Test() error {
+	if err := GenerateContent(); err != nil {
+		return err
+	}
 	return run("go", "test", "./...")
+}
+
+func GenerateContent() error {
+	return run("go", "run", "./tools/contentgen", "-out", "pkg/gamedata/zz_generated_game_data.go")
 }
 
 func DbSetup() error {
@@ -253,6 +273,8 @@ func runTargetByName(targetName string) error {
 	switch targetName {
 	case "build":
 		return Build()
+	case "generateContent":
+		return GenerateContent()
 	case "buildEmbed":
 		return BuildEmbed()
 	case "run":

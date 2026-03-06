@@ -1,8 +1,11 @@
 version: 1
 behaviors:
   - key: player_scavenge_scrap
+    name: Scavenge Scrap
+    summary: Search for scrap and occasional coin in nearby alleys.
     actorType: player
     durationMinutes: 30
+    staminaCost: 18
     requirements:
       unlocks: []
       items: {}
@@ -17,8 +20,11 @@ behaviors:
     completeMessage: "You return with salvage and a few coins from quick trades."
 
   - key: player_sell_scrap
+    name: Sell Scrap
+    summary: Convert scrap into coins when the market is open.
     actorType: player
     durationMinutes: 10
+    staminaCost: 4
     requirements:
       unlocks: []
       items:
@@ -27,14 +33,18 @@ behaviors:
       scrap: 1
     outputs: {}
     outputExpressions: {}
+    requiresMarketOpen: true
     startMessage: "You head toward the nearest buyer with scrap in hand."
     completeMessage: "The scrap changes hands and your coin pouch feels heavier."
     notes:
       - Coins are resolved from current market price for scrap (AI-driven market).
 
   - key: player_sell_wood
+    name: Sell Wood
+    summary: Bring cut wood to market buyers for coins.
     actorType: player
     durationMinutes: 12
+    staminaCost: 6
     requirements:
       unlocks: []
       items:
@@ -43,14 +53,21 @@ behaviors:
       wood: 1
     outputs: {}
     outputExpressions: {}
+    requiresMarketOpen: true
     startMessage: "You carry your cut wood to market stalls and lumber buyers."
     completeMessage: "The wood lot sells and your coin pouch grows."
     notes:
       - Coins are resolved from current market price for wood (AI-driven market).
 
   - key: player_petition_forester
+    name: Petition Forester
+    summary: Purchase forest cutting rights to unlock wood gathering.
     actorType: player
+    scheduleModes:
+      - once
+    singleUsePerAscension: true
     durationMinutes: 45
+    staminaCost: 6
     requirements:
       unlocks: []
       items:
@@ -65,8 +82,11 @@ behaviors:
     completeMessage: "A stamped permit is granted. The forest now opens to your axe."
 
   - key: player_chop_wood
+    name: Chop Wood
+    summary: Gather wood from the forest once access is unlocked.
     actorType: player
     durationMinutes: 25
+    staminaCost: 22
     requirements:
       unlocks:
         - forest_access
@@ -78,11 +98,198 @@ behaviors:
     startMessage: "You enter the forest edge and begin chopping carefully."
     completeMessage: "You haul back cut wood for crafting or sale."
 
+  - key: player_pushups
+    name: Pushups
+    summary: Train strength through bodyweight exercise.
+    actorType: player
+    exclusiveGroup: body_state
+    durationMinutes: 20
+    staminaCost: 14
+    requirements:
+      unlocks: []
+      items: {}
+    costs: {}
+    outputs: {}
+    outputExpressions: {}
+    statDeltas:
+      strength: 1
+    startMessage: "You drop to the ground and begin a disciplined pushup set."
+    completeMessage: "Your muscles burn and adapt. Strength inches upward."
+
+  - key: player_run_training
+    name: Run Training
+    summary: Build endurance to improve stamina cap and recovery.
+    actorType: player
+    exclusiveGroup: body_state
+    durationMinutes: 30
+    staminaCost: 20
+    requirements:
+      unlocks: []
+      items: {}
+    costs: {}
+    outputs: {}
+    outputExpressions: {}
+    statDeltas:
+      endurance: 1
+    startMessage: "You settle into a steady running pace to build endurance."
+    completeMessage: "Your lungs and legs adapt. Your stamina ceiling improves."
+
+  - key: player_rest
+    name: Rest
+    summary: Recover stamina faster than passive recovery by taking deliberate downtime.
+    actorType: player
+    exclusiveGroup: body_state
+    durationMinutes: 30
+    staminaCost: 0
+    requirements:
+      unlocks: []
+      items: {}
+    costs: {}
+    outputs: {}
+    outputExpressions: {}
+    startMessage: "You step back from work and focus on steady recovery."
+    completeMessage: "The rest pays off, and your stamina rebounds quickly."
+
+  - key: player_socialize_market
+    name: Socialize at Market
+    summary: Improve social stat through market networking.
+    actorType: player
+    durationMinutes: 30
+    staminaCost: 8
+    requirements:
+      unlocks: []
+      items: {}
+    costs: {}
+    outputs: {}
+    outputExpressions: {}
+    statDeltas:
+      social: 1
+    startMessage: "You spend time talking with traders, runners, and regular buyers."
+    completeMessage: "You learn how people negotiate, and your social instincts sharpen."
+
+  - key: player_study_ledger_math
+    name: Study Ledger Math
+    summary: Practice arithmetic and bookkeeping to improve financial skill.
+    actorType: player
+    durationMinutes: 40
+    staminaCost: 4
+    requirements:
+      unlocks: []
+      items: {}
+    costs: {}
+    outputs: {}
+    outputExpressions: {}
+    statDeltas:
+      financial: 1
+    startMessage: "You sit with market logs and work through pricing and spread calculations."
+    completeMessage: "Your confidence with numbers grows. Financial skill improves."
+
+  - key: player_take_finance_class
+    name: Take Finance Class
+    summary: Pay for structured lessons to accelerate financial growth.
+    actorType: player
+    durationMinutes: 55
+    staminaCost: 6
+    requirements:
+      unlocks: []
+      items:
+        coins: 18
+    costs:
+      coins: 18
+    outputs: {}
+    outputExpressions: {}
+    statDeltas:
+      financial: 2
+    startMessage: "You attend an evening class focused on risk, pricing, and disciplined trade planning."
+    completeMessage: "You leave with sharper market instincts and improved financial skill."
+
+  - key: player_buy_weights
+    name: Buy Weights
+    summary: Buy home weights to unlock heavier strength training.
+    actorType: player
+    scheduleModes:
+      - once
+    singleUsePerAscension: true
+    durationMinutes: 15
+    staminaCost: 0
+    requirements:
+      unlocks: []
+      items:
+        coins: 60
+    costs:
+      coins: 60
+    outputs: {}
+    outputExpressions: {}
+    grantsUnlocks:
+      - home_weights
+    startMessage: "You search second-hand stalls for a battered but usable weight set."
+    completeMessage: "You haul a weight set home. Heavier training is now possible."
+
+  - key: player_weight_training
+    name: Weight Training
+    summary: Advance strength quickly with home weight routines.
+    actorType: player
+    exclusiveGroup: body_state
+    durationMinutes: 35
+    staminaCost: 26
+    requirements:
+      unlocks:
+        - home_weights
+      items: {}
+    costs: {}
+    outputs: {}
+    outputExpressions: {}
+    statDeltas:
+      strength: 3
+    startMessage: "You commit to a focused weight training routine."
+    completeMessage: "Progressive overload pays off. Your strength rises noticeably."
+
+  - key: player_bet_underground_fight
+    name: Bet Underground Fight
+    summary: Place a risky nighttime wager on unsanctioned fights.
+    actorType: player
+    requiresNight: true
+    durationMinutes: 20
+    staminaCost: 2
+    requirements:
+      unlocks: []
+      items:
+        coins: 20
+    costs:
+      coins: 20
+    outputs: {}
+    outputExpressions:
+      coins: "20+d80"
+    outputChances:
+      coins: 0.45
+    startMessage: "You slip into a back-alley ring and put coins on a fighter."
+    completeMessage: "The bets settle and the crowd thins before dawn."
+
+  - key: player_night_dock_salvage
+    name: Night Dock Salvage
+    summary: Recover extra scrap at night while the docks are quiet.
+    actorType: player
+    requiresNight: true
+    durationMinutes: 35
+    staminaCost: 24
+    requirements:
+      unlocks: []
+      items: {}
+    costs: {}
+    outputs:
+      scrap: 2
+    outputExpressions:
+      coins: "1+d3"
+    outputChances:
+      coins: 0.25
+    startMessage: "You comb the darkened dockyards for discarded metal and loose cargo bits."
+    completeMessage: "You return from the docks with a heavy sack of salvage."
+
 outputExpressionSyntax:
   staticRange: "1-5"
   diceRange: "1+d6"
   staticValue: "3"
   notes:
     - Output expressions are optional and evaluated on behavior completion.
-    - Static `outputs` and `outputExpressions` can both be present and are added together.
-    - `outputChances` is optional and uses decimal probabilities from 0.0 to 1.0.
+    - "Static `outputs` and `outputExpressions` can both be present and are added together."
+    - "`outputChances` is optional and uses decimal probabilities from 0.0 to 1.0."

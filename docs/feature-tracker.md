@@ -17,18 +17,18 @@ _Generated from docs/feature-tracker.yaml via tools/trackergen. Edit YAML, not t
 
 | ID | Type | Priority | Action State | Area | Item | Next Action |
 |---|---|---|---|---|---|---|
-| BUG-001 | Bug | P0 | 🟩 done | Auth/Session | Refresh race + first-login churn | Keep watching error telemetry during normal play sessions |
-| BUG-002 | Bug | P0 | 🟩 done | Stream | Stale-token stream reconnect/401 + duplicate reconnect pressure | Monitor for recurrence after broader gameplay updates |
+| BUG-001 | Bug | P0 | 🟩 done | Auth/Session | Refresh race + first-login churn | Depends on: DISC-002,FEAT-010. Behavior lifecycle toasts now announce start spend and completion gains; next pass should add explicit rest-specific stamina/recovery delta callouts in snapshot/queue/event cues |
+| BUG-002 | Bug | P0 | 🟩 done | Stream | Stale-token stream reconnect/401 + duplicate reconnect pressure | Added stream endpoint candidate resolution/failover (`window.host`, optional `VITE_STREAM_ORIGIN`, localhost `:8080` fallback), richer close/error diagnostics, and player-safe footer realtime status (raw transport errors no longer surfaced directly) |
 | BUG-003 | Bug | P0 | 🟩 done | Chat | Default channel creation race (`failed to ensure default channel`) | Keep idempotent insert behavior as baseline |
-| BUG-004 | Bug | P1 | 🟩 done | Admin UX | Tabs/layout instability and heavy stats payload rendering issues | Revisit only if modal regression appears |
-| BUG-005 | Bug | P1 | 🟩 done | Admin Audit | Actor identity not clearly visible in audit entries | Keep actor username + account id visible in every row |
-| BUG-006 | Bug | P0 | 🟩 done | Gameplay UI | Stats overhaul has no clear visual/context separation; attributes and derived stats still feel mixed in the UI | Keep formula/context hints aligned with gameplay tuning updates |
-| BUG-007 | Bug | P2 | 🟨 todo | Startup UX | Gameplay/chat tabs visible before character creation | FEAT-005 is complete. Gate gameplay/chat tabs until `hasPrimaryPlayer` (or equivalent) is true and keep onboarding/new-character flow primary |
-| BUG-008 | Bug | P2 | 🟨 todo | Queue UX | Frontend queue controls do not expose DISC-001 schedule modes (`once/repeat/repeat-until`) | DISC-001 is complete. Add mode + repeat-until inputs to queue UX and reflect resolved schedule metadata in queue/history rows |
-| BUG-009 | Bug | P1 | 🟩 done | Gameplay Integrity | Mutually exclusive behaviors can run concurrently (e.g., rest + exercise) | Queue-time + activation-time exclusion checks are enforced and queue UI now surfaces exclusivity block reasons for conflicting active behaviors |
+| BUG-004 | Bug | P1 | 🟩 done | Admin UX | Tabs/layout instability and heavy stats payload rendering issues | Frontend now gates auth-required polling/stream connections until bootstrap refresh/context load settles; keep watching telemetry for any residual stale-session startup noise |
+| BUG-005 | Bug | P1 | 🟩 done | Admin Audit | Actor identity not clearly visible in audit entries | Monitor for recurrence after broader gameplay updates |
+| BUG-006 | Bug | P0 | 🟩 done | Gameplay UI | Stats overhaul has no clear visual/context separation; attributes and derived stats still feel mixed in the UI | Revisit only if modal regression appears |
+| BUG-007 | Bug | P2 | 🟩 done | Startup UX | Gameplay/chat tabs visible before character creation | Keep actor username + account id visible in every row |
+| BUG-008 | Bug | P2 | 🟩 done | Queue UX | Frontend queue controls do not expose DISC-001 schedule modes (`once/repeat/repeat-until`) | Queue cards now surface item/unlock requirements alongside duration/stamina/group, market wait controls only appear for market-gated behaviors, and repeat sell loops now auto-complete when resources are exhausted instead of failing |
+| BUG-009 | Bug | P1 | 🟩 done | Gameplay Integrity | Mutually exclusive behaviors can run concurrently (e.g., rest + exercise) | Gameplay/chat tabs now stay hidden until character context exists, so pre-onboarding sessions remain profile/onboarding-first by default |
 | BUG-010 | Bug | P2 | 🟨 todo | Snapshot UX | Rest effects are not visibly reflected in UI feedback | Depends on: DISC-002,FEAT-010. Surface rest-driven stamina/recovery deltas clearly in snapshot/queue/event cues |
-| BUG-011 | Bug | P1 | 🟩 done | Admin/Chat UX | Chat admin realm targeting uses free-text id input instead of constrained selector | Realm target selector (`*`/single/list) and per-realm fan-out result drilldown (including failure reasons) are implemented for chat admin actions |
-| BUG-012 | Bug | P1 | 🟩 done | Character Lifecycle | Character creation behaves like upsert/replace and can accidentally wipe active save intent | Onboarding is now split into explicit create (`/v1/onboarding/start`) and explicit switch (`/v1/onboarding/switch`), default-character resolution when `characterId` is omitted is primary-first, and same-realm create attempts now return conflict instead of implicit upsert/switch |
+| BUG-011 | Bug | P1 | 🟩 done | Admin/Chat UX | Chat admin realm targeting uses free-text id input instead of constrained selector | Depends on: DISC-002,FEAT-010. Behavior lifecycle toasts now announce start spend and completion gains; next pass should add explicit rest-specific stamina/recovery delta callouts in snapshot/queue/event cues |
+| BUG-012 | Bug | P1 | 🟩 done | Character Lifecycle | Character creation behaves like upsert/replace and can accidentally wipe active save intent | Added stream endpoint candidate resolution/failover (`window.host`, optional `VITE_STREAM_ORIGIN`, localhost `:8080` fallback), richer close/error diagnostics, and player-safe footer realtime status (raw transport errors no longer surfaced directly) |
 | BUG-013 | Bug | P1 | 🟩 done | Character Session UX | Character switching in frontend oscillates/alternates context instead of stabilizing on selected character | Character switch now persists preferred character, forces full context reload, and stream snapshot use is restricted to live context to avoid cross-character tick bleed |
 | BUG-014 | Bug | P1 | 🟩 done | Auth/Session UX | Logout/login does not fully clear frontend transient state | Session-change subscription now enforces full client-state reset on token/session clear (including refresh-failure paths), and login/logout/no-session boundaries all converge on the same reset flow |
 | BUG-015 | Bug | P2 | 🟩 done | Chat Bootstrap | Global channel is not initialized as global across realms at startup/bootstrap | Added deterministic global-channel bootstrap on runtime startup across known realms and realm-create bootstrap now ensures/reenables per-realm `global` binding visibility semantics |
@@ -44,7 +44,7 @@ _Generated from docs/feature-tracker.yaml via tools/trackergen. Edit YAML, not t
 | BUG-025 | Bug | P1 | 🟩 done | Runtime/Shutdown | Server process can appear hung/noisy in terminal after DB reset/crash paths because teardown paths could outlive cancellation and DB interruption errors bubbled as fatal runtime output | World-loop and HTTP shutdown paths now use cancellation-aware bounded teardown, telemetry flush is timeout-bounded, known DB-reset SQLSTATE interruptions are treated as graceful runtime shutdown, and GORM logging defaults to non-color silent mode (`LIVED_GORM_LOG_LEVEL` to override) to avoid terminal-hostile output |
 | BUG-026 | Bug | P1 | 🟩 done | Build/Test | Full suite failed to compile in gameplay tests after DAL model embedding changes (`BehaviorInstance` no longer exposes promoted `ID` in keyed literals) | Updated gameplay runtime tests to construct `dal.BehaviorInstance` with explicit embedded `BaseModel` IDs; full `go test ./...` passes |
 | BUG-027 | Bug | P2 | 🟩 done | Build/Module Hygiene | `go.mod` listed `github.com/jackc/pgx/v5` as indirect despite direct code imports (`pgconn`) | Promoted `github.com/jackc/pgx/v5` to direct dependency in root `require` block so diagnostics/tooling align with actual imports |
-| FEAT-001 | Feature | P0 | 🟩 done | Core Gameplay | Split trainable character attributes from derived/running stats | Keep catalog `name`/`label`/`summary` metadata aligned with behavior design updates |
+| FEAT-001 | Feature | P0 | 🟩 done | Core Gameplay | Split trainable character attributes from derived/running stats | Added financial as a first-class trainable attribute with derived trading aptitude (`social + financial`) and new training behaviors (`Study Ledger Math`, `Take Finance Class`) to support upcoming soft-gated market progression |
 | FEAT-002 | Feature | P0 | 🟩 done | Core Gameplay | Add explicit stat formulas/docs (endurance -> stamina cap/recovery) in API docs | Keep formulas in sync with gameplay constants on future balance changes |
 | FEAT-003 | Feature | P1 | 🟩 done | Chat | Channel subject support | Keep subject length/usage guidance aligned across admin form, API docs, and chat UI |
 | FEAT-004 | Feature | P1 | 🟩 done | Realms | Realm naming + selector UX | Added persisted realm metadata (`name`, `whitelistOnly`) with admin editing, surfaced realm names across profile/onboarding/admin selectors, and removed raw-id-only realm labeling in primary UX paths |
@@ -52,8 +52,8 @@ _Generated from docs/feature-tracker.yaml via tools/trackergen. Edit YAML, not t
 | FEAT-017 | Feature | P2 | 🟩 done | Realms/Auth | Whitelisted realm character creation access control | Added realm whitelist policy + per-account grant/revoke admin controls and enforced onboarding create checks so restricted realms require explicit admin approval |
 | FEAT-006 | Feature | P1 | 🟩 done | Admin UX | Per-tab admin load diagnostics + retries | Added tab-scoped data health indicators, segment-level failure reporting, and targeted retry controls in AdminModal (top chrome + tab-local panel body status) |
 | FEAT-007 | Feature | P2 | 🟩 done | Queue UX | Human-readable queue timing | Keep queue split between current work and recent results; revisit if users want richer timeline cues |
-| FEAT-008 | Feature | P2 | 🟨 todo | Progression | Restore progression panel for locked/future actions | Depends on: DISC-001. Keep queue dropdown limited to queueable actions while progression reflects finalized behavior modes |
-| FEAT-009 | Feature | P2 | 🟨 todo | Time UX | Day/night indicator in snapshot | Add compact visual in snapshot panel |
+| FEAT-008 | Feature | P2 | 🟩 done | Progression | Restore progression panel for locked/future actions | Progression tab restored with locked/future behaviors, consumed single-use entries, and upgrade cards with explicit gate type labels; future pass can add richer graph-style dependency visualization |
+| FEAT-009 | Feature | P2 | 🟨 todo | Time UX | Day/night indicator in snapshot | Night-only behaviors are now supported in runtime/catalog (`requiresNight`) with queue wait reasons; next pass should add a compact snapshot day/night indicator plus market/night session cues |
 | FEAT-010 | Feature | P2 | 🟨 todo | Economy UX | Rolling production metrics (coins/min, wood/min) | Depends on: DISC-001, DISC-002. Add sampled rate cards after scheduling/rest loops are finalized |
 | FEAT-011 | Feature | P1 | 🟩 done | Snapshot UX | Represent queued/active behaviors visually in player snapshot with compact progress bars | Keep baseline skyline bars stable; FEAT-012 polish remains blocked on DISC-001 and DISC-003 |
 | FEAT-012 | Feature | P1 | 🟥 blocked | Snapshot UX | Persistent per-slot behavior skyline: show all available behavior slots, retain slot history state after completion, and visualize active progress against DISC-003 parallel limits (animation polish included) | Depends on: DISC-001,DISC-003. Expand prototype to slot-based persistent bars and upgrade-aware capacity, then polish transitions |
@@ -61,12 +61,12 @@ _Generated from docs/feature-tracker.yaml via tools/trackergen. Edit YAML, not t
 | FEAT-014 | Feature | P2 | 🟩 done | Market UX | Improve market open/close countdown display (hours until 60m, then minutes) | Revisit only if players request day-aware market countdown phrasing |
 | FEAT-015 | Feature | P1 | 🟩 done | Admin Observability | Show average tick time vs desired tick time with frame-budget visualization in admin stats | Exposed tick timing aggregates in `/v1/admin/stats` (`avgTickMs`, `targetTickMs`, budget delta/ratio, runs/failures) and rendered a Tick Budget visualization card in Admin Dashboard |
 | FEAT-016 | Feature | P1 | 🟩 done | Layout UX | Add fixed footer with always-visible operational context while central content scrolls between fixed header/footer | Implemented fixed shell chrome with header+snapshot and always-visible operational footer while center content scrolls across profile/gameplay/chat views |
-| DISC-001 | Feature | P2 | 🟩 done | Scheduling | Continuous/repeat-until behavior modes | Finalized behavior mode contracts (`once/repeat/repeat-until`) in queue/runtime API with validated request rules (`repeatUntil` only for `repeat-until`) and deterministic rescheduling semantics |
+| DISC-001 | Feature | P2 | 🟩 done | Scheduling | Continuous/repeat-until behavior modes | Queue/runtime contracts now include per-behavior mode restrictions via game-data (`scheduleModes`) with UI controls for `once/repeat/repeat-until` and validated `repeatUntil` semantics |
 | DISC-002 | Feature | P2 | 🟩 done | Gameplay | Rest behavior with accelerated recovery | Added `player_rest` with deterministic accelerated stamina recovery on completion (capped by max stamina) and validated queue/runtime interaction |
-| DISC-003 | Feature | P2 | 🟨 todo | Progression Systems | Composable upgrade/modifier system | Prototype upgrade that raises max parallel behaviors |
+| DISC-003 | Feature | P2 | 🟦 in-progress | Progression Systems | Composable upgrade/modifier system | Added separate upgrade `costScaling` + `outputScaling` formulas with projected next-level costs/outputs in API/UI, explicit `gateTypes` in game-data/catalog, queue slot progression wiring, server-side batch completion summaries with realized spend/gain payloads, and a dedicated `cancelled` behavior state; next pass should add dependency graph rendering and richer gate semantics beyond resource/unlock |
 | DISC-004 | Feature | P1 | 🟨 todo | Progression Systems | Behavior evolution contract: replace-vs-tier coexistence for upgraded behaviors | Depends on: DISC-003,FEAT-001. Define per-behavior evolution mode (`replace` vs `coexist`) and migration/runtime resolution rules so upgrades can either supersede or stack by design |
-| DISC-005 | Feature | P2 | 🟨 todo | Economy/Social Finance | Player-created indexes with incentive/revenue-sharing model (future) | Depends on: FEAT-020,MMO-011. Define ownership, index composition/rebalancing rules, and incentive payout model after advanced trading and market-inventory simulation stabilize |
-| TECH-001 | Technical | P1 | 🟨 todo | Build/Runtime | Confirm YAML source embedding/versioning is compile-time and not runtime file dependency | Verify embed pipeline and version metadata flow |
+| DISC-005 | Feature | P2 | 🟦 in-progress | Economy/Social Finance | Player-created indexes with incentive/revenue-sharing model (future) | Realm-local phase-1 orderbook now ships API-supplied candle/overview feeds, observability-first market tab layout, wider open-order ergonomics (no default horizontal scrolling), explicit liquidity/cap/pressure stats, and deterministic `npc_cycle` autonomous repricing beyond player-only input; next pass should add admin market controls (inject/remove liquidity, pause matching, shock events) and deeper lot/entry ergonomics |
+| TECH-001 | Technical | P1 | 🟩 done | Build/Runtime | Confirm YAML source embedding/versioning is compile-time and not runtime file dependency | Added YAML -> Go codegen (`tools/contentgen`) producing both `pkg/gamedata/zz_generated_game_data.go` and typed runtime behavior maps in `src/gameplay/zz_generated_behavior_definitions.go`, enforced full-document YAML validation during generation, surfaced metadata via `/v1/system/version`, and wired `mage build/run/dev/test` to auto-generate so runtime has no filesystem YAML dependency |
 | TECH-002 | Technical | P1 | 🟩 done | Chat/Realms | Clarify channel-to-realm binding model (`*` global, per-realm, multi-realm) | Finalized v1 model: channel bindings are `scope=realm` with stable `scopeKey=realm:{id}`, wordlist policy is `policyScope=global` with `policyScopeKey=global`, and multi-realm expansion is reserved behind future scope families using opaque `scopeKey` |
 | TECH-003 | Technical | P2 | 🟨 todo | Build Guardrails | Prevent raw-string/backtick regressions in embedded spec/template literals | Add a lightweight compile/lint guard that fails when unescaped backticks are introduced inside embedded raw strings |
 | TECH-004 | Technical | P2 | 🟨 todo | Dev Workflow | Mage-driven local dev terminal HUD for tick/frame budget + runtime health (without altering app stdout) | Design runner-side HUD that reads side-channel metrics/logs and keeps app stdout clean for deployment logging pipelines |
@@ -74,6 +74,15 @@ _Generated from docs/feature-tracker.yaml via tools/trackergen. Edit YAML, not t
 | FEAT-018 | Feature | P1 | 🟩 done | Admin Process UX | Process-oriented admin command model (explicit create/edit/activate/deactivate/attach/detach flows) | Admin command semantics are now explicit across chat (`create`/`edit`/`attach`), realm metadata (`edit`), account role/status (`set_role`/`set_status`), and character moderation (`edit`), with UI labels migrated away from implicit upsert/set phrasing |
 | FEAT-019 | Feature | P2 | 🟨 todo | Producer Progression | Lumbering progression branch into woodworking with larger tool requirements and strength interaction | Depends on: DISC-004. Define producer-track behavior set (gather, refine, craft), tool unlock tiers, and strength-scaled throughput/cost formulas with inventory requirements |
 | FEAT-020 | Feature | P1 | 🟨 todo | Trading Mechanics | Advanced trading orders + protections (lot size 100, buy/sell limits, timed buys, stop-loss, circuit breaker) | Depends on: MMO-011. Define order lifecycle/expiry contracts and matching rules, enforce quantity granularity of 100, and implement per-symbol circuit-breaker pause windows without halting whole market |
+| FEAT-021 | Feature | P2 | 🟨 todo | Career Paths | Trader/Speculator career path (financial-first progression track) | Depends on: FEAT-020,DISC-005. Define milestone behaviors/unlocks for trader identity (analysis, liquidity scouting, market execution discipline), with financial + social soft gates and explicit progression rewards. |
+| FEAT-022 | Feature | P2 | 🟨 todo | Career Paths | Night Operator career path (risk/reward night economy track) | Depends on: FEAT-009,DISC-005. Expand approved night behaviors into a full progression branch (street wagering, dock salvage, after-hours trade loops), including unique unlock chain and balance guardrails. |
+| FEAT-023 | Feature | P1 | 🟨 todo | Admin Market Controls | Realm admin controls for market intervention (inject/remove liquidity, pause matching, shock events) | Depends on: MMO-011,FEAT-020. Define safe operator commands, audit semantics, and bounded effect models so test/live realms can run deterministic market interventions. |
+| FEAT-024 | Feature | P2 | 🟦 in-progress | Market UX | Market order-entry ergonomics pass (lot presets, expiry presets, clearer risk/fee previews) | Added lot-based quantity selector (`x100`) and live inventory/coin affordability hints in order entry; next pass should add explicit escrow/refund/fee impact preview copy before submit. |
+| FEAT-025 | Feature | P2 | 🟨 todo | Career Paths | Market-maker / liquidity steward career path | Depends on: FEAT-021,MMO-011. Define progression from passive liquidity support to active spread management with role identity rewards and anti-grief guardrails. |
+| FEAT-026 | Feature | P2 | 🟨 todo | Career Paths | Logistics / convoy merchant career path | Depends on: FEAT-019,MMO-011. Define gather-haul-sell loop tied to convoy windows, route risk, and inventory throughput bonuses. |
+| TECH-007 | Technical | P1 | 🟦 in-progress | Economy Balance | Market influence tuning (player vs NPC impact budgeting) | Added adaptive directional impact budgeting in `applySingleMarketDelta` using liquidity depth plus active-participant/population estimates, plus storyteller-driven curve corrections (`storyteller_curve`) to prevent one-way drift while preserving swings; next pass should tune coefficients from live telemetry and add operator controls for storyteller aggressiveness. |
+| FEAT-027 | Feature | P2 | 🟩 done | Market UX | Dedicated symbol-overview mode with candle window controls | Completed dedicated `Market Overview` gameplay tab with multi-symbol selectable line graph + sample points and configurable bucket/window controls; continue monitoring readability as symbol count grows. |
+| TECH-008 | Technical | P2 | 🟨 todo | Tracker Hygiene | Backlog audit for previously approved but untracked career paths/features | Run a documentation reconciliation pass against prior design notes/chat decisions and add missing approved paths/features with dependencies and priorities in `docs/feature-tracker.yaml`. |
 | TECH-005 | Technical | P2 | 🟨 todo | Admin Safety | Preflight/preview support for destructive admin operations | Design optional preflight endpoints + confirmation metadata so destructive actions can be previewed and audit-linked before commit |
 | MMO-001 | Technical | P0 | 🟩 done | Realm Partitioning | Complete remaining runtime/API default realm scoping and remove legacy unscoped read paths | Keep new realm-scoped resolver coverage for system/feed/chat/mmo + market endpoints and realm-aware admin audit ticks stable; watch for regressions |
 | MMO-002 | Feature | P1 | 🟩 done | Admin/Chat | Chat control-plane endpoints (channel lifecycle + participant moderation + word policy lifecycle) | Implemented `/v1/admin/chat/*` control-plane set with per-action admin audit trails and Swagger coverage; next follow-up is BUG-015 deterministic global-channel bootstrap semantics |
@@ -103,6 +112,15 @@ Use comma-separated IDs in `Depends On` for machine-parsable dependency traversa
 | FEAT-018 | MMO-002,MMO-003 | Process-oriented command contracts should align with finalized chat/realm control-plane lifecycle semantics |
 | FEAT-019 | DISC-004 | Producer-track behavior unlock/replacement rules should follow finalized evolution semantics |
 | FEAT-020 | MMO-011 | Advanced order mechanics need inventory-backed market simulation and actor-driven price movement first |
+| FEAT-021 | FEAT-020,DISC-005 | Trader identity progression should build on mature order mechanics and finance/economy systems |
+| FEAT-022 | FEAT-009,DISC-005 | Night-operator path relies on explicit day/night UX context and stabilized market-economy loops |
+| FEAT-023 | MMO-011,FEAT-020 | Admin interventions must target the finalized actor-driven market and order lifecycle contracts |
+| FEAT-024 | FEAT-020 | UX safety improvements should align with finalized advanced order model and protections |
+| FEAT-025 | FEAT-021,MMO-011 | Liquidity-provider progression should align with trader track identity and actor-driven inventory simulation |
+| FEAT-026 | FEAT-019,MMO-011 | Convoy/logistics path should sit on top of producer progression and market inventory simulation |
+| TECH-007 | MMO-011,FEAT-020 | Impact balancing must use finalized actor-driven market depth and order lifecycle mechanics |
+| FEAT-027 | FEAT-020 | Dedicated market-view UX should align with finalized order model and observability contracts |
+| TECH-008 | FEAT-018 | Tracker hygiene should follow the canonical process-oriented planning workflow |
 | BUG-007 | FEAT-005 | Startup tab gating should align with onboarding/boot sequencing contract |
 | BUG-008 | DISC-001 | Queue UI mode controls must match finalized scheduling contract |
 | BUG-009 | DISC-003 | Mutual exclusion and parallel-capacity rules should land together for coherent behavior scheduling |
@@ -162,12 +180,20 @@ flowchart LR
 	FEAT_005["🟠 FEAT-005"]
 	FEAT_006["🟠 FEAT-006"]
 	FEAT_008["🟡 FEAT-008"]
+	FEAT_009["🟡 FEAT-009"]
 	FEAT_010["🟡 FEAT-010"]
 	FEAT_012["🟠 FEAT-012"]
 	FEAT_015["🟠 FEAT-015"]
 	FEAT_018["🟠 FEAT-018"]
 	FEAT_019["🟡 FEAT-019"]
 	FEAT_020["🟠 FEAT-020"]
+	FEAT_021["🟡 FEAT-021"]
+	FEAT_022["🟡 FEAT-022"]
+	FEAT_023["🟠 FEAT-023"]
+	FEAT_024["🟡 FEAT-024"]
+	FEAT_025["🟡 FEAT-025"]
+	FEAT_026["🟡 FEAT-026"]
+	FEAT_027["🟡 FEAT-027"]
 	MMO_001["🔴 MMO-001"]
 	MMO_002["🟠 MMO-002"]
 	MMO_003["🟠 MMO-003"]
@@ -182,6 +208,8 @@ flowchart LR
 	TECH_004["🟡 TECH-004"]
 	TECH_005["🟡 TECH-005"]
 	TECH_006["🔴 TECH-006"]
+	TECH_007["🟠 TECH-007"]
+	TECH_008["🟡 TECH-008"]
 	MMO_001 --> FEAT_004
 	MMO_001 --> FEAT_005
 	MMO_002 --> FEAT_006
@@ -195,6 +223,21 @@ flowchart LR
 	MMO_003 --> FEAT_018
 	DISC_004 --> FEAT_019
 	MMO_011 --> FEAT_020
+	FEAT_020 --> FEAT_021
+	DISC_005 --> FEAT_021
+	FEAT_009 --> FEAT_022
+	DISC_005 --> FEAT_022
+	MMO_011 --> FEAT_023
+	FEAT_020 --> FEAT_023
+	FEAT_020 --> FEAT_024
+	FEAT_021 --> FEAT_025
+	MMO_011 --> FEAT_025
+	FEAT_019 --> FEAT_026
+	MMO_011 --> FEAT_026
+	MMO_011 --> TECH_007
+	FEAT_020 --> TECH_007
+	FEAT_020 --> FEAT_027
+	FEAT_018 --> TECH_008
 	FEAT_005 --> BUG_007
 	DISC_001 --> BUG_008
 	DISC_003 --> BUG_009
@@ -244,8 +287,8 @@ flowchart LR
 	classDef todo fill:#3b3212,stroke:#f0d46a,stroke-width:2px,color:#fff8de;
 	classDef blocked fill:#4a1f29,stroke:#ff8fa6,stroke-width:2px,color:#ffe9ee;
 
-	class BUG_007 todo;
-	class BUG_008 todo;
+	class BUG_007 done;
+	class BUG_008 done;
 	class BUG_009 done;
 	class BUG_010 todo;
 	class BUG_011 done;
@@ -261,20 +304,28 @@ flowchart LR
 	class BUG_023 done;
 	class DISC_001 done;
 	class DISC_002 done;
-	class DISC_003 todo;
+	class DISC_003 inProgress;
 	class DISC_004 todo;
-	class DISC_005 todo;
+	class DISC_005 inProgress;
 	class FEAT_001 done;
 	class FEAT_004 done;
 	class FEAT_005 done;
 	class FEAT_006 done;
-	class FEAT_008 todo;
+	class FEAT_008 done;
+	class FEAT_009 todo;
 	class FEAT_010 todo;
 	class FEAT_012 blocked;
 	class FEAT_015 done;
 	class FEAT_018 done;
 	class FEAT_019 todo;
 	class FEAT_020 todo;
+	class FEAT_021 todo;
+	class FEAT_022 todo;
+	class FEAT_023 todo;
+	class FEAT_024 inProgress;
+	class FEAT_025 todo;
+	class FEAT_026 todo;
+	class FEAT_027 done;
 	class MMO_001 done;
 	class MMO_002 done;
 	class MMO_003 done;
@@ -289,6 +340,8 @@ flowchart LR
 	class TECH_004 todo;
 	class TECH_005 todo;
 	class TECH_006 done;
+	class TECH_007 inProgress;
+	class TECH_008 todo;
 
 ```
 
@@ -300,6 +353,7 @@ flowchart TB
 	P1Q --> DISC_004["DISC-004"]
 	P1Q --> FEAT_012["FEAT-012"]
 	P1Q --> FEAT_020["FEAT-020"]
+	P1Q --> FEAT_023["FEAT-023"]
 	P1Q --> MMO_005["MMO-005"]
 	P1Q --> MMO_006["MMO-006"]
 	P1Q --> MMO_007["MMO-007"]
@@ -307,24 +361,30 @@ flowchart TB
 	P1Q --> MMO_009["MMO-009"]
 	P1Q --> MMO_010["MMO-010"]
 	P1Q --> MMO_011["MMO-011"]
-	P1Q --> TECH_001["TECH-001"]
-	P2Q --> BUG_007["BUG-007"]
-	P2Q --> BUG_008["BUG-008"]
+	P1Q --> TECH_007["TECH-007"]
 	P2Q --> BUG_010["BUG-010"]
 	P2Q --> DISC_003["DISC-003"]
 	P2Q --> DISC_005["DISC-005"]
-	P2Q --> FEAT_008["FEAT-008"]
 	P2Q --> FEAT_009["FEAT-009"]
 	P2Q --> FEAT_010["FEAT-010"]
 	P2Q --> FEAT_019["FEAT-019"]
+	P2Q --> FEAT_021["FEAT-021"]
+	P2Q --> FEAT_022["FEAT-022"]
+	P2Q --> FEAT_024["FEAT-024"]
+	P2Q --> FEAT_025["FEAT-025"]
+	P2Q --> FEAT_026["FEAT-026"]
 	P2Q --> TECH_003["TECH-003"]
 	P2Q --> TECH_004["TECH-004"]
 	P2Q --> TECH_005["TECH-005"]
+	P2Q --> TECH_008["TECH-008"]
 
 ```
 
 ## Recently Completed
 
+- Added storyteller-driven market curve management (`storyteller_curve`) and adaptive per-symbol directional impact budgets based on liquidity depth plus active realm participation/population baselines.
+- Replaced in-tab all-symbol toggle with dedicated `Market Overview` tab featuring multi-symbol line graph trends with sample points and selectable history windows.
+- Improved order entry ergonomics with lot-based quantity selection (`x100`) and live holdings/affordability hints (resource lots + coin escrow capacity).
 - Added toast-first notifications and removed old inline app notices.
 - Hardened admin modal loading/refresh behavior and stabilized tab layout.
 - Added audit visual summaries and aggregate/fallback source labeling.
@@ -341,7 +401,10 @@ flowchart TB
 2. `MMO-005`: `MMO-005` (P1): OTel profile signal integration + non-HTTP structured log correlation fields for workers/loop operations.
 3. `MMO-011`: `MMO-011` (P1): Inventory-backed market simulation and NPC actor loops to establish natural price movement baseline.
 4. `FEAT-020`: `FEAT-020` (P1): Advanced trading order mechanics (lot-size constraints, limits, timed orders, stop-loss, circuit-breaker behavior) on top of MMO-011.
-5. `MMO-010`: `MMO-010` (P1): JWT signing key rotation with active+next key (`kid`) handling and access-token transport hardening policy.
+5. `FEAT-023`: `FEAT-023` (P1): Admin market intervention controls (liquidity ops, matching pauses, shock events) with bounded effects and audit trail.
+6. `TECH-007`: `TECH-007` (P1): Market influence balancing (player vs NPC impact budgets, liquidity-aware repricing controls, and MMO fairness tuning).
+7. `FEAT-027`: `FEAT-027` (P2): DONE - Dedicated Market Overview tab with multi-symbol sampled trend lines and configurable window controls.
+8. `MMO-010`: `MMO-010` (P1): JWT signing key rotation with active+next key (`kid`) handling and access-token transport hardening policy.
 
 ## Sanity Scan Cross-Reference (2026-03-05)
 

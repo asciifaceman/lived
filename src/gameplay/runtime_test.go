@@ -111,6 +111,27 @@ func TestSortBehaviorDefinitionsByDisplayName(t *testing.T) {
 	}
 }
 
+func TestSplitCoreAndDerivedStatsIncludesFinancialAndTradingAptitude(t *testing.T) {
+	stats := map[string]int64{
+		statStrength:            2,
+		statSocial:              3,
+		statFinancial:           4,
+		statEndurance:           5,
+		statStamina:             10,
+		statMaxStamina:          100,
+		statTradingAptitude:     7,
+		statStaminaRecoveryRate: 9,
+	}
+
+	core, derived := splitCoreAndDerivedStats(stats)
+	if core[statFinancial] != 4 {
+		t.Fatalf("expected core financial 4, got %d", core[statFinancial])
+	}
+	if derived[statTradingAptitude] != 7 {
+		t.Fatalf("expected derived trading aptitude 7, got %d", derived[statTradingAptitude])
+	}
+}
+
 func TestParseBehaviorRuntimePayloadModeNormalization(t *testing.T) {
 	payload := parseBehaviorRuntimePayload(`{"mode":"REPEAT-UNTIL","repeatIntervalMinutes":30,"repeatUntilTick":900}`)
 	if payload.Mode != behaviorModeRepeatUntil {
@@ -128,6 +149,26 @@ func TestParseBehaviorRuntimePayloadInvalidModeFallsBackToOnce(t *testing.T) {
 	payload := parseBehaviorRuntimePayload(`{"mode":"forever"}`)
 	if payload.Mode != behaviorModeOnce {
 		t.Fatalf("expected fallback mode %q, got %q", behaviorModeOnce, payload.Mode)
+	}
+}
+
+func TestParseBehaviorRuntimePayloadNormalizesRealizedMaps(t *testing.T) {
+	payload := parseBehaviorRuntimePayload(`{"spent":{"coins":12,"":5},"gained":{"coins":3,"stamina":0}}`)
+	if len(payload.Spent) != 1 || payload.Spent["coins"] != 12 {
+		t.Fatalf("expected normalized spent map, got %#v", payload.Spent)
+	}
+	if len(payload.Gained) != 1 || payload.Gained["coins"] != 3 {
+		t.Fatalf("expected normalized gained map, got %#v", payload.Gained)
+	}
+}
+
+func TestMarshalBehaviorRuntimePayloadEmptyMapPayloadToBraces(t *testing.T) {
+	encoded, err := marshalBehaviorRuntimePayload(behaviorRuntimePayload{Spent: map[string]int64{"coins": 0}, Gained: map[string]int64{"": 5}})
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if encoded != "{}" {
+		t.Fatalf("expected empty payload encoding {}, got %q", encoded)
 	}
 }
 
@@ -170,6 +211,27 @@ func TestBehaviorDefinitionsConflict(t *testing.T) {
 	}
 }
 
+func TestBehaviorModeSupportedDefaultsAndOverrides(t *testing.T) {
+	defaultDefinition := BehaviorDefinition{}
+	if !behaviorModeSupported(defaultDefinition, "once") {
+		t.Fatal("expected default definition to support once")
+	}
+	if !behaviorModeSupported(defaultDefinition, "repeat") {
+		t.Fatal("expected default definition to support repeat")
+	}
+	if !behaviorModeSupported(defaultDefinition, "repeat-until") {
+		t.Fatal("expected default definition to support repeat-until")
+	}
+
+	onceOnlyDefinition := BehaviorDefinition{ScheduleModes: []string{"once"}}
+	if !behaviorModeSupported(onceOnlyDefinition, "once") {
+		t.Fatal("expected once-only definition to support once")
+	}
+	if behaviorModeSupported(onceOnlyDefinition, "repeat") {
+		t.Fatal("expected once-only definition to reject repeat")
+	}
+}
+
 func TestHasExclusiveConflictWithActiveBehaviorKeys(t *testing.T) {
 	rest := playerBehaviorDefinitions["player_rest"]
 
@@ -190,4 +252,57 @@ func TestHasExclusiveConflictWithActiveBehaviorKeys(t *testing.T) {
 	if hasExclusiveConflictWithActiveBehaviorKeys(nonExclusive, 99, active) {
 		t.Fatal("expected non-exclusive definition to not conflict")
 	}
+}
+
+func TestShouldAutoCompleteQueuedBehavior(t *testing.T) {
+	repeatPayload := behaviorRuntimePayload{Mode: behaviorModeRepeat}
+	repeatUntilPayload := behaviorRuntimePayload{Mode: behaviorModeRepeatUntil}
+	oncePayload := behaviorRuntimePayload{Mode: behaviorModeOnce}
+
+	if !shouldAutoCompleteQueuedBehavior(repeatPayload, errString("missing scrap (need 1)")) {
+		t.Fatal("expected repeat mode missing requirement to auto-complete")
+	}
+	if !shouldAutoCompleteQueuedBehavior(repeatUntilPayload, errString("insufficient scrap")) {
+		t.Fatal("expected repeat-until insufficient resource to auto-complete")
+	}
+	if shouldAutoCompleteQueuedBehavior(oncePayload, errString("missing scrap (need 1)")) {
+		t.Fatal("expected once mode requirement miss to remain a failure")
+	}
+	if shouldAutoCompleteQueuedBehavior(repeatPayload, errString("unknown behavior definition")) {
+		t.Fatal("expected unknown errors to remain failures")
+	}
+}
+
+func TestShouldQueueNextBehaviorStopsRestWhenFull(t *testing.T) {
+	payload := behaviorRuntimePayload{Mode: behaviorModeRepeat}
+	if shouldQueueNextBehavior(payload, 100, 0, restBehaviorKey, 0) {
+		t.Fatal("expected rest repeat to stop when no stamina was recovered")
+	}
+	if !shouldQueueNextBehavior(payload, 100, 0, restBehaviorKey, 5) {
+		t.Fatal("expected rest repeat to continue when stamina was recovered")
+	}
+	if !shouldQueueNextBehavior(payload, 100, 0, "player_scavenge_scrap", 0) {
+		t.Fatal("expected non-rest repeat to continue")
+	}
+}
+
+func TestIsNightTickWindow(t *testing.T) {
+	if !IsNightTick(0) {
+		t.Fatal("expected midnight to be night")
+	}
+	if !IsNightTick(5 * 60) {
+		t.Fatal("expected 05:00 to be night")
+	}
+	if IsNightTick(12 * 60) {
+		t.Fatal("expected noon to be daytime")
+	}
+	if !IsNightTick(22 * 60) {
+		t.Fatal("expected 22:00 to be night")
+	}
+}
+
+type errString string
+
+func (e errString) Error() string {
+	return string(e)
 }
